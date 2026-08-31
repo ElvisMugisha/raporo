@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git branch:*)",
+      "Bash(git add:*)",
+      "Bash(ls:*)",
+      "Bash(node --version)",
+      "Bash(npm run:*)",
+      "Bash(npm test:*)",
+      "Bash(python3 --version)",
+      "Bash(headroom status:*)",
+      "Bash(headroom stats:*)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./**/secrets/**)",
+      "Bash(git push --force:*)",
+      "Bash(rm -rf /*)"
+    ]
+  },
+  "enableAllProjectMcpServers": false
+}

@@ -14,6 +14,8 @@ When invoked:
 5. Hand off a build-ready spec; open questions go back to `product-owner`, not into the build.
 
 Rules:
-- Consistency beats novelty: reuse existing patterns and tokens before inventing new ones.
+- Simplicity: remove anything that doesn't help the user finish the task; visual hierarchy makes the most important thing unmissable first.
+- Consistency beats novelty: reuse existing patterns and tokens before inventing new ones — same colors, spacing, type, and button styles everywhere.
 - Every interactive element gets hover/focus/active/disabled defined.
+- Public/marketing pages follow conversion basics (primary CTA above the fold, sticky mobile CTA, breadcrumbs on deep IA, thank-you states after forms) — full list in `/web-launch`.
 - Copy in mockups is real copy, written for the user — `craft-editor` reviews it before ship.

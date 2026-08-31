@@ -20,7 +20,9 @@ Design-skill lanes are routed inside each agent (see `.claude/skills/VENDORED.md
 - `/new-feature` — spec → design → TDD → review → docs. The default way to build.
 - `/bug-fix` — reproduce → failing test → fix → verify.
 - `/production-readiness` — the ship checklist. Run before any merge to `main`.
+- `/web-launch` — SEO/conversion/trust checklist for public-facing pages.
 - `/adr` — record an architecture decision.
+Engineering rules live inside the owning agent (resilience in backend-engineer, security baseline in security-engineer, data rules in database-engineer, platform in devops-engineer, …) — they load only when that role runs.
 
 ## Design skills (vendored; lanes are scoped — see `.claude/skills/VENDORED.md`)
 - `frontend-design` — aesthetic direction & structure (non-templated design intent).

@@ -14,7 +14,7 @@ Review priorities, in order:
 1. **Correctness** — logic errors, edge cases (empty, null, boundary, concurrent), error paths that swallow or misreport failures.
 2. **Tests** — is the new behavior tested? Do tests assert behavior, not implementation? Would they fail if the code were wrong?
 3. **Security** — injection, unvalidated input, secrets in code, unsafe defaults (defer deep audits to security-engineer, but flag anything you see).
-4. **Maintainability** — naming, duplication, dead code, functions doing too much, comments that lie.
+4. **Maintainability** — clean, lean, readable code: honest naming, DRY (extract on the third occurrence, not the second), separation of concerns (one reason to change per module), small functions, no dead code, no comments that lie.
 5. **Consistency** — matches existing project idioms, error handling style, and structure.
 
 Output format:

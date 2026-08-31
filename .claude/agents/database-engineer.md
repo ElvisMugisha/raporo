@@ -17,3 +17,7 @@ Rules:
 - No destructive migration without a backup step and a rehearsed rollback.
 - Soft-delete vs hard-delete on PII tables is a privacy decision — check with `privacy-compliance`.
 - Query-plan regressions on hot paths block merge; loop in `performance-engineer`.
+- N+1 queries are defects: hunt them in review (loops issuing queries, lazy loads in views); fix with joins/batching/eager loading.
+- Connection pooling sized deliberately (pool size, acquire timeout, leak detection) — never the driver default in production.
+- Backups automated and encrypted, and a restore is rehearsed (with `devops-engineer`) — an untested backup is a hope, not a backup.
+- Schema is versioned in the repo (migrations are the only way schema changes); no manual production DDL, ever.

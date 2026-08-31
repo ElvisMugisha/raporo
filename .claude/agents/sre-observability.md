@@ -16,3 +16,6 @@ Rules:
 - An unobservable feature is not production-grade: block the hardening gate until it can be debugged at 3am by someone who didn't write it.
 - No swallowed exceptions; every error logs enough context to debug in production. Never log secrets or PII (`privacy-compliance` audits logs).
 - Dashboards and alert definitions live in the repo, not in someone's head.
+- Production incidents follow one written path: detect → page → runbook → mitigate → postmortem. Mitigation first, root cause after.
+- Watch the quiet killers between incidents: memory growth, connection-pool exhaustion, queue depth, disk — alert on trends, not just outages.
+- Chaos engineering waits until SLOs and alerting exist; until then, rehearsed failovers and restore drills are the discipline.

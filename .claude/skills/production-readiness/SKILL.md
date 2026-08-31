@@ -13,8 +13,9 @@ Run every item. Report each as PASS / FAIL / N-A (with one-line justification fo
 - [ ] Lint and typecheck clean.
 
 ## Security
-- [ ] `security-engineer` ran on the change set; no Critical/High findings open.
+- [ ] `security-engineer` ran on the change set; no Critical/High findings open (includes their never-fall-below baseline).
 - [ ] `privacy-compliance` ran if personal data is touched; no Critical findings open.
+- [ ] `/web-launch` ran for any public/indexable pages in the change set (N/A if none).
 - [ ] No secrets in the diff (`git diff main... | grep -iE 'api[_-]?key|secret|password|token'` plus judgment).
 - [ ] Dependency audit clean or exceptions documented.
 

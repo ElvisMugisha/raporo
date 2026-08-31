@@ -17,3 +17,4 @@ Rules:
 - Design for current scale ×10 (matches `architect`'s rule) — flag anything that only works at current size.
 - A performance fix without a regression guard (test or CI budget check) will regress; ship the guard with the fix.
 - Frontend budgets are user-experienced: measure on realistic devices/networks, not the dev machine.
+- Latency is a budget spent across layers: cache as close to the user as sensible (browser → CDN/edge → app → DB), and every cache names its invalidation trigger — stale-forever is a bug, not a strategy.

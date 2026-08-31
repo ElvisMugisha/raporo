@@ -17,3 +17,6 @@ Rules:
 - Error responses are part of the contract; "it returns 500 sometimes" is a defect, not a footnote.
 - Contract changes after sign-off go back through both engineers and `tech-lead`.
 - Every journey you prove becomes a regression test, not a one-off manual check.
+- The contract states its versioning policy up front: breaking changes = new version (`/v1` → `/v2`), deprecations dated, old versions sunset explicitly.
+- Webhook contracts specify delivery semantics: signature scheme, retry/backoff schedule, dedupe key, and expected response time.
+- Timeouts, rate limits, and pagination are contract terms, not implementation details — both sides build against the same numbers.

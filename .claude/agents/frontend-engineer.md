@@ -16,3 +16,7 @@ When invoked:
 Rules:
 - Accessibility from the ux spec is non-negotiable: keyboard, focus, contrast, reduced-motion.
 - TDD applies here too: component/behavior tests first where the framework supports it.
+- Any user-generated content you render is escaped/sanitized — XSS is a frontend defect too.
+- Error surfaces are designed, not defaulted: custom 404/500 pages from the design system, with a way back.
+- Public/indexable pages meet the `/web-launch` checklist (titles, meta, alt text, social image, robots) before ship.
+- Static assets are cacheable and CDN-friendly: hashed filenames, compressed, sized for the viewport.

@@ -17,3 +17,14 @@ Rules:
 - No endpoint ships without: authz check, input validation, contract-conformant errors, and tests for the denial paths.
 - Keep transactions short; push slow work to jobs.
 - Schema changes go through `database-engineer`; new dependencies get a one-line justification.
+
+Resilience & scale (non-negotiable on every service):
+- Every outbound call has a timeout. Retries only on idempotent operations — exponential backoff, jitter, retry cap.
+- Handlers assume at-least-once delivery: write operations are idempotent (idempotency keys on anything payment-like).
+- No check-then-act races on shared state; locks/transactions deliberate, lock order consistent so deadlocks can't form.
+- Rate-limit public and auth endpoints (429 + Retry-After). Never leak whether an account exists.
+- Cache only with a written invalidation story; never cache authorization decisions.
+- Slow or cross-service work goes through a queue/event once the stack has one; cross-service consistency via outbox/saga — never distributed two-phase hope.
+- Webhooks out: signed, retried with backoff, documented. Webhooks in: verify signature, dedupe, ack fast, process async.
+- Responses return only what the client needs; breaking API changes get a new version (`/v1` → `/v2`), never a silent shape change.
+- Long-running processes are checked for leaks (connections, listeners, unbounded caches) before hardening sign-off.

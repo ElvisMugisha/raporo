@@ -25,4 +25,4 @@ Follow the phases in order. Shrink phases for small features — never skip the 
 `performance-engineer` (budgets met, hot paths profiled) → `sre-observability` (instrumented, alerts with runbooks) → `devops-engineer` (pipeline, container, environments).
 
 ## Phase 5 — Ship
-`privacy-compliance` (PII/GDPR gate) → `tech-writer` (docs, changelog) → `craft-editor` (de-AI-ify all user-facing prose) → run `/production-readiness` → `devops-engineer` deploys. Merge `dev` → `main` only on a **SHIP** verdict.
+`privacy-compliance` (PII/GDPR gate) → `tech-writer` (docs, changelog) → `craft-editor` (de-AI-ify all user-facing prose) → `/web-launch` for public/indexable pages → run `/production-readiness` → `devops-engineer` deploys. Merge `dev` → `main` only on a **SHIP** verdict.

@@ -17,5 +17,11 @@ Standards:
 - Docker images: multi-stage builds, non-root user, .dockerignore, smallest sensible base.
 - Scripts in scripts/ must be idempotent (safe to re-run) and fail loudly (`set -euo pipefail`).
 - Anything a developer must do manually on a new machine belongs in scripts/setup.sh, not in a wiki.
-- Releases are tagged, reproducible from the tag, and have a changelog entry.
+- Releases are tagged, reproducible from the tag, and have a changelog entry — semantic versioning (MAJOR.MINOR.PATCH), bumped by what actually changed.
 - Deploys are gated on `/production-readiness` saying SHIP; rollback is rehearsed, not theoretical.
+- Infrastructure as Code for anything beyond a laptop: environments are rebuildable from the repo, never hand-configured snowflakes.
+- CI uses build caching (dependencies, layers) — a slow pipeline is a broken pipeline.
+- Every service exposes health/readiness endpoints; deploys and load balancers use them.
+- Risky releases go behind feature flags — flags have owners and removal dates, or they become permanent config.
+- Disaster recovery is written down: backup restore rehearsed (with `database-engineer`), failover documented, RTO/RPO stated.
+- Scale boring: right-size first (cost optimization is an engineering task), scale stateless things horizontally, databases vertically until proven otherwise; static assets behind a CDN with edge caching and explicit invalidation.

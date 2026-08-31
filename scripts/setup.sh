@@ -65,7 +65,30 @@ if command -v headroom >/dev/null 2>&1; then
   fi
 fi
 
-# --- 5. Project agents/skills sanity check ----------------------------------
+# --- 5. Plugin marketplaces + plugins (user-scope install, project-scope enable)
+# Marketplaces/enabled-plugins are declared in .claude/settings.json (committed);
+# the binaries still need one install per machine — that's this step.
+if command -v claude >/dev/null 2>&1; then
+  if $CHECK_ONLY; then
+    claude plugin list 2>/dev/null | grep -q superpowers && ok "plugins installed" || fail "plugins not installed (run without --check)"
+  else
+    for m in obra/superpowers-marketplace pbakaus/impeccable thedotmack/claude-mem anthropics/claude-code; do
+      claude plugin marketplace add "$m" >/dev/null 2>&1 || true
+    done
+    for p in superpowers@superpowers-marketplace impeccable@impeccable claude-mem@thedotmack \
+             security-guidance@claude-code-plugins claude-code-setup@claude-plugins-official; do
+      claude plugin install "$p" >/dev/null 2>&1 && ok "plugin $p" || warn "plugin $p — install manually: claude plugin install $p"
+    done
+    # claude-mem needs its worker + hooks registered (one-time; interactive on first run)
+    if command -v bun >/dev/null 2>&1 || npx --yes claude-mem status >/dev/null 2>&1; then
+      ok "claude-mem runtime present"
+    else
+      warn "claude-mem worker not initialized — run once: npx claude-mem install"
+    fi
+  fi
+fi
+
+# --- 6. Project agents/skills sanity check ----------------------------------
 for d in .claude/agents .claude/skills; do
   if [[ -d "$d" ]] && [[ -n "$(ls -A "$d")" ]]; then
     ok "$d ($(ls "$d" | wc -l) entries)"
@@ -74,7 +97,7 @@ for d in .claude/agents .claude/skills; do
   fi
 done
 
-# --- 6. Summary ---------------------------------------------------------------
+# --- 7. Summary ---------------------------------------------------------------
 echo
 if $FAILED; then
   echo "Bootstrap INCOMPLETE — fix the [XX] items above."

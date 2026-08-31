@@ -24,6 +24,19 @@ Product code plus a fully portable AI-team setup. Everything the team needs — 
 - `/production-readiness` — the ship checklist. Run before any merge to `main`.
 - `/adr` — record an architecture decision.
 
+## Design skills (vendored; lanes are scoped — see `.claude/skills/VENDORED.md`)
+- `frontend-design` — aesthetic direction & structure (non-templated design intent).
+- `taste` — visual identity & consistent design language.
+- `ui-ux-pro-max` — layout, typography, palettes, UX patterns (database-backed).
+- `animate` / `emil-design-eng` / `review-animations` / `improve-animations` — motion & polish.
+- `/impeccable <command>` (plugin) — on-demand design audits.
+- `task-observer` — watches sessions, proposes new skills.
+
+## Plugins (declared in `.claude/settings.json`; installed per machine by setup.sh)
+superpowers (methodology), impeccable (design audits), claude-mem (session memory),
+security-guidance (real-time edit checks), claude-code-setup (automation recommendations).
+Built-in `/code-review` and `/security-review` cover review — no extra plugins for those.
+
 ## Environment notes
 - Primary dev environment: WSL Ubuntu 24.04 (`claude` CLI lives there).
 - Headroom (token-compression proxy) is installed per-machine by `scripts/setup.sh`; see `docs/SETUP.md`.

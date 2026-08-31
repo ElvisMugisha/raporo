@@ -19,7 +19,9 @@ Then just run `claude` in the project. Verify anytime with `./scripts/setup.sh -
 | Team (subagents) | `.claude/agents/*.md` | automatically |
 | Workflows (skills) | `.claude/skills/*/SKILL.md` | as `/new-feature`, `/bug-fix`, `/production-readiness`, `/adr` |
 | Shared settings & permissions | `.claude/settings.json` | automatically |
-| MCP servers (when we add any) | `.mcp.json` | automatically (approve on first use) |
+| Vendored design/meta skills | `.claude/skills/` (see `VENDORED.md`) | automatically |
+| MCP servers (Playwright, Figma) | `.mcp.json` | automatically (approve on first use) |
+| Plugin declarations | `.claude/settings.json` (`extraKnownMarketplaces`, `enabledPlugins`) | marketplaces auto-register; binaries installed by `setup.sh` |
 | Bootstrap | `scripts/setup.sh` | run manually once per machine |
 
 Machine-local overrides go in `.claude/settings.local.json` and `CLAUDE.local.md` — both gitignored, never committed.
@@ -29,10 +31,28 @@ Machine-local overrides go in `.claude/settings.local.json` and `CLAUDE.local.md
 Headroom is a local proxy that compresses tool outputs, file contents, and history before they reach the Anthropic API (roughly 15–20% savings for coding agents per their benchmarks), while preserving prompt-cache prefixes. It's a Python CLI, so it lives on the machine, not in the repo — `scripts/setup.sh` installs it via `uv` and wires it into the project with `headroom init claude`.
 
 How the wiring works (all machine-local, none of it committed):
+
 - `headroom init claude` writes `.claude/settings.local.json` (gitignored): sets `ANTHROPIC_BASE_URL` to the local proxy **for this project only**, and installs SessionStart/PreToolUse hooks that auto-start the proxy — so a reboot can never leave `claude` pointing at a dead proxy.
 - `claude` outside this project is untouched; routing is project-scoped.
 - `headroom doctor` — health check + lifetime tokens saved; `headroom dashboard` — savings dashboard.
 - To disable on a machine: delete `.claude/settings.local.json` (or the headroom entries in it).
+
+## Plugins
+
+Declared project-scoped in `.claude/settings.json`; `scripts/setup.sh` installs the binaries per machine (plugin installs are user-scoped by design in Claude Code):
+
+- **superpowers** — brainstorm → spec → plan → TDD methodology (`obra/superpowers`)
+- **impeccable** — `/impeccable <command>` design audits (Paul Bakaus)
+- **claude-mem** — automatic session memory across sessions (run `npx claude-mem install` once per machine to register its worker)
+- **security-guidance** — Anthropic hook that pattern-checks every edit in real time
+- **claude-code-setup** — Anthropic analyzer that recommends project automations
+
+Deliberately NOT installed: code-review/security-review plugins (built-in `/code-review` and `/security-review` cover it) and MemPalace (conflicts with claude-mem — one memory system only).
+
+## MCP servers
+
+- **Playwright** (`npx @playwright/mcp`) — browser automation for testing/screenshots. Needs Node.
+- **Figma** (official remote, `https://mcp.figma.com/mcp`) — authenticate once per machine via `/mcp` in Claude Code (OAuth; no token in the repo).
 
 ## Requirements
 

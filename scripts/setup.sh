@@ -88,7 +88,19 @@ if command -v claude >/dev/null 2>&1; then
   fi
 fi
 
-# --- 6. Project agents/skills sanity check ----------------------------------
+# --- 6. Playwright CLI (browser automation for the agents) ------------------
+# CLI over MCP: no per-request tool schemas, snapshots stay on disk (ADR 0003).
+if command -v playwright-cli >/dev/null 2>&1; then
+  ok "Playwright CLI $(playwright-cli --version 2>/dev/null | head -1)"
+else
+  if $CHECK_ONLY; then fail "Playwright CLI missing"; else
+    warn "Playwright CLI missing — installing"
+    npm install -g @playwright/cli@latest
+    ok "Playwright CLI installed (browsers download on first use: npx playwright install chromium)"
+  fi
+fi
+
+# --- 7. Project agents/skills sanity check ----------------------------------
 for d in .claude/agents .claude/skills; do
   if [[ -d "$d" ]] && [[ -n "$(ls -A "$d")" ]]; then
     ok "$d ($(ls "$d" | wc -l) entries)"
@@ -97,7 +109,7 @@ for d in .claude/agents .claude/skills; do
   fi
 done
 
-# --- 7. Summary ---------------------------------------------------------------
+# --- 8. Summary ---------------------------------------------------------------
 echo
 if $FAILED; then
   echo "Bootstrap INCOMPLETE — fix the [XX] items above."

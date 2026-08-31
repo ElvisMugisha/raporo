@@ -14,7 +14,8 @@
       "Bash(python3 .claude/skills/ui-ux-pro-max/scripts/*)",
       "Bash(headroom status:*)",
       "Bash(headroom stats:*)",
-      "Bash(headroom doctor)"
+      "Bash(headroom doctor)",
+      "Bash(playwright-cli:*)"
     ],
     "deny": [
       "Read(./.env)",

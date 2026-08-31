@@ -39,6 +39,7 @@ Built-in `/code-review` and `/security-review` cover review — no extra plugins
 
 ## Environment notes
 - Primary dev environment: WSL Ubuntu 24.04 (`claude` CLI lives there).
+- Browser automation: vendored `playwright-cli` skill — CLI over MCP for token cost (ADR 0003).
 - Headroom (token-compression proxy) is installed per-machine by `scripts/setup.sh`; see `docs/SETUP.md`.
 - Machine-local overrides go in `.claude/settings.local.json` and `CLAUDE.local.md` (both gitignored) — never in the shared files.
 

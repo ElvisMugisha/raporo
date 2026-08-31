@@ -20,7 +20,8 @@ Then just run `claude` in the project. Verify anytime with `./scripts/setup.sh -
 | Workflows (skills) | `.claude/skills/*/SKILL.md` | as `/new-feature`, `/bug-fix`, `/production-readiness`, `/adr` |
 | Shared settings & permissions | `.claude/settings.json` | automatically |
 | Vendored design/meta skills | `.claude/skills/` (see `VENDORED.md`) | automatically |
-| MCP servers (Playwright, Figma) | `.mcp.json` | automatically (approve on first use) |
+| MCP servers (Figma) | `.mcp.json` | automatically (approve on first use) |
+| Browser automation skill | `.claude/skills/playwright-cli/` | automatically (binary installed by `setup.sh`) |
 | Plugin declarations | `.claude/settings.json` (`extraKnownMarketplaces`, `enabledPlugins`) | marketplaces auto-register; binaries installed by `setup.sh` |
 | Bootstrap | `scripts/setup.sh` | run manually once per machine |
 
@@ -49,9 +50,16 @@ Declared project-scoped in `.claude/settings.json`; `scripts/setup.sh` installs 
 
 Deliberately NOT installed: code-review/security-review plugins (built-in `/code-review` and `/security-review` cover it) and MemPalace (conflicts with claude-mem — one memory system only).
 
+## Browser automation (Playwright CLI)
+
+We use the Playwright **CLI**, not the Playwright MCP server — Playwright's own recommendation for coding agents. The MCP server injects ~26 tool schemas (~3.6k tokens) into every session and streams page snapshots through the model; the CLI is invoked like git or npm and keeps snapshots/screenshots on disk (Microsoft benchmarks ≈4× fewer tokens). See ADR 0003.
+
+- Agent skill vendored at `.claude/skills/playwright-cli/` (travels with the repo; see `VENDORED.md`).
+- Binary installed per machine by `setup.sh` (`npm install -g @playwright/cli`).
+- Browsers download on first use; if prompted, run once: `npx playwright install chromium`.
+
 ## MCP servers
 
-- **Playwright** (`npx @playwright/mcp`) — browser automation for testing/screenshots. Needs Node.
 - **Figma** (official remote, `https://mcp.figma.com/mcp`) — authenticate once per machine via `/mcp` in Claude Code (OAuth; no token in the repo).
 
 ## Requirements

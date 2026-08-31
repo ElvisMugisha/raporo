@@ -1,32 +1,28 @@
 ---
 name: new-feature
-description: The standard workflow for building any feature - spec, design, TDD implementation, review, docs. Use whenever starting new functionality of any size.
+description: The standard workflow for building any feature - the five-phase team pipeline from spec to ship. Use whenever starting new functionality of any size.
 ---
 
-# New Feature Workflow
+# New Feature — the five-phase pipeline
 
-Follow these phases in order. Do not skip phases for "small" features — shrink them instead.
+Follow the phases in order. Shrink phases for small features — never skip the gates. Agent roster: CLAUDE.md.
 
-## 1. Spec (minutes, not days)
-Write 3–8 lines in the task/PR description: what the user can do after this ships, what is explicitly out of scope, and how we'll know it works (acceptance criteria). If you can't write the acceptance criteria, stop and ask.
+## Phase 1 — Define
+`product-owner` (problem statement, acceptance criteria, scope, glossary) → `tech-lead` (vertical slices, sequencing) → `architect` (module boundaries, dependency direction; `/adr` for hard-to-reverse decisions). If you can't write the acceptance criteria, stop and ask.
 
-## 2. Design
-For anything touching more than one module, new dependencies, data model, or public API: invoke the `architect` agent with the spec. Architectural decisions get an ADR (`/adr`). Trivial features may skip to 3 — say so explicitly.
+## Phase 2 — Design (parallel, then converge)
+`ux-designer` (flows, every interaction state, tokens, accessibility) ∥ `database-engineer` (schema, constraints, indexes) ∥ `architect` (structure) → `integration-engineer` writes the API contract, both build engineers sign off → `security-engineer` threat-models the design.
 
-## 3. Branch
-`git checkout dev && git pull && git checkout -b feature/<short-name>`
+## Phase 3 — Build (per vertical slice)
+1. Branch: `git checkout dev && git pull && git checkout -b feature/<short-name>`.
+2. `backend-engineer` ∥ `frontend-engineer` — parallel against the signed contract; TDD (superpowers:test-driven-development); no placeholder code, no TODOs without a linked issue.
+3. `integration-engineer` proves the seam: end-to-end journeys including failure paths.
+4. `qa-engineer` proves behavior: denial tests, exploratory pass.
+5. Blocking gates: `code-reviewer` on every diff (must APPROVE); `security-engineer` if auth/tenant/input/files/network/deps/config touched; `data-reporting-engineer` if aggregation/export/period logic touched.
+6. `tech-lead` merge gate: verifies every required gate actually produced output, then hands the human the go/no-go (commits/merges are human actions in this project).
 
-## 4. Implement with TDD
-- Invoke `test-engineer` (or write tests yourself for small changes): failing tests first, from the acceptance criteria.
-- Implement until tests pass. Keep commits small and logical.
-- No placeholder code, no commented-out blocks, no TODOs without a linked issue.
+## Phase 4 — Harden
+`performance-engineer` (budgets met, hot paths profiled) → `sre-observability` (instrumented, alerts with runbooks) → `devops-engineer` (pipeline, container, environments).
 
-## 5. Review gate (all three, can run in parallel)
-- `code-reviewer` on the diff — must APPROVE.
-- `security-auditor` if the change touches input, auth, files, network, deps, or config.
-- Full test suite + lint green locally.
-
-## 6. Docs & finish
-- `docs-writer` if behavior, setup, or API changed.
-- Run `/production-readiness` before merging to `main`.
-- PR into `dev`; merge `dev` → `main` only via `/production-readiness`.
+## Phase 5 — Ship
+`privacy-compliance` (PII/GDPR gate) → `tech-writer` (docs, changelog) → `craft-editor` (de-AI-ify all user-facing prose) → run `/production-readiness` → `devops-engineer` deploys. Merge `dev` → `main` only on a **SHIP** verdict.

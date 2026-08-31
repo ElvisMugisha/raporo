@@ -17,9 +17,10 @@ Details, portability rules, and troubleshooting: [docs/SETUP.md](docs/SETUP.md).
 ```text
 CLAUDE.md              # project rules & principles (loaded every AI session)
 .claude/
-  agents/              # the AI team: architect, code-reviewer, security-auditor,
-                       #   test-engineer, devops-engineer, docs-writer
+  agents/              # the AI team: 19 senior roles — delivery, gates, advisory
+                       #   (roster in CLAUDE.md, pipeline in /new-feature)
   skills/              # workflows: /new-feature, /bug-fix, /production-readiness, /adr
+                       #   + vendored design/browser skills (see skills/VENDORED.md)
   settings.json        # shared permissions & settings
 .mcp.json              # project-scoped MCP servers (currently none)
 docs/

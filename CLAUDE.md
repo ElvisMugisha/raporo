@@ -10,13 +10,11 @@ Product code plus a fully portable AI-team setup. Everything the team needs — 
 4. **Decisions are written down.** Anything architectural gets an ADR in `docs/adr/` (use the `adr` skill).
 5. **Token discipline.** Keep this file and skills lean. Search before reading whole files. Prefer subagents for broad exploration so raw file dumps stay out of the main context.
 
-## The team (subagents in `.claude/agents/`)
-- `architect` — system design, trade-offs, ADRs. Use before building anything non-trivial.
-- `code-reviewer` — strict review of diffs before merge.
-- `security-auditor` — security review of changes and dependencies.
-- `test-engineer` — test strategy, writing and hardening tests.
-- `devops-engineer` — CI/CD, Docker, environments, releases.
-- `docs-writer` — README, ADR polish, changelogs, user docs.
+## The team (subagents in `.claude/agents/` — 19 roles, each a 20-year veteran of its craft; pipeline in `/new-feature`)
+**Core delivery:** `product-owner` (spec, acceptance criteria, glossary) · `tech-lead` (plan, arbitration, merge gate) · `architect` (module layout, ADRs) · `ux-designer` (flows, states, tokens, a11y) · `backend-engineer` · `frontend-engineer` · `integration-engineer` (API contract, e2e) · `database-engineer` · `qa-engineer` (strategy, denial tests, exploratory).
+**Gates at checkpoints:** `code-reviewer` (verdict on every diff) · `security-engineer` (threat model, auth/input changes, release) · `devops-engineer` (containers, pipeline, deploy) · `sre-observability` (instrumentation, alerting) · `data-reporting-engineer` (aggregations, period boundaries) · `performance-engineer` (budgets, hot paths).
+**Advisory on demand:** `tech-writer` (docs, runbooks) · `craft-editor` (de-AI-ifies all prose) · `localization-engineer` (i18n) · `privacy-compliance` (GDPR).
+Design-skill lanes are routed inside each agent (see `.claude/skills/VENDORED.md`).
 
 ## Workflows (skills in `.claude/skills/`)
 - `/new-feature` — spec → design → TDD → review → docs. The default way to build.

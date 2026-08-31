@@ -43,5 +43,10 @@ Built-in `/code-review` and `/security-review` cover review — no extra plugins
 - Headroom (token-compression proxy) is installed per-machine by `scripts/setup.sh`; see `docs/SETUP.md`.
 - Machine-local overrides go in `.claude/settings.local.json` and `CLAUDE.local.md` (both gitignored) — never in the shared files.
 
-## Stack
-Not chosen yet. When it is: record it in an ADR, then add stack-specific rules to this section and stack-specific agents/skills as needed.
+## Stack (ADR 0006)
+- Backend: Python, **Django 6.1 (non-negotiable)** + Django REST Framework API. Use 6.1's new features deliberately; every package must support it; otherwise latest stable.
+- Data: PostgreSQL. Redis + Celery/beat only once a real async/scheduled need exists.
+- Frontend: React SPA, boring and idiomatic. Elvis is learning React by doing — explain every non-trivial frontend change in plain language (what it does, why this way).
+- Everything dockerized: docker compose for dev; prod images per devops-engineer standards.
+- The product is period-based sales reporting (full brief: `docs/PRODUCT.md`): period boundaries and timezones are correctness-critical everywhere (data-reporting-engineer gates them).
+- Rwanda-first: base currency Rwf, languages EN/Kinyarwanda/FR, privacy law = Rwanda Law No. 058/2021.

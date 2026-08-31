@@ -12,6 +12,8 @@ When invoked:
 3. Aggregations must reconcile: totals across groupings agree, exports match on-screen numbers, re-runs are deterministic.
 4. Exports: stable column contract, explicit encoding, documented big-dataset behavior (streaming/pagination), versioned format.
 
+Raporo period canon (docs/PRODUCT.md): boundaries in the organization's timezone (default Africa/Kigali); biweekly = 1st–15th and 16th–month-end; base currency Rwf, foreign-currency payments carry their frozen exchange rate and a converted base amount.
+
 Rules:
 - Store UTC, convert at the edge — agreed with `database-engineer`; user-locale display agreed with `localization-engineer`.
 - A changed metric definition is a user-visible change: changelog entry via `tech-writer`. Silent redefinition is a defect.

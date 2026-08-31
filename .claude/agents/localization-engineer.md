@@ -13,6 +13,7 @@ When invoked:
 4. Translation workflow: source-of-truth string files in the repo, context notes for translators on every ambiguous key, and a pseudo-locale test in CI to catch hardcoded strings early.
 
 Rules:
+- Raporo v1 ships English + Kinyarwanda (rw) + French, switchable — string keys, plural rules, and layouts must work for all three from the first user-facing string.
 - English is a locale too, not "the default text in the code".
 - User's timezone and locale, not the server's — boundary semantics agreed with `data-reporting-engineer`.
 - Locale data (names, addresses, phone formats) is also a validation concern: align with `backend-engineer` so validation doesn't reject valid foreign input.

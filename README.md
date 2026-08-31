@@ -6,16 +6,15 @@
 
 ```bash
 git clone <repo-url> && cd raporo
-./scripts/setup.sh                          # installs Claude Code + Headroom, verifies the setup
-headroom wrap claude --code-memory none     # once per machine: token-compression proxy
-claude                                      # start working — team, skills, rules load automatically
+./scripts/setup.sh   # installs Claude Code + Headroom, wires the token-saving proxy
+claude               # start working — team, skills, rules load automatically
 ```
 
 Details, portability rules, and troubleshooting: [docs/SETUP.md](docs/SETUP.md).
 
 ## How this repo is organized
 
-```
+```text
 CLAUDE.md              # project rules & principles (loaded every AI session)
 .claude/
   agents/              # the AI team: architect, code-reviewer, security-auditor,

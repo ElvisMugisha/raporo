@@ -2,20 +2,19 @@
 
 Everything portable lives in git. Only two things are machine-level and installed by the bootstrap script: the Claude Code CLI and Headroom.
 
-## Fresh machine, three commands
+## Fresh machine, two commands
 
 ```bash
 git clone <repo-url> && cd raporo
 ./scripts/setup.sh
-headroom wrap claude --code-memory none
 ```
 
-Then just run `claude`. Verify anytime with `./scripts/setup.sh --check`.
+Then just run `claude` in the project. Verify anytime with `./scripts/setup.sh --check` or `headroom doctor`.
 
 ## What travels with the repo (nothing to reinstall)
 
 | Piece | Location | Loaded by Claude Code |
-|---|---|---|
+| --- | --- | --- |
 | Rules & principles | `CLAUDE.md` | every session, automatically |
 | Team (subagents) | `.claude/agents/*.md` | automatically |
 | Workflows (skills) | `.claude/skills/*/SKILL.md` | as `/new-feature`, `/bug-fix`, `/production-readiness`, `/adr` |
@@ -27,11 +26,13 @@ Machine-local overrides go in `.claude/settings.local.json` and `CLAUDE.local.md
 
 ## Headroom (token compression)
 
-Headroom is a local proxy that compresses tool outputs, file contents, and history before they reach the Anthropic API (roughly 15–20% savings for coding agents per their benchmarks), while preserving prompt-cache prefixes. It's a Python CLI, so it lives on the machine, not in the repo — `scripts/setup.sh` installs it via `uv`.
+Headroom is a local proxy that compresses tool outputs, file contents, and history before they reach the Anthropic API (roughly 15–20% savings for coding agents per their benchmarks), while preserving prompt-cache prefixes. It's a Python CLI, so it lives on the machine, not in the repo — `scripts/setup.sh` installs it via `uv` and wires it into the project with `headroom init claude`.
 
-- `headroom wrap claude --code-memory none` — one-time per machine; routes the `claude` CLI through the proxy. We pass `--code-memory none` to keep the setup clean (skips Headroom's optional user-scoped Serena install, which would violate our everything-in-the-repo rule).
-- `headroom unwrap claude` — restore direct connection.
-- If Claude ever fails to connect after a reboot, the proxy isn't running: re-run `headroom wrap claude` or `headroom proxy --port 8787`.
+How the wiring works (all machine-local, none of it committed):
+- `headroom init claude` writes `.claude/settings.local.json` (gitignored): sets `ANTHROPIC_BASE_URL` to the local proxy **for this project only**, and installs SessionStart/PreToolUse hooks that auto-start the proxy — so a reboot can never leave `claude` pointing at a dead proxy.
+- `claude` outside this project is untouched; routing is project-scoped.
+- `headroom doctor` — health check + lifetime tokens saved; `headroom dashboard` — savings dashboard.
+- To disable on a machine: delete `.claude/settings.local.json` (or the headroom entries in it).
 
 ## Requirements
 

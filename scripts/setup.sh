@@ -51,7 +51,21 @@ else
   fi
 fi
 
-# --- 4. Project agents/skills sanity check ----------------------------------
+# --- 4. Headroom durable integration for this project -----------------------
+# Writes machine-local routing (.claude/settings.local.json, gitignored):
+# ANTHROPIC_BASE_URL -> local proxy + hooks that auto-start the proxy.
+if command -v headroom >/dev/null 2>&1; then
+  if [[ -f .claude/settings.local.json ]] && grep -q "headroom" .claude/settings.local.json 2>/dev/null; then
+    ok "Headroom already wired into this project"
+  else
+    if $CHECK_ONLY; then fail "Headroom not wired into this project (run without --check)"; else
+      headroom init claude
+      ok "Headroom wired (project-local routing + auto-start hooks)"
+    fi
+  fi
+fi
+
+# --- 5. Project agents/skills sanity check ----------------------------------
 for d in .claude/agents .claude/skills; do
   if [[ -d "$d" ]] && [[ -n "$(ls -A "$d")" ]]; then
     ok "$d ($(ls "$d" | wc -l) entries)"
@@ -60,18 +74,18 @@ for d in .claude/agents .claude/skills; do
   fi
 done
 
-# --- 5. Summary ---------------------------------------------------------------
+# --- 6. Summary ---------------------------------------------------------------
 echo
 if $FAILED; then
   echo "Bootstrap INCOMPLETE — fix the [XX] items above."
   exit 1
 fi
 cat <<'EOF'
-Bootstrap complete. Daily usage:
+Bootstrap complete. Daily usage: just run `claude` in this project —
+Headroom routing and proxy auto-start are wired via .claude/settings.local.json.
 
-  headroom wrap claude --code-memory none   # once per machine: route Claude Code through the proxy
-  claude                                     # work as usual — compression is transparent
-  headroom unwrap claude                     # undo, if ever needed
+  headroom doctor    # verify routing + see tokens saved
+  headroom dashboard # savings dashboard
 
 Team, skills, and rules load automatically from .claude/ and CLAUDE.md.
 EOF

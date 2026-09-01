@@ -16,6 +16,9 @@ Product code plus a fully portable AI-team setup. Everything the team needs — 
 **Advisory on demand:** `tech-writer` (docs, runbooks) · `craft-editor` (de-AI-ifies all prose) · `localization-engineer` (i18n) · `privacy-compliance` (Rwanda Law 058/2021).
 Design-skill lanes are routed inside each agent (see `.claude/skills/VENDORED.md`).
 
+## Where are we? (read first)
+`docs/ROADMAP.md` is the living tracker — phases, slices, statuses, and the 📍NOW line. Read it before starting work; update statuses in the same change that lands the work.
+
 ## Workflows (skills in `.claude/skills/`)
 - `/new-feature` — spec → design → TDD → review → docs. The default way to build.
 - `/bug-fix` — reproduce → failing test → fix → verify.

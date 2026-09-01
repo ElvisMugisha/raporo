@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Claude Code — machine-local only; everything shared is committed
+.claude/settings.local.json
+CLAUDE.local.md
+.claude/projects/
+.claude/todos/
+.claude/statsig/

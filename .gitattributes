@@ -1,0 +1,18 @@
+# Normalize line endings: LF in the repo and working tree everywhere.
+# We develop across Windows/WSL/Linux; CRLF breaks shell scripts and diffs.
+* text=auto eol=lf
+
+# Windows-only scripts keep CRLF
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary safety
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.woff2 binary

@@ -11,9 +11,9 @@ Product code plus a fully portable AI-team setup. Everything the team needs — 
 5. **Token discipline.** Keep this file and skills lean. Search before reading whole files. Prefer subagents for broad exploration so raw file dumps stay out of the main context.
 
 ## The team (subagents in `.claude/agents/` — 19 roles, each a 20-year veteran of its craft; pipeline in `/new-feature`)
-**Core delivery:** `product-owner` (spec, acceptance criteria, glossary) · `tech-lead` (plan, arbitration, merge gate) · `architect` (module layout, ADRs) · `ux-designer` (flows, states, tokens, a11y) · `backend-engineer` · `frontend-engineer` · `integration-engineer` (API contract, e2e) · `database-engineer` · `qa-engineer` (strategy, denial tests, exploratory).
+**Core delivery:** `product-owner` (spec, acceptance criteria, glossary) · `tech-lead` (plan, arbitration, merge gate) · `architect` (module layout, ADRs) · `ux-designer` (flows, states, tokens, a11y) · `backend-engineer` · `frontend-engineer` · `integration-engineer` (seam contract, e2e) · `database-engineer` · `qa-engineer` (strategy, denial tests, exploratory).
 **Gates at checkpoints:** `code-reviewer` (verdict on every diff) · `security-engineer` (threat model, auth/input changes, release) · `devops-engineer` (containers, pipeline, deploy) · `sre-observability` (instrumentation, alerting) · `data-reporting-engineer` (aggregations, period boundaries) · `performance-engineer` (budgets, hot paths).
-**Advisory on demand:** `tech-writer` (docs, runbooks) · `craft-editor` (de-AI-ifies all prose) · `localization-engineer` (i18n) · `privacy-compliance` (GDPR).
+**Advisory on demand:** `tech-writer` (docs, runbooks) · `craft-editor` (de-AI-ifies all prose) · `localization-engineer` (i18n) · `privacy-compliance` (Rwanda Law 058/2021).
 Design-skill lanes are routed inside each agent (see `.claude/skills/VENDORED.md`).
 
 ## Workflows (skills in `.claude/skills/`)
@@ -44,9 +44,9 @@ Built-in `/code-review` and `/security-review` cover review — no extra plugins
 - Machine-local overrides go in `.claude/settings.local.json` and `CLAUDE.local.md` (both gitignored) — never in the shared files.
 
 ## Stack (ADR 0006)
-- Backend: Python, **Django 6.1 (non-negotiable)** + Django REST Framework API. Use 6.1's new features deliberately; every package must support it; otherwise latest stable.
+- Backend: Python, **Django 6.1 (non-negotiable)**. Use 6.1's new features deliberately; every package must support it; otherwise latest stable. DRF only when a real API consumer (mobile/integration) exists — see ADR 0007.
 - Data: PostgreSQL. Redis + Celery/beat only once a real async/scheduled need exists.
-- Frontend: React SPA, boring and idiomatic. Elvis is learning React by doing — explain every non-trivial frontend change in plain language (what it does, why this way).
+- Frontend: **Django templates + HTMX** (ADR 0007 — supersedes the earlier React choice; React/DRF-SPA references anywhere are stale). Server-rendered pages, HTMX fragment swaps, no JS framework, no Node build. Business logic lives in a **service layer** (views thin) so DRF endpoints can be added when a mobile app/API consumer becomes real. Explain anything new to Elvis in plain language.
 - Everything dockerized: docker compose for dev; prod images per devops-engineer standards.
 - The product is period-based sales reporting (full brief: `docs/PRODUCT.md`): period boundaries and timezones are correctness-critical everywhere (data-reporting-engineer gates them).
 - Rwanda-first: base currency Rwf, languages EN/Kinyarwanda/FR, privacy law = Rwanda Law No. 058/2021.

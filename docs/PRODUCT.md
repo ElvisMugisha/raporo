@@ -1,6 +1,6 @@
 # Raporo — Product Brief (v1 decisions, 2026-08-31)
 
-Source of truth for `product-owner`; each feature gets its own Phase-1 spec refined from this. Stack: ADR 0006.
+Source of truth for `product-owner`; each feature gets its own Phase-1 spec refined from this. Stack: ADR 0006 + ADR 0007 (frontend = Django templates + HTMX; service layer keeps a future mobile API cheap).
 
 ## What it is
 Sales-reporting SaaS for Rwandan businesses. Organizations register, add products, record stock movements and sales, then see fast reports (daily / weekly / biweekly / monthly / custom range) and download or schedule beautifully designed, boss-ready reports.

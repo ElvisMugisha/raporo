@@ -53,7 +53,7 @@ This is Elvis's "I give a friend 350K to invest" scenario, exactly as practiced 
 
 ## Foundation decisions already made (docs/PRODUCT.md, ADR 0006)
 
-Django 6.1 + DRF, PostgreSQL, React SPA, Docker, Redis/Celery when scheduling arrives · org-level custom RBAC · base currency Rwf with frozen-rate foreign payments · org timezone (default Africa/Kigali) · login by username/email/phone + password · EN/Kinyarwanda/FR · ≥10-year record retention · Dokploy/Coolify hosting.
+Django 6.1, PostgreSQL, Django templates + HTMX (ADR 0007 — replaced the earlier React choice), Docker, Redis/Celery when scheduling arrives · org-level custom RBAC · base currency Rwf with frozen-rate foreign payments · org timezone (default Africa/Kigali) · login by username/email/phone + password · EN/Kinyarwanda/FR · ≥10-year record retention · Dokploy/Coolify hosting.
 
 ## Decisions from the Q&A round (Elvis, 2026-08-31 evening)
 

@@ -11,11 +11,11 @@ Follow the phases in order. Shrink phases for small features — never skip the 
 `product-owner` (problem statement, acceptance criteria, scope, glossary) → `tech-lead` (vertical slices, sequencing) → `architect` (module boundaries, dependency direction; `/adr` for hard-to-reverse decisions). If you can't write the acceptance criteria, stop and ask.
 
 ## Phase 2 — Design (parallel, then converge)
-`ux-designer` (flows, every interaction state, tokens, accessibility) ∥ `database-engineer` (schema, constraints, indexes) ∥ `architect` (structure) → `integration-engineer` writes the API contract, both build engineers sign off → `security-engineer` threat-models the design.
+`ux-designer` (flows, every interaction state, tokens, accessibility) ∥ `database-engineer` (schema, constraints, indexes) ∥ `architect` (structure) → `integration-engineer` writes the seam contract (service signatures + URL/fragment map), both build engineers sign off → `security-engineer` threat-models the design.
 
 ## Phase 3 — Build (per vertical slice)
 1. Branch: `git checkout dev && git pull && git checkout -b feature/<short-name>`.
-2. `backend-engineer` ∥ `frontend-engineer` — parallel against the signed contract; TDD (superpowers:test-driven-development); no placeholder code, no TODOs without a linked issue.
+2. `backend-engineer` (models, services, thin views) ∥ `frontend-engineer` (templates, styles, HTMX) — parallel against the signed seam; TDD (superpowers:test-driven-development); no placeholder code, no TODOs without a linked issue.
 3. `integration-engineer` proves the seam: end-to-end journeys including failure paths.
 4. `qa-engineer` proves behavior: denial tests, exploratory pass.
 5. Blocking gates: `code-reviewer` on every diff (must APPROVE); `security-engineer` if auth/tenant/input/files/network/deps/config touched; `data-reporting-engineer` if aggregation/export/period logic touched.

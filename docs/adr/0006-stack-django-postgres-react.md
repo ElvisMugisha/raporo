@@ -1,7 +1,7 @@
 # 0006. Stack: Django 6.1 + DRF API, PostgreSQL, Redis/Celery when needed, React SPA, Docker everywhere
 
 Date: 2026-08-31
-Status: Accepted
+Status: Accepted — frontend choice superseded by ADR 0007 (Django templates + HTMX); backend/data/Docker decisions remain in force
 
 ## Context
 Raporo is a sales-reporting product: clients create accounts, register their business and products, and view sales across daily/weekly/biweekly/monthly/custom ranges — fast — and download polished reports good enough to hand to their boss. The owner's strengths are Python/Django; the frontend is explicitly also a learning goal (React, learning by doing). A development environment with the chosen versions already exists and is active.

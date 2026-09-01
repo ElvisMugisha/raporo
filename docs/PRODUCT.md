@@ -3,16 +3,17 @@
 Source of truth for `product-owner`; each feature gets its own Phase-1 spec refined from this. Stack: ADR 0006 + ADR 0007 (frontend = Django templates + HTMX; service layer keeps a future mobile API cheap).
 
 ## What it is
+
 Sales-reporting SaaS for Rwandan businesses. Organizations register, add products, record stock movements and sales, then see fast reports (daily / weekly / biweekly / monthly / custom range) and download or schedule beautifully designed, boss-ready reports.
 
 ## Decisions
 
 | Area | Decision |
-|---|---|
+| --- | --- |
 | Data entry | Manual: products (new/edit), restocking, sales, refunds. No online payments — the payment *method* is recorded per sale. |
 | Tenancy | Organization = tenant, multiple users per org. |
 | Roles | Custom RBAC: org owners/admins create roles, define permissions, assign/promote/demote members. Ship presets (Owner, Manager, Seller) built on the same custom-role system. |
-| Currency | Base currency **Rwf**. USD as a later addition. Customers may pay in another currency: record amount + currency + the exchange rate frozen at transaction time, plus the converted base-currency amount. Exact decimals only — never floats. |
+| Currency | Base currency **Rwf**. Prices and totals always read in the store's base currency. Any money in a foreign currency (customer pays USD, investor contributes USD, payout in USD) **requires the exchange rate at record time — mandatory, the form blocks submission without it** (confirmed 2026-09-01): the UI detects currency ≠ base, demands the rate, shows the converted amount before saving, and stores amount + currency + frozen rate + converted base amount. One shared money mechanism across sales payments, capital entries, payouts, expenses. Exact decimals only — never floats. Rate entry is manual in v1 (auto-fetch later). |
 | Timezone | Report boundaries use the **organization's timezone** (default `Africa/Kigali`); users may get a display timezone later. One truth per org, or two users see different "today" totals. |
 | Biweekly | **Confirmed (2026-09-01): 1st–15th and 16th–end of month** (28th/29th/30th/31st all fall in the second half). |
 | Report delivery | **WhatsApp-first** (changed from email-first in the Q&A round): reports render as a beautiful shareable image + PDF with one-tap share; scheduled/automated sending (email first, since WhatsApp automation is Meta-restricted) comes later as a setting — that's when Celery beat lands. |
@@ -41,7 +42,9 @@ Sales-reporting SaaS for Rwandan businesses. Organizations register, add product
 | Hosting | Self-hosted Docker PaaS (Dokploy or Coolify) on a low-cost VPS — fits the everything-dockerized rule and a near-zero starting budget. |
 
 ## Glossary seeds (product-owner owns and grows this)
+
 **Organization** (the tenant/business) · **Member** (a user inside an org) · **Role** (org-defined permission set) · **Product** · **Restock** (stock in) · **Sale** (stock out, has payment method + currency) · **Refund** · **Period** (daily/weekly/biweekly/monthly/custom, org-timezone-bounded) · **Report** (rendered, branded output of a period).
 
 ## Explicitly out of scope for v1
+
 Online payment processing · social login · USD as base currency · POS/e-commerce integrations · global/multi-country launch.

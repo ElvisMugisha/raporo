@@ -4,17 +4,19 @@
 > Statuses: ✅ done · 🔄 in progress · ⏳ pending · ⛔ blocked (say by what).
 > Rules: never delete rows — flip statuses and date them. One line of note per flip. Details live in the linked docs, not here.
 
-**📍 NOW:** Phase B, Step 1 — architecture presented, **awaiting Elvis's blessing on 4 points** (monolith · ledger/movements · session auth · folder layout). Next: Step 2 database schema.
+**📍 NOW:** Phase B, Step 3 — schema approved (D1/D2/D3 as recommended + mandatory-FX rule added); full design spec written at `docs/superpowers/specs/2026-09-01-raporo-architecture-and-schema-design.md`, **awaiting Elvis's review**. After review: implementation planning, then slice 1 build.
 
 ---
 
 ## Phase 0 — Team & tooling foundation ✅ (2026-08-31)
+
 - ✅ 19-agent senior team + 5-phase pipeline (`.claude/agents/`, ADR 0004)
 - ✅ Rules distributed into owning agents; gate skills `/production-readiness`, `/web-launch` (ADR 0005)
 - ✅ Vendored skills + plugins + Playwright CLI (ADR 0002, 0003) · Headroom wired · setup.sh green
 - ✅ Portable repo setup (CLAUDE.md, settings, bootstrap — ADR 0001)
 
 ## Phase A — Product understanding ✅ (2026-08-31 → 09-01)
+
 - ✅ Stack decided: Django 6.1, Postgres, Docker (ADR 0006); frontend switched to **Django templates + HTMX** (ADR 0007, replaces React)
 - ✅ Product brief: [PRODUCT.md](PRODUCT.md) (all decisions) · narrative: [PROJECT-DESCRIPTION.md](PROJECT-DESCRIPTION.md)
 - ✅ Sample reports decoded (orders/deposits, credit, stock ledger, igishoro/inyungu)
@@ -22,27 +24,32 @@
 - ✅ Biweekly confirmed by Elvis (2026-09-01): 1–15 and 16–end of month
 
 ## Phase B — Architecture & design 🔄
-- 🔄 **Step 1: architecture + project structure** — presented 2026-09-01 (modular monolith at repo root, ledger/movements, session auth + hardening, app layout). ⛔ Awaiting Elvis's explicit blessing of the 4 points.
-- ⏳ **Step 2: database schema** — every table/field, movement ledger, invariant #1 in models, soft-delete, 2FA + invite fields. (After Step 1 blessing.)
-- ⏳ **Step 3: written spec** — design doc committed (`docs/superpowers/specs/`), Elvis reviews, then implementation planning.
+
+- ✅ **Step 1: architecture + project structure** — approved by Elvis 2026-09-01 (modular monolith at repo root, ledger/movements, session auth + hardening, app layout).
+- ✅ **Step 2: database schema** — approved by Elvis 2026-09-01: D1 store-scoped products, D2 store-scoped customers, D3 cycle-owned variants; plus mandatory exchange-rate rule for any foreign-currency money (UI blocks without it; converted base amount always stored).
+- 🔄 **Step 3: written spec** — written 2026-09-01 (`docs/superpowers/specs/2026-09-01-raporo-architecture-and-schema-design.md`); awaiting Elvis's review, then implementation planning.
 - ⏳ ADR: report rendering tech (HTML→PDF/image) — decided during slice 4 design.
 
 ## Phase C — Build (six slices; each runs the full `/new-feature` pipeline: define → design → build+gates → harden → ship)
-| # | Slice | Scope anchor | Status |
-|---|---|---|---|
-| 1 | Foundation | accounts (username/email/phone), max-security auth, 2FA-ready login flow, invite links, orgs, stores (1–5), custom RBAC, audit/soft-delete core, i18n + header switcher, Docker skeleton | ⏳ |
-| 2 | Products & stock | per-store stock, variants/packs, restocks (cost + optional expiry), floor=cost rule, reference/latest prices, write-offs with reasons | ⏳ |
-| 3 | Selling & owing | sales (negotiated ≥ floor), orders + deposits + ✅ lifecycle, customers, credit book ("who owes us"), payments in/out | ⏳ |
-| 4 | The Report | period engine (org TZ, biweekly 1–15/16–end), per-store + consolidated org reports, branded, WhatsApp-shareable image + PDF | ⏳ |
-| 5 | Money intelligence | expenses, investors (capital accounts, optional user link), cycles (co-investor % shares, profit splits, payouts), detail-page analytics | ⏳ |
-| 6 | Alerts & automation | low-stock + expiry alerts, scheduled report sending (Celery beat arrives), org branding settings | ⏳ |
+
+| #   | Slice               | Scope anchor                                                                                                                                                                             | Status |
+| --- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
+| 1   | Foundation          | accounts (username/email/phone), max-security auth, 2FA-ready login flow, invite links, orgs, stores (1–5), custom RBAC, audit/soft-delete core, i18n + header switcher, Docker skeleton | ⏳     |
+| 2   | Products & stock    | per-store stock, variants/packs, restocks (cost + optional expiry), floor=cost rule, reference/latest prices, write-offs with reasons                                                    | ⏳     |
+| 3   | Selling & owing     | sales (negotiated ≥ floor), orders + deposits + ✅ lifecycle, customers, credit book ("who owes us"), payments in/out                                                                    | ⏳     |
+| 4   | The Report          | period engine (org TZ, biweekly 1–15/16–end), per-store + consolidated org reports, branded, WhatsApp-shareable image + PDF                                                              | ⏳     |
+| 5   | Money intelligence  | expenses, investors (capital accounts, optional user link), cycles (co-investor % shares, profit splits, payouts), detail-page analytics                                                 | ⏳     |
+| 6   | Alerts & automation | low-stock + expiry alerts, scheduled report sending (Celery beat arrives), org branding settings                                                                                         | ⏳     |
 
 ## Phase D — Launch ⏳
+
 - ⏳ `/production-readiness` full pass · `/web-launch` for public pages · deploy (Dokploy/Coolify VPS) · Rwanda Law 058/2021 privacy pass
 
 ## Later / explicitly deferred
+
 Social login · SMS OTP · USD base option · DRF API + OpenAPI docs (when mobile/integration is real — service layer keeps it cheap) · POS/e-commerce integrations · >5 stores · full offline entry · global launch
 
 ## Standing notes
+
 - Commits/merges are **human actions** (settings deny agent git writes) — when a step lands, Elvis commits, then flip the status here in the same change.
 - Every slice's gates (code-reviewer, security-engineer, data-reporting-engineer where relevant, tech-lead merge) must produce output — no silent skips.

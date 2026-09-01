@@ -27,7 +27,7 @@ This is Elvis's "I give a friend 350K to invest" scenario, exactly as practiced 
 ## What the samples teach us (decoded)
 
 | Report section | Meaning (as understood) | Raporo concept |
-|---|---|---|
+| --- | --- | --- |
 | **COMMAND** — `Complete(Albert) 70k (T.50k)`, `4Trauser(Joram) 100k✅` | Confirmed: customer orders by name at an agreed price; "T.50k" = 50k deposit paid; ✅ = fully paid/delivered. | Customer **order**: money actually received (deposit/full) counts in the day's sales; the unpaid balance becomes a tracked debt ("who owes us"), filterable so the owner can follow up. An order with nothing paid is visible but counts no revenue. |
 | **SALES** — `6Shirt made in Rda 180k` | Line items: quantity × product = amount. Unit prices vary between sales (rice sacks: 45k, 39k, 42k…) — prices are negotiated per sale. | **Sale** with line items; actual price recorded per sale |
 | **PAYMENT — 0** | Confirmed: money movements beyond plain sales — credit collections in, AND money out for purchases/inputs (restocks, materials to make suits/shirts), with payment methods recorded. | **Payments in** (credit book) + **money out** (purchases/expenses) — the basis for investment-vs-return, which-product-wins, where-to-cut analysis |

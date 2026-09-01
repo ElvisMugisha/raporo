@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git branch:*)",
+      "Bash(ls:*)",
+      "Bash(node --version)",
+      "Bash(npm run:*)",
+      "Bash(npm test:*)",
+      "Bash(python3 --version)",
+      "Bash(python3 .claude/skills/ui-ux-pro-max/scripts/*)",
+      "Bash(headroom status:*)",
+      "Bash(headroom stats:*)",
+      "Bash(headroom doctor)",
+      "Bash(playwright-cli:*)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./**/secrets/**)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git reset:*)",
+      "Bash(git rebase:*)",
+      "Bash(rm -rf /*)"
+    ]
+  },
+  "extraKnownMarketplaces": {
+    "superpowers-marketplace": {
+      "source": { "source": "github", "repo": "obra/superpowers-marketplace" }
+    },
+    "impeccable": {
+      "source": { "source": "github", "repo": "pbakaus/impeccable" }
+    },
+    "thedotmack": {
+      "source": { "source": "github", "repo": "thedotmack/claude-mem" }
+    },
+    "claude-code-plugins": {
+      "source": { "source": "github", "repo": "anthropics/claude-code" }
+    }
+  },
+  "enabledPlugins": {
+    "superpowers@superpowers-marketplace": true,
+    "impeccable@impeccable": true,
+    "claude-mem@thedotmack": true,
+    "security-guidance@claude-code-plugins": true,
+    "claude-code-setup@claude-plugins-official": true
+  },
+  "enableAllProjectMcpServers": false
+}

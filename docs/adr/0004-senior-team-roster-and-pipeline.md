@@ -1,0 +1,13 @@
+# 0004. Nineteen-role senior team with a five-phase delivery pipeline
+
+Date: 2026-08-31
+Status: Accepted
+
+## Context
+The original team was six generalist agents (architect, code-reviewer, security-auditor, test-engineer, devops-engineer, docs-writer). That covers review and design but leaves whole disciplines implicit: nobody owns requirements, API contracts, the data model, observability, performance, reporting correctness, privacy, i18n, or prose quality — so those concerns surface late or never. We want production-grade output by default, which means each discipline needs an owner with deep expertise and a defined checkpoint, plus explicit routing so the vendored design skills (ADR 0002) get used by the right role at the right time.
+
+## Decision
+We staff the team as 19 specialist roles in `.claude/agents/`, each written as a 20-year veteran of one discipline: nine core-delivery roles (product-owner, tech-lead, architect, ux-designer, backend-engineer, frontend-engineer, integration-engineer, database-engineer, qa-engineer), six checkpoint gates (code-reviewer, security-engineer, devops-engineer, sre-observability, data-reporting-engineer, performance-engineer), and four advisory roles (tech-writer, craft-editor, localization-engineer, privacy-compliance). Delivery follows the five-phase pipeline encoded in `/new-feature`: Define → Design → Build (per vertical slice, with blocking gates) → Harden → Ship. Skill lanes are routed inside each agent (ux-designer/frontend-engineer own the design skills, integration/qa own playwright-cli, architect owns /adr). Three roles are renames of existing agents (security-auditor→security-engineer, test-engineer→qa-engineer, docs-writer→tech-writer). Rejected: keeping six generalists (disciplines without owners get skipped under pressure); adding further roles now — release manager (tech-lead + devops cover it), accessibility specialist (spec'd by ux-designer, tested by qa-engineer), mobile/ML engineers (no stack decision yet; add when the stack demands them).
+
+## Consequences
+Easier: every production concern has a named owner and a checkpoint where it blocks; parallel build against a signed contract; specs and reviews arrive in a consistent shape. Harder: more orchestration per feature — mitigated by shrinking phases (never skipping gates) for small work, and by only the invoked agent's file loading into context. The roster is code: changes to `.claude/agents/` go through code review like everything else. Revisit when the stack is chosen (stack-specific rules per agent, possible mobile/data roles) or if pipeline overhead visibly outweighs defect prevention on small slices.

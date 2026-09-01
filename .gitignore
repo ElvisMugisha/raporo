@@ -223,3 +223,7 @@ CLAUDE.local.md
 .claude/projects/
 .claude/todos/
 .claude/statsig/
+
+# Uploaded files. MEDIA_ROOT now lives outside the repo (settings/base.py);
+# this stays as a backstop in case someone points it back in here.
+/media/

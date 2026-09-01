@@ -32,14 +32,20 @@
 
 ## Phase C — Build (six slices; each runs the full `/new-feature` pipeline: define → design → build+gates → harden → ship)
 
-| #   | Slice               | Scope anchor                                                                                                                                                                             | Status |
-| --- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
+| #   | Slice               | Scope anchor                                                                                                                                                                             | Status                                                                                                                                                 |
+| --- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | 1   | Foundation          | accounts (username/email/phone), max-security auth, 2FA-ready login flow, invite links, orgs, stores (1–5), custom RBAC, audit/soft-delete core, i18n + header switcher, Docker skeleton | ⏳ **plan ready** — `docs/superpowers/plans/2026-09-01-slice-1-foundation.md` (14 tasks incl. emailed password reset; email required for all accounts) |
-| 2   | Products & stock    | per-store stock, variants/packs, restocks (cost + optional expiry), floor=cost rule, reference/latest prices, write-offs with reasons                                                    | ⏳     |
-| 3   | Selling & owing     | sales (negotiated ≥ floor), orders + deposits + ✅ lifecycle, customers, credit book ("who owes us"), payments in/out                                                                    | ⏳     |
-| 4   | The Report          | period engine (org TZ, biweekly 1–15/16–end), per-store + consolidated org reports, branded, WhatsApp-shareable image + PDF                                                              | ⏳     |
-| 5   | Money intelligence  | expenses, investors (capital accounts, optional user link), cycles (co-investor % shares, profit splits, payouts), detail-page analytics                                                 | ⏳     |
-| 6   | Alerts & automation | low-stock + expiry alerts, scheduled report sending (Celery beat arrives), org branding settings                                                                                         | ⏳     |
+| 2   | Products & stock    | per-store stock, variants/packs, restocks (cost + optional expiry), floor=cost rule, reference/latest prices, write-offs with reasons                                                    | ⏳                                                                                                                                                     |
+| 3   | Selling & owing     | sales (negotiated ≥ floor), orders + deposits + ✅ lifecycle, customers, credit book ("who owes us"), payments in/out                                                                    | ⏳                                                                                                                                                     |
+| 4   | The Report          | period engine (org TZ, biweekly 1–15/16–end), per-store + consolidated org reports, branded, WhatsApp-shareable image + PDF                                                              | ⏳                                                                                                                                                     |
+| 5   | Money intelligence  | expenses, investors (capital accounts, optional user link), cycles (co-investor % shares, profit splits, payouts), detail-page analytics                                                 | ⏳                                                                                                                                                     |
+| 6   | Alerts & automation | low-stock + expiry alerts, scheduled report sending (Celery beat arrives), org branding settings                                                                                         | ⏳                                                                                                                                                     |
+
+### Cross-slice decisions taken mid-build (must not be lost)
+- ✅ **Branding chain (2026-09-01):** store → org → Raporo default; per-store `use_own_branding` toggle (empty = inherit); store name always local; logo/colors/typography inherit; consolidated report uses org branding. Recorded in PRODUCT.md + design spec §4-orgs.
+  - ⏳ **Slice 1 (now):** add `Store.brand` (JSONB, default `{}`) + `Store.use_own_branding` (bool, default False) — folded into the *uncommitted* `orgs/0001_initial` so no extra migration is spent.
+  - ⏳ **Slice 4:** implement `resolve_branding(store)` and use it in every report/share-card/PDF path.
+  - ⏳ **Slice 6:** settings UI for editing org and store branding, including the toggle.
 
 ## Phase D — Launch ⏳
 

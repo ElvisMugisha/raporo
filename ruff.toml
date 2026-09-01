@@ -1,0 +1,23 @@
+target-version = "py313"
+line-length = 100
+
+extend-exclude = [
+    ".claude",
+    ".superpowers",
+    ".remember",
+    "docs",
+    "env",
+]
+
+[lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = []
+
+[lint.isort]
+known-first-party = ["apps", "common", "config"]
+
+[lint.per-file-ignores]
+# Django writes migrations for us: its one-line field definitions run far past
+# any line length, and it emits imports in its own order (first-party `common`
+# validators next to django ones). We do not hand-format generated code.
+"**/migrations/*.py" = ["E501", "I001"]

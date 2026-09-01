@@ -1,0 +1,11 @@
+Django==6.1
+psycopg[binary]==3.3.5
+argon2-cffi==25.1.0
+pyotp==2.10.0
+cryptography==50.0.1
+pytest==9.1.1
+pytest-django==4.14.0
+ruff==0.16.5
+# Verifies uploaded logos are really PNG/JPEG/WebP by decoding the bytes
+# (an attacker picks the extension), and backs Django's ImageField.
+Pillow==12.3.0

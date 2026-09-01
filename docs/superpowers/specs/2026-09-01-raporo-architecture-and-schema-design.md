@@ -40,7 +40,8 @@ Types abbreviated; all tables get SoftDelete + Audited unless noted. PKs are Big
 ### orgs
 
 - **Organization**: `name` · `slug` UNIQUE · `logo` · `brand` JSONB (color/typography tokens) · `base_currency` CHAR(3) default RWF · `timezone` default Africa/Kigali.
-- **Store**: FK Organization · `name`; UNIQUE(org, name). 1–5 stores enforced in `create_store` service under `SELECT … FOR UPDATE` on the org row.
+- **Branding resolution (confirmed 2026-09-01).** One helper `resolve_branding(store)` owns the whole chain so no report, share card or PDF re-implements it: if `store.use_own_branding` is False → org branding, else store's `brand` with per-field fallback to org, then to the Raporo default token set. Store **name** never inherits (always the store's own). Consolidated cross-store reports resolve against the org, by definition. `Store.brand` is store-scoped data like everything else, so invariant #1 covers it unchanged.
+- **Store**: FK Organization · `name` · `brand` JSONB (default empty dict — same token-bag shape as `Organization.brand`) · `use_own_branding` BOOLEAN default False; UNIQUE(org, name). 1–5 stores enforced in `create_store` service under `SELECT … FOR UPDATE` on the org row.
 - **Role**: FK Organization · `name` · `permissions` JSONB array of codes from the in-code catalog (e.g. `sale.record`, `sale.below_floor_override`, `stock.write_off`, `invite.create`, `report.generate`, `cycle.manage`, `member.manage`, `expense.record`) · `is_preset`. UNIQUE(org, name).
 - **Membership**: FK User · FK Organization · FK Role · UNIQUE(user, org).
 - **StoreAccess**: FK Membership · FK Store · UNIQUE(membership, store). Org-wide roles (Owner) get all stores via service, still materialized here (explicit > implicit).

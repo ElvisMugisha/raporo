@@ -27,7 +27,7 @@ This is Elvis's "I give a friend 350K to invest" scenario, exactly as practiced 
 ## What the samples teach us (decoded)
 
 | Report section | Meaning (as understood) | Raporo concept |
-|---|---|---|
+| --- | --- | --- |
 | **COMMAND** — `Complete(Albert) 70k (T.50k)`, `4Trauser(Joram) 100k✅` | Confirmed: customer orders by name at an agreed price; "T.50k" = 50k deposit paid; ✅ = fully paid/delivered. | Customer **order**: money actually received (deposit/full) counts in the day's sales; the unpaid balance becomes a tracked debt ("who owes us"), filterable so the owner can follow up. An order with nothing paid is visible but counts no revenue. |
 | **SALES** — `6Shirt made in Rda 180k` | Line items: quantity × product = amount. Unit prices vary between sales (rice sacks: 45k, 39k, 42k…) — prices are negotiated per sale. | **Sale** with line items; actual price recorded per sale |
 | **PAYMENT — 0** | Confirmed: money movements beyond plain sales — credit collections in, AND money out for purchases/inputs (restocks, materials to make suits/shirts), with payment methods recorded. | **Payments in** (credit book) + **money out** (purchases/expenses) — the basis for investment-vs-return, which-product-wins, where-to-cut analysis |
@@ -53,7 +53,7 @@ This is Elvis's "I give a friend 350K to invest" scenario, exactly as practiced 
 
 ## Foundation decisions already made (docs/PRODUCT.md, ADR 0006)
 
-Django 6.1 + DRF, PostgreSQL, React SPA, Docker, Redis/Celery when scheduling arrives · org-level custom RBAC · base currency Rwf with frozen-rate foreign payments · org timezone (default Africa/Kigali) · login by username/email/phone + password · EN/Kinyarwanda/FR · ≥10-year record retention · Dokploy/Coolify hosting.
+Django 6.1, PostgreSQL, Django templates + HTMX (ADR 0007 — replaced the earlier React choice), Docker, Redis/Celery when scheduling arrives · org-level custom RBAC · base currency Rwf with frozen-rate foreign payments · org timezone (default Africa/Kigali) · login by username/email/phone + password · EN/Kinyarwanda/FR · ≥10-year record retention · Dokploy/Coolify hosting.
 
 ## Decisions from the Q&A round (Elvis, 2026-08-31 evening)
 

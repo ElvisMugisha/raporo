@@ -33,7 +33,7 @@ Types abbreviated; all tables get SoftDelete + Audited unless noted. PKs are Big
 
 ### accounts
 
-- **User** (AbstractBaseUser): `username` citext UNIQUE · `email` citext UNIQUE NULL · `phone` VARCHAR(15) UNIQUE (digits, country code, no `+`; validated E.164-without-plus) · `password` (argon2id) · `language` CHAR(2) in {en, rw, fr} · `is_active`. Login accepts any of the three identifiers via one auth backend; responses never reveal which part failed (no enumeration).
+- **User** (AbstractBaseUser): `username` citext UNIQUE · `email` citext UNIQUE **required** (decided 2026-09-01: email is the password-reset channel for everyone, including phone-first users) · `phone` VARCHAR(15) UNIQUE (digits, country code, no `+`; validated E.164-without-plus) · `password` (argon2id) · `language` CHAR(2) in {en, rw, fr} · `is_active`. Login accepts any of the three identifiers via one auth backend; responses never reveal which part failed (no enumeration).
 - **TwoFactor**: OneToOne(User) · `totp_secret` (encrypted at rest with app key) · `confirmed_at`. Login is two-stage from slice 1: stage 2 renders only when the row exists.
 - **RecoveryCode**: FK User · `code_hash` · `used_at`. 10 per enablement.
 
@@ -91,7 +91,7 @@ Types abbreviated; all tables get SoftDelete + Audited unless noted. PKs are Big
 - **Register** → creates User + Organization + first Store + Owner membership (one transaction). Phone mandatory (country code, no `+`), language captured, email optional.
 - **Login**: identifier (username|email|phone) + password → constant-time lookup across the three, argon2id verify, uniform error. Rate limit: per-identifier and per-IP counters (cache), lockout with backoff; all attempts audited. Stage 2 = TOTP (or recovery code) when TwoFactor confirmed. Session cookie: Secure, HttpOnly, SameSite=Lax; rotation on login; CSRF everywhere.
 - **Invite accept**: raw token → hash lookup; valid = not used, not revoked, not expired; new or existing user binds Membership + StoreAccess in the invite's transaction; token consumed atomically.
-- **Password reset**: token via email (or displayed to org admin for phone-only users — v1 pragmatic path), single-use, expiring, non-enumerating.
+- **Password reset** (2026-09-01): everyone resets via an emailed link — single-use, expiring (1h), non-enumerating (the response is identical whether the email exists or not). Email is therefore required at registration. Dev: console email backend; prod: SMTP via env vars.
 
 ## 6. Period engine (reporting)
 
@@ -118,4 +118,4 @@ Report rendering tech (HTML→PDF/image) — ADR during slice 4 · alert deliver
 
 ## Self-review (done before handing to Elvis)
 
-Placeholders: none. Contradictions: checked — FX rule consistent across §3.5/§4 (line prices base-only); D1–D3 reflected in catalog/sales/money; 2FA staged flow consistent between §4 accounts and §5. Scope: this spec covers architecture + schema + flows; per-slice implementation plans come next and stay separate. Ambiguities resolved by naming them: floor = latest_cost (v1 policy, revisit trigger stated), password reset for phone-only users via admin-displayed token.
+Placeholders: none. Contradictions: checked — FX rule consistent across §3.5/§4 (line prices base-only); D1–D3 reflected in catalog/sales/money; 2FA staged flow consistent between §4 accounts and §5. Scope: this spec covers architecture + schema + flows; per-slice implementation plans come next and stay separate. Ambiguities resolved by naming them: floor = latest_cost (v1 policy, revisit trigger stated), password reset via emailed link for all users (email required at registration — decided 2026-09-01).

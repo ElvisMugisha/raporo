@@ -4,7 +4,7 @@
 > Statuses: ✅ done · 🔄 in progress · ⏳ pending · ⛔ blocked (say by what).
 > Rules: never delete rows — flip statuses and date them. One line of note per flip. Details live in the linked docs, not here.
 
-**📍 NOW:** Phase B, Step 3 — schema approved (D1/D2/D3 as recommended + mandatory-FX rule added); full design spec written at `docs/superpowers/specs/2026-09-01-raporo-architecture-and-schema-design.md`, **awaiting Elvis's review**. After review: implementation planning, then slice 1 build.
+**📍 NOW:** Slice 1 build ready to start (2026-09-01): plan has 14 tasks, execution mode = subagent-driven (default per tech-lead recommendation). Waiting on Elvis's commit+push of Phase A/B docs, then Task 0 begins.
 
 ---
 
@@ -27,14 +27,14 @@
 
 - ✅ **Step 1: architecture + project structure** — approved by Elvis 2026-09-01 (modular monolith at repo root, ledger/movements, session auth + hardening, app layout).
 - ✅ **Step 2: database schema** — approved by Elvis 2026-09-01: D1 store-scoped products, D2 store-scoped customers, D3 cycle-owned variants; plus mandatory exchange-rate rule for any foreign-currency money (UI blocks without it; converted base amount always stored).
-- 🔄 **Step 3: written spec** — written 2026-09-01 (`docs/superpowers/specs/2026-09-01-raporo-architecture-and-schema-design.md`); awaiting Elvis's review, then implementation planning.
+- ✅ **Step 3: written spec** — accepted 2026-09-01. Slice-1 plan: `docs/superpowers/plans/2026-09-01-slice-1-foundation.md` (14 tasks — password reset included as Task 9b after Elvis's email-required decision).
 - ⏳ ADR: report rendering tech (HTML→PDF/image) — decided during slice 4 design.
 
 ## Phase C — Build (six slices; each runs the full `/new-feature` pipeline: define → design → build+gates → harden → ship)
 
 | #   | Slice               | Scope anchor                                                                                                                                                                             | Status |
 | --- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
-| 1   | Foundation          | accounts (username/email/phone), max-security auth, 2FA-ready login flow, invite links, orgs, stores (1–5), custom RBAC, audit/soft-delete core, i18n + header switcher, Docker skeleton | ⏳     |
+| 1   | Foundation          | accounts (username/email/phone), max-security auth, 2FA-ready login flow, invite links, orgs, stores (1–5), custom RBAC, audit/soft-delete core, i18n + header switcher, Docker skeleton | ⏳ **plan ready** — `docs/superpowers/plans/2026-09-01-slice-1-foundation.md` (14 tasks incl. emailed password reset; email required for all accounts) |
 | 2   | Products & stock    | per-store stock, variants/packs, restocks (cost + optional expiry), floor=cost rule, reference/latest prices, write-offs with reasons                                                    | ⏳     |
 | 3   | Selling & owing     | sales (negotiated ≥ floor), orders + deposits + ✅ lifecycle, customers, credit book ("who owes us"), payments in/out                                                                    | ⏳     |
 | 4   | The Report          | period engine (org TZ, biweekly 1–15/16–end), per-store + consolidated org reports, branded, WhatsApp-shareable image + PDF                                                              | ⏳     |

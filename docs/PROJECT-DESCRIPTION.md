@@ -20,7 +20,9 @@ The Silver Rice report is a different, equally important use. Someone put **350,
 - *Inyungu y'ibyacurujwe* — profit on what was sold: **60,500**
 - *REST* — 2 sacks still in stock (70,000 of capital still working)
 
-This is Elvis's "I give a friend 350K to invest" scenario, exactly as practiced today. Raporo should make this a first-class concept: an **investment cycle** — capital in, purchases linked, sales tracked, and at any moment the answer to *how is my money doing?* (revenue, cost of goods sold, profit so far, capital still tied up in stock, over what period).
+This is Elvis's "I give a friend 350K to invest" scenario, exactly as practiced today.
+
+**Investors are first-class (added 2026-09-01).** An organization keeps a list of investors. Each investor has a profile with a capital account: every contribution is dated and recorded (the initial 350k, and any top-ups later — capital can grow over time). Cycles belong to an investor; under an investor's profile you see how their money is working: capital contributed, capital currently tied up in stock, revenue, igishoro, inyungu realized, payouts taken, ROI, and how long each cycle ran. Each investor gets their own report — per cycle and across all their cycles — separate from the shop's daily sales report. Raporo should make this a first-class concept: an **investment cycle** — capital in, purchases linked, sales tracked, and at any moment the answer to *how is my money doing?* (revenue, cost of goods sold, profit so far, capital still tied up in stock, over what period).
 
 ## What the samples teach us (decoded)
 
@@ -40,7 +42,7 @@ This is Elvis's "I give a friend 350K to invest" scenario, exactly as practiced 
 - **Owner/Admin** — creates the organization, brands it (logo, colors), invites members, defines custom roles and permissions, promotes/demotes, sees everything, receives reports.
 - **Manager / Seller** (org-defined roles) — records sales, restocks, orders, payments as they happen.
 - **The boss/investor** — often not a user at all: they receive the finished report and judge the business (and the app) by it. The report is the product's face.
-- **Investor-owner** — runs investment cycles and watches capital, sales, and inyungu per cycle.
+- **Investor** — a profile in the organization's investor list (may or may not be a system user). Has a capital account (contributions and top-ups over time), owns cycles, receives per-investor reports: capital working, inyungu realized, payouts, ROI, duration.
 
 ## What Raporo promises
 
@@ -60,6 +62,10 @@ Django 6.1 + DRF, PostgreSQL, React SPA, Docker, Redis/Celery when scheduling ar
 3. **Pricing (confirmed 17:29):** reference price per product, actual negotiated price per sale, no ceiling — 40k, 45k, 55k all welcome. The floor **is the purchase cost**: a product can never be sold below what it was bought for (35k rice never sells at 30k). The floor comes from the recorded cost automatically, not from a manually set field.
 4. **Costing:** weighted average for shop COGS; exact per-batch inside investment cycles; and always surface the **latest purchase cost** (current replacement cost) — it informs the floor and stock value.
 5. **Investment cycles: v1.** 6. **Entry: both** live per-sale (mobile-first) and end-of-day batch. 7. **Customers: lightweight** (name, optional phone) on orders/credit. 8. **Delivery: WhatsApp-first** — beautiful shareable image + PDF, one-tap share; scheduled sending later. 9. **Expenses: in v1** — simple expense log so profit is honest. 10. **Connectivity: online-first**, entry screens tolerate brief drops gracefully.
+
+## Final completeness round (Elvis, 2026-09-01 morning)
+
+A-b: profit splits stored per cycle and computed. B-b: investor profiles optionally link to real accounts (read-only watching). C-b: co-investors allowed, % shares per cycle. D-a: write-offs with mandatory reasons. E-a plus: **soft deletion only — nothing is ever really deleted**; every action records its actor. F-b: **1–5 stores per organization**, store-scoped everything with per-store analytics + consolidated org view. G-b: alerts in v1 — low stock and **expiring goods** (restock batches carry optional expiry dates). Cross-cutting principle: every detail page (product, investor, store) shows everything under it with its actions attached. Confirmed inferences: org-level consolidated reports comparing all stores; optional expiry date per restock batch. **Invariant #1 (Elvis, verbatim intent): everything connects to a store and above it an org — data must never mix between stores or orgs at any point.**
 
 ## Explicitly not in v1
 

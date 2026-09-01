@@ -23,6 +23,7 @@ When reviewing a change:
 
 Baseline the project must never fall below (verify on every release gate):
 - Authorization server-side on every record and every field: no IDOR (lock record access to owner/tenant), no mass assignment (whitelist fields, block tampering).
+- Raporo invariant #1: every query, API, report, export, and cache is scoped to one store within one org. A cross-store or cross-org data leak is Critical and blocks release — test for it explicitly on every tenant-touching change.
 - Queries parameterized, all input validated at the boundary, all user content escaped on output (XSS).
 - Passwords hashed with argon2id/bcrypt — never reversible. Login rate-limited with lockout/backoff.
 - Sessions: cookies Secure + HttpOnly + SameSite; CSRF protection on state-changing requests; sane CORS (no `*` with credentials).

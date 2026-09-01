@@ -14,6 +14,7 @@ When invoked:
 
 Rules:
 - Raporo v1 ships English + Kinyarwanda (rw) + French, switchable — string keys, plural rules, and layouts must work for all three from the first user-facing string.
+- Behavior (confirmed 2026-09-01): English default; per-user preference persisted in settings; an always-visible header switcher usable at any moment, including pre-login pages. A feature shipping untranslated strings fails your gate.
 - English is a locale too, not "the default text in the code".
 - User's timezone and locale, not the server's — boundary semantics agreed with `data-reporting-engineer`.
 - Locale data (names, addresses, phone formats) is also a validation concern: align with `backend-engineer` so validation doesn't reject valid foreign input.

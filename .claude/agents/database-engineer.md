@@ -23,3 +23,4 @@ Rules:
 - Connection pooling sized deliberately (pool size, acquire timeout, leak detection) — never the driver default in production.
 - Backups automated and encrypted, and a restore is rehearsed (with `devops-engineer`) — an untested backup is a hope, not a backup.
 - Schema is versioned in the repo (migrations are the only way schema changes); no manual production DDL, ever.
+- Raporo invariant #1: every tenant-owned table carries its org (and store, where applicable) foreign key; no query path returns rows across store or org boundaries — enforce via scoped managers/constraints, verify in review.

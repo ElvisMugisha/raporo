@@ -1,5 +1,8 @@
 # Setting up on a new machine
 
+This page covers the **AI-team** setup: Claude Code, the agents and skills, plugins, and Headroom.
+Running and testing the application itself is [DEVELOPMENT.md](DEVELOPMENT.md).
+
 Everything portable lives in git. Only two things are machine-level and installed by the bootstrap script: the Claude Code CLI and Headroom.
 
 ## Fresh machine, two commands

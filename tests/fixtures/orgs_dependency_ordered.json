@@ -1,0 +1,115 @@
+[
+  {
+    "model": "orgs.organization",
+    "pk": 1,
+    "fields": {
+      "created_at": "2026-01-01T00:00:00Z",
+      "updated_at": "2026-01-01T00:00:00Z",
+      "created_by": null,
+      "updated_by": null,
+      "deleted_at": null,
+      "deleted_by": null,
+      "name": "Eva Shop",
+      "slug": "eva-shop",
+      "logo": "",
+      "brand": {},
+      "base_currency": "RWF",
+      "timezone": "Africa/Kigali"
+    }
+  },
+  {
+    "model": "accounts.user",
+    "pk": 1,
+    "fields": {
+      "password": "!unusable",
+      "last_login": "2026-01-01T00:00:00Z",
+      "is_superuser": false,
+      "username": "eva",
+      "email": "eva@example.rw",
+      "phone": "250788000001",
+      "language": "en",
+      "is_active": true,
+      "is_staff": false,
+      "date_joined": "2026-09-01T17:38:35.240Z",
+      "groups": [],
+      "user_permissions": []
+    }
+  },
+  {
+    "model": "orgs.store",
+    "pk": 1,
+    "fields": {
+      "created_at": "2026-01-01T00:00:00Z",
+      "updated_at": "2026-01-01T00:00:00Z",
+      "created_by": null,
+      "updated_by": null,
+      "deleted_at": null,
+      "deleted_by": null,
+      "org": 1,
+      "name": "Main",
+      "brand": {},
+      "use_own_branding": false
+    }
+  },
+  {
+    "model": "orgs.role",
+    "pk": 1,
+    "fields": {
+      "created_at": "2026-01-01T00:00:00Z",
+      "updated_at": "2026-01-01T00:00:00Z",
+      "created_by": null,
+      "updated_by": null,
+      "deleted_at": null,
+      "deleted_by": null,
+      "org": 1,
+      "name": "Owner",
+      "permissions": [],
+      "is_preset": true
+    }
+  },
+  {
+    "model": "orgs.membership",
+    "pk": 1,
+    "fields": {
+      "created_at": "2026-01-01T00:00:00Z",
+      "updated_at": "2026-01-01T00:00:00Z",
+      "created_by": null,
+      "updated_by": null,
+      "deleted_at": null,
+      "deleted_by": null,
+      "user": 1,
+      "org": 1,
+      "role": 1
+    }
+  },
+  {
+    "model": "orgs.storeaccess",
+    "pk": 1,
+    "fields": {
+      "created_at": "2026-01-01T00:00:00Z",
+      "updated_at": "2026-01-01T00:00:00Z",
+      "created_by": null,
+      "updated_by": null,
+      "deleted_at": null,
+      "deleted_by": null,
+      "membership": 1,
+      "store": 1,
+      "org": 1
+    }
+  },
+  {
+    "model": "audit.auditlog",
+    "pk": 1,
+    "fields": {
+      "org": 1,
+      "store": 1,
+      "actor": 1,
+      "action": "store.created",
+      "target_type": "orgs.store",
+      "target_id": 1,
+      "changes": {},
+      "ip": null,
+      "at": "2026-01-01T00:00:00Z"
+    }
+  }
+]

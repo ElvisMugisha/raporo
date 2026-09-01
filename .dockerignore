@@ -1,5 +1,10 @@
 .git
-.env
+
+# Every .env shape, template included: nothing inside an image reads a
+# template, and `.env` alone would have baked a `.env.production` or
+# `.env.staging` sitting in a developer's checkout into an image layer.
+.env*
+
 env/
 venv/
 __pycache__/
@@ -10,4 +15,13 @@ __pycache__/
 .superpowers/
 .remember/
 docs/
+
+# AI-team config: no image stage reads either, and in dev the `.:/app` bind
+# mount supplies them from the host anyway.
+CLAUDE.md
+.mcp.json
 node_modules/
+
+# Machine-local compose overrides never belong in an image.
+compose.override.y*ml
+docker-compose.override.y*ml

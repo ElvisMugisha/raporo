@@ -16,6 +16,14 @@ else's query - has to build a compiler, so one hook covers paths a
 because Django swaps the query class (`UpdateQuery`) or skips it entirely
 (`create`, `bulk_create`).
 
+Combining two querysets is guarded the same way - at the seam, not on a list of
+method names. `|`, `&` and `^` all reach `sql.Query.combine`; `union()`,
+`intersection()` and `difference()` all reach `QuerySet._combinator_query`. Both
+are overridden, so an operator Django adds later is covered by construction:
+enumerating dunders is exactly how `^` shipped unguarded, and how
+`for_store(A) | for_store(RIVAL)` stayed a synonym for the `for_stores([A,
+RIVAL])` that `_store_pks()` already refused.
+
 The messages here are for developers, not users: reaching them means a bug in
 our code, never bad input from a request. They stay untranslated on purpose.
 """
@@ -27,6 +35,7 @@ from collections.abc import Iterable
 from django.apps import apps as global_apps
 from django.db import models
 from django.db.models.sql import Query
+from django.db.models.sql.where import AND
 from django.utils import timezone
 
 STORE_LABEL = "orgs.store"
@@ -133,6 +142,27 @@ def require_actor(by, system: bool):
     return by
 
 
+def merge_scope_pks(left_pks, right_pks, connector: str) -> tuple[int, ...]:
+    """The store set a combined query is pinned to, resolved - never assumed.
+
+    A plain set union is what leaked: `for_stores([A, RIVAL])` is refused by
+    `_store_pks()`, so `for_store(A) | for_store(RIVAL)` is its synonym and has
+    to go through the same resolver. Every merge therefore re-resolves ownership
+    against the database, which also catches a pin whose store was deleted
+    between the two legs.
+
+    `AND` narrows to the intersection when there is one (the conjunction can
+    only return rows in both); an empty intersection falls back to the resolved
+    union, because a pin of no stores would read as "unpinned" downstream.
+    """
+    resolved = _store_pks(sorted(set(left_pks) | set(right_pks)))
+    if connector == AND:
+        narrowed = set(left_pks) & set(right_pks)
+        if narrowed:
+            return tuple(pk for pk in resolved if pk in narrowed)
+    return tuple(resolved)
+
+
 class GuardedQuery(Query):
     """Refuses to resolve the literal `+` query name of a hidden relation.
 
@@ -145,7 +175,42 @@ class GuardedQuery(Query):
     reached by traversal, so the traversal is refused here too.
 
     Standing rule regardless: never build an ORM lookup key from request data.
+
+    It also carries the scope flags for *both* kinds of query, so the `combine()`
+    seam below can compare a scoped query with an unscoped one from either side.
     """
+
+    #: Overwritten per instance by `ScopedQuerySet._pin`.
+    store_scoped = False
+    store_scope_pks: tuple[int, ...] = ()
+
+    def refuse_scope_mismatch(self, rhs, connector: str) -> None:
+        """A merge of a pinned query with an unpinned one produces a single
+        WHERE clause with no store predicate at all."""
+        if bool(self.store_scoped) != bool(getattr(rhs, "store_scoped", False)):
+            pinned, unpinned = (
+                ("left", "right") if self.store_scoped else ("right", "left")
+            )
+            raise UnscopedQueryError(
+                f"{self.model.__name__}: `{connector}` combines a store-pinned query "
+                f"({pinned}) with an unpinned one ({unpinned}); the combined query "
+                f"would carry no store predicate. Pin every side with "
+                f"for_store()/for_stores()."
+            )
+
+    def combine(self, rhs, connector):
+        """`|`, `&` and `^` all funnel through here - guard the seam, not names.
+
+        `QuerySet.__or__` / `__and__` / `__xor__` each build the merged query by
+        calling `Query.combine`, so one override covers all three *and* whatever
+        combinator a later Django adds, which is the lesson `get_compiler`
+        already taught this codebase: enumerating dunders is how `^` shipped
+        unguarded.
+
+        Here, on the unscoped base class, the only question is agreement.
+        """
+        self.refuse_scope_mismatch(rhs, connector)
+        return super().combine(rhs, connector)
 
     def names_to_path(self, names, *args, **kwargs):
         for name in names:
@@ -199,8 +264,22 @@ def guarded_queryset(manager, queryset_class):
 class ScopedQuery(GuardedQuery):
     """A `Query` that refuses to compile until a store has been pinned."""
 
-    store_scoped = False
-    store_scope_pks: tuple[int, ...] = ()
+    def combine(self, rhs, connector):
+        """The scoped side of the same seam: re-resolve the merged pin set.
+
+        Once a mixed merge is refused, both sides are pinned and the remaining
+        question is *whose stores*. Both checks run before `super()`, because
+        `Query.combine` mutates `self` and a refusal should leave nothing
+        half-merged behind.
+        """
+        self.refuse_scope_mismatch(rhs, connector)
+        merged = merge_scope_pks(
+            self.store_scope_pks, getattr(rhs, "store_scope_pks", ()), connector
+        )
+        result = super().combine(rhs, connector)
+        self.store_scoped = True
+        self.store_scope_pks = merged
+        return result
 
     def get_compiler(self, *args, **kwargs):
         if not self.store_scoped:
@@ -235,9 +314,17 @@ class NoHardDeleteQuerySet(models.QuerySet):
             f"use .soft_delete(by=<user>) instead."
         )
 
-    # Operand order decides which `__or__` Python calls, and Django's never
-    # returns NotImplemented, so `__ror__` on the scoped side would never run.
-    # The refusal therefore has to live here, on the unscoped side, as well.
+    # `Query.combine` (guarded on GuardedQuery) covers `|`, `&` and `^` once the
+    # merged query has been built. These two seams cover what it cannot see:
+    #
+    #  * the operators short-circuit on an empty queryset *before* calling
+    #    `combine`, so a mixed pair could slip past unmerged;
+    #  * `union()` / `intersection()` / `difference()` never call `combine` at
+    #    all - they hang the legs off `combined_queries` instead, through
+    #    `_combinator_query`, which is their own single seam;
+    #  * operand order decides which method Python calls, and Django's operators
+    #    never return NotImplemented, so a refusal that lived only on the scoped
+    #    side would never run for `unscoped OP scoped`.
 
     def __or__(self, other):
         refuse_scope_mix(self, [other], "|")
@@ -247,25 +334,30 @@ class NoHardDeleteQuerySet(models.QuerySet):
         refuse_scope_mix(self, [other], "&")
         return super().__and__(other)
 
+    def __xor__(self, other):
+        refuse_scope_mix(self, [other], "^")
+        return super().__xor__(other)
+
+    # Django's QuerySet defines no reflected operators, so there is no `super()`
+    # to call: `x.__ror__(y)` means `y | x`, and OR/AND/XOR are commutative as
+    # set operations, so the forward operator gives the same rows.
+
     def __ror__(self, other):
         refuse_scope_mix(self, [other], "|")
-        return super().__ror__(other)
+        return self.__or__(other)
 
     def __rand__(self, other):
         refuse_scope_mix(self, [other], "&")
-        return super().__rand__(other)
+        return self.__and__(other)
 
-    def union(self, *other_qs, all=False):
-        refuse_scope_mix(self, other_qs, "union()")
-        return super().union(*other_qs, all=all)
+    def __rxor__(self, other):
+        refuse_scope_mix(self, [other], "^")
+        return self.__xor__(other)
 
-    def intersection(self, *other_qs):
-        refuse_scope_mix(self, other_qs, "intersection()")
-        return super().intersection(*other_qs)
-
-    def difference(self, *other_qs):
-        refuse_scope_mix(self, other_qs, "difference()")
-        return super().difference(*other_qs)
+    def _combinator_query(self, combinator, *other_qs, **kwargs):
+        """The seam behind `union()`, `intersection()` and `difference()`."""
+        refuse_scope_mix(self, other_qs, f"{combinator}()")
+        return super()._combinator_query(combinator, *other_qs, **kwargs)
 
 
 class SoftDeleteQuerySet(NoHardDeleteQuerySet):
@@ -318,27 +410,26 @@ class ScopedQuerySet(SoftDeleteQuerySet):
     # -- set operators ---------------------------------------------------
     # `a | b` merges two queries into one WHERE clause and would otherwise
     # inherit the left operand's scope flag while dragging the right operand's
-    # rows in with it.
+    # rows in with it. That merge is guarded once, at the seam every operator
+    # goes through (`ScopedQuery.combine`), rather than on a list of dunder
+    # names - so `^`, and whatever Django adds next, are covered by
+    # construction. The only combinators that skip `combine` are the ones that
+    # build `combined_queries` instead, and they share the seam below.
 
-    def __or__(self, other):
-        self._require_both_scoped(other, "|")
-        combined = super().__or__(other)
-        return self._pin(combined, tuple(set(self._scope_pks()) | set(other._scope_pks())))
+    def _combinator_query(self, combinator, *other_qs, **kwargs):
+        """`union()` / `intersection()` / `difference()`, re-pinned.
 
-    def __and__(self, other):
-        self._require_both_scoped(other, "&")
-        combined = super().__and__(other)
-        narrowed = set(self._scope_pks()) & set(other._scope_pks())
-        return self._pin(combined, tuple(narrowed or set(self._scope_pks())))
-
-    def _require_both_scoped(self, other, operator: str):
-        for operand in (self, other):
-            if not getattr(getattr(operand, "query", None), "store_scoped", False):
-                raise UnscopedQueryError(
-                    f"{self.model.__name__}: both sides of `{operator}` must be pinned with "
-                    f"for_store()/for_stores(); combining a scoped queryset with an "
-                    f"unscoped one would return every store's rows."
-                )
+        Each leg is compiled separately, so each leg's own scope guard fires -
+        but nothing would have stopped the *set of legs* from spanning two
+        organizations, which is what `for_stores()` exists to refuse. The
+        refusal for an unpinned leg lives on `NoHardDeleteQuerySet`, which this
+        call passes through first.
+        """
+        clone = super()._combinator_query(combinator, *other_qs, **kwargs)
+        merged = self._scope_pks()
+        for other in other_qs:
+            merged = merge_scope_pks(merged, queryset_scope(other)[1], combinator)
+        return self._pin(clone, merged)
 
     # -- writes ----------------------------------------------------------
 
@@ -462,11 +553,19 @@ class ScopedQuerySet(SoftDeleteQuerySet):
                 )
 
     def _check_update_fk_stores(self, kwargs) -> None:
-        """Every store-scoped FK named in an update must land inside the scope.
+        """Every store-scoped FK named in an update must be the row's own store.
 
         Mirrors the create/save same-store invariant on the update path: without
         it, `for_store(A).filter(...).update(product_id=<a store-B product>)`
         silently points a row at another tenant's row.
+
+        Membership in the *pinned set* is not that invariant. `save()` compares
+        an FK's store with the row's own store, and a multi-store pin cannot
+        know each row's store - `for_stores([A, A2]).update(product_id=<an A2
+        product>)` would repoint store A's rows at store A2's catalogue, which
+        is the same broken invariant one organization further in. So a
+        multi-store pin refuses outright rather than approximating; narrow the
+        pin to one store, where membership and equality are the same test.
         """
         pinned = self._scope_pks()
         if not pinned:
@@ -475,6 +574,13 @@ class ScopedQuerySet(SoftDeleteQuerySet):
             for key in (field.name, field.attname):
                 if key not in kwargs:
                     continue
+                if len(pinned) != 1:
+                    raise CrossStoreReferenceError(
+                        f"{self.model.__name__}.{field.name}: this queryset pins "
+                        f"{len(pinned)} stores {list(pinned)}, so no single value can "
+                        f"be proven to match the store of every row it would hit. "
+                        f"Update through a queryset pinned to exactly one store."
+                    )
                 value = kwargs[key]
                 if hasattr(value, "resolve_expression"):
                     # A query expression (e.g. bulk_update's Case, or F()): its
@@ -502,6 +608,16 @@ class ScopedQuerySet(SoftDeleteQuerySet):
                     )
 
     def update(self, **kwargs):
+        """Refuses an unscoped, re-parenting or cross-store update.
+
+        Note for callers of `bulk_update()`: it runs its `update()` calls inside
+        `transaction.atomic(savepoint=False)`, so a `CrossStoreReferenceError`
+        raised here escapes an atomic block with no savepoint to roll back to -
+        the *surrounding* transaction is marked for rollback and cannot be
+        continued. Catching it and carrying on in the same transaction will fail
+        with `TransactionManagementError`; validate before the write, or start
+        the whole operation again in a new transaction.
+        """
         self._require_scope()
         self._refuse_store_reparenting(kwargs)
         self._check_update_fk_stores(kwargs)

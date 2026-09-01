@@ -16,8 +16,11 @@ ALLOWED_HOSTS = [
 # The append-only trigger (common/db.py) waives its TRUNCATE guard for any
 # database whose name starts with `test_`, so Django's test databases can be
 # torn down. A production database that is *mis-named* `test_...` would inherit
-# that waiver silently. This flag turns `common.E100` on: `manage.py check`
-# (which the container runs before boot) then refuses such a name outright.
+# that waiver silently. This flag turns `common.E100` on: any `manage.py check`
+# run against these settings then fails, which is what a pre-boot check in the
+# container makes fatal. `common.E100` is registered under `Tags.security`, not
+# `Tags.database` - database-tagged checks are skipped unless an alias is passed
+# explicitly, which is exactly how this guard sat inert for two review rounds.
 ENFORCE_NON_TEST_DATABASE = True
 
 SECURE_SSL_REDIRECT = True

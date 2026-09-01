@@ -3,13 +3,41 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
+      # Builds the `dev` target: the `runtime` target plus psql, so
+      # `manage.py dbshell` works locally without a psql client in a shipped
+      # image. (`runtime` is an honest placeholder today, not yet deployable —
+      # see the comment on that stage in docker/Dockerfile.)
+      target: dev
     env_file: .env
     environment:
       DJANGO_SETTINGS_MODULE: config.settings.dev
+      # Local dev only: one container, no rolling deploy, so the entrypoint may
+      # migrate on boot and a fresh clone's first `up` serves a real schema.
+      # Deploys leave this unset — see docker/entrypoint.sh.
+      RAPORO_AUTO_MIGRATE: "1"
     volumes:
       - ".:/app"
     ports:
       - "8000:8000"
+    healthcheck:
+      # Same endpoint the deploy probes use. Makes `up --wait` mean "migrated
+      # and answering requests" rather than "process started".
+      test:
+        - CMD
+        - python
+        - "-c"
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"
+      interval: 5s
+      timeout: 5s
+      # retries stays tight: it governs how long an *already-running* app may
+      # be sick before compose calls it unhealthy. The cold start is budgeted
+      # by start_period instead, which costs nothing when boot is fast because
+      # `up --wait` returns on the first success. 120s because a wiped-volume
+      # `up` here took 102s to first-healthy (check + 22 migrations + first
+      # request) against a 102s budget — zero margin, and slice 2 adds
+      # migrations.
+      retries: 12
+      start_period: 120s
     depends_on:
       db:
         condition: service_healthy
@@ -18,9 +46,18 @@ services:
     image: postgres:17
     env_file: .env
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"]
+      # `-h 127.0.0.1` on purpose: during first-time initdb the server listens
+      # on the unix socket only, and a socket-based pg_isready reports ready
+      # before the database accepts TCP connections — which is exactly when
+      # `web` would try to migrate on a fresh clone.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 3s
       retries: 10
+      # Same reasoning. A cold `initdb` on a loaded machine was measured at
+      # ~30s of real work in this repo; with start_period at 15s the probe
+      # failures during it counted against `retries` and `up --wait` aborted
+      # the whole stack with "dependency failed to start".
+      start_period: 60s
     volumes:
       - "pgdata:/var/lib/postgresql/data"
 

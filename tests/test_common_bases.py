@@ -358,6 +358,56 @@ def test_update_cannot_repoint_a_foreign_key_into_another_store(
     assert SaleLine.all_objects.get(pk=line.pk).product_id == product.pk
 
 
+def test_a_multi_store_pin_refuses_to_update_a_store_scoped_foreign_key(
+    db, store, other_store, sale, product, category
+):
+    """A2 (fix round 3): membership in the pinned *set* is not the invariant.
+
+    `save()` enforces that a row's FK targets live in *that row's own* store. A
+    multi-store pin cannot know each row's store, so a single value can never be
+    proven correct for every row it would hit - `for_stores([A, A2]).update(
+    product_id=<an A2 product>)` used to update a store-A row to point at store
+    A2's catalogue. Same organization, so not a tenant breach; still the same
+    broken invariant, and store A's reports then count store A2's product.
+    """
+    line = SaleLine.objects.create(store=store, sale=sale, product=product)
+    product_b = Product.objects.create(store=other_store, category=category, name="theirs")
+
+    with pytest.raises(CrossStoreReferenceError):
+        SaleLine.objects.for_stores([store, other_store]).filter(pk=line.pk).update(
+            product_id=product_b.pk
+        )
+
+    assert SaleLine.all_objects.get(pk=line.pk).product_id == product.pk
+
+
+def test_a_multi_store_pin_refuses_even_an_in_scope_foreign_key(
+    db, store, other_store, sale, product
+):
+    """Refused even when the target is the row's own store: the pin cannot prove
+    it, and approximating is what produced the leak above. Narrow the pin."""
+    line = SaleLine.objects.create(store=store, sale=sale, product=product)
+
+    with pytest.raises(CrossStoreReferenceError):
+        SaleLine.objects.for_stores([store, other_store]).filter(pk=line.pk).update(
+            product_id=product.pk
+        )
+
+
+def test_a_single_store_pin_still_updates_a_foreign_key_in_its_own_store(
+    db, store, sale, product, category
+):
+    """The refusal above is scoped to multi-store pins; the single-store path
+    keeps working, or the fix would just be a ban."""
+    line = SaleLine.objects.create(store=store, sale=sale, product=product)
+    other = Product.objects.create(store=store, category=category, name="second")
+
+    updated = SaleLine.objects.for_store(store).filter(pk=line.pk).update(product=other)
+
+    assert updated == 1
+    assert SaleLine.all_objects.get(pk=line.pk).product_id == other.pk
+
+
 def test_update_refuses_to_reparent_a_row_even_within_scope(db, store, other_store):
     """Re-parenting is a service operation (it must move children too), so a bulk
     `update(store_id=...)` is refused even when the target store is in scope."""
@@ -630,6 +680,139 @@ def test_and_of_two_scoped_querysets_stays_scoped(db, store):
     combined = ScopedThing.objects.for_store(store) & ScopedThing.objects.for_store(store)
 
     assert combined.count() == 1
+
+
+# --------------------------------------------------------------------------
+# A1 (fix round 3) - the WHOLE combinator surface, in both operand orders.
+#
+# Two of these forms leaked across organizations after fix round 2, and the
+# forms that already worked were entirely unpinned - which is how `^` shipped
+# unguarded in the first place. The matrix is the point: it fails the day
+# Django grows another combinator, or the day someone deletes one override.
+# --------------------------------------------------------------------------
+
+#: Every way two querysets of the same model can be merged into one.
+COMBINATORS = [
+    "__or__",
+    "__and__",
+    "__xor__",
+    "__ror__",
+    "__rand__",
+    "__rxor__",
+    "union",
+    "intersection",
+    "difference",
+]
+
+
+def combine(operator, left, right):
+    """Apply `operator` to two querysets and *materialise* the result.
+
+    Materialising is not incidental. A combined queryset is lazy, and the
+    unscoped side has no compile-time guard to fall back on, so a refusal that
+    only happens at build time and a leak that only happens at fetch time look
+    identical until something iterates.
+    """
+    return sorted(row.name for row in getattr(left, operator)(right))
+
+
+@pytest.fixture
+def one_row_per_store(db, store, other_store, foreign_store):
+    """`mine` and `mine2` are two stores of one org; `RIVAL` is another org's."""
+    ScopedThing.objects.create(store=store, name="mine")
+    ScopedThing.objects.create(store=other_store, name="mine2")
+    ScopedThing.objects.create(store=foreign_store, name="RIVAL")
+
+
+@pytest.mark.parametrize("operator", COMBINATORS)
+def test_a_combinator_refuses_an_unscoped_right_hand_side(operator, one_row_per_store, store):
+    with pytest.raises(UnscopedQueryError):
+        combine(operator, ScopedThing.objects.for_store(store), ScopedThing.all_objects.all())
+
+
+@pytest.mark.parametrize("operator", COMBINATORS)
+def test_a_combinator_refuses_an_unscoped_left_hand_side(operator, one_row_per_store, store):
+    """Operand order decides whose method Python calls, so the refusal has to
+    exist on the unscoped side too - `all_objects.all() ^ for_store(A)` returned
+    every other organization's rows."""
+    with pytest.raises(UnscopedQueryError):
+        combine(operator, ScopedThing.all_objects.all(), ScopedThing.objects.for_store(store))
+
+
+@pytest.mark.parametrize("operator", COMBINATORS)
+def test_a_combinator_refuses_a_cross_organization_merge(
+    operator, one_row_per_store, store, foreign_store
+):
+    """`for_stores([A, RIVAL])` is refused; `for_store(A) | for_store(RIVAL)` is
+    its synonym and must be refused by the same resolver. That shape is the IDOR:
+    a store id taken off a request, combined with the caller's own."""
+    with pytest.raises(CrossStoreReferenceError):
+        combine(
+            operator,
+            ScopedThing.objects.for_store(store),
+            ScopedThing.objects.for_store(foreign_store),
+        )
+
+
+@pytest.mark.parametrize("operator", COMBINATORS)
+def test_a_combinator_refuses_a_cross_organization_merge_in_the_other_order(
+    operator, one_row_per_store, store, foreign_store
+):
+    with pytest.raises(CrossStoreReferenceError):
+        combine(
+            operator,
+            ScopedThing.objects.for_store(foreign_store),
+            ScopedThing.objects.for_store(store),
+        )
+
+
+@pytest.mark.parametrize("operator", COMBINATORS)
+def test_a_combinator_allows_two_stores_of_one_organization(
+    operator, one_row_per_store, store, other_store
+):
+    """The legitimate case still works - and returns nothing from the other org.
+
+    Without this leg the matrix could be satisfied by refusing everything.
+    """
+    names = combine(
+        operator,
+        ScopedThing.objects.for_store(store),
+        ScopedThing.objects.for_store(other_store),
+    )
+
+    assert set(names) <= {"mine", "mine2"}
+
+
+@pytest.mark.parametrize("operator", ["__or__", "__xor__", "union"])
+def test_a_merged_queryset_stays_pinned_to_both_stores(
+    operator, one_row_per_store, store, other_store
+):
+    """The merge is not just allowed, it is *re-pinned*: the result carries the
+    resolved store set, so a further combination is resolved against it too."""
+    merged = getattr(ScopedThing.objects.for_store(store), operator)(
+        ScopedThing.objects.for_store(other_store)
+    )
+
+    assert merged.query.store_scoped is True
+    assert set(merged.query.store_scope_pks) == {store.pk, other_store.pk}
+
+
+def test_the_combinator_guard_sits_on_the_query_seam_not_on_a_list_of_names():
+    """`|`, `&` and `^` all funnel through `sql.Query.combine`; `union()`,
+    `intersection()` and `difference()` all funnel through
+    `QuerySet._combinator_query`. Guarding those two seams is what makes a
+    combinator Django adds later covered by construction, so both must stay
+    overridden - and both must still exist upstream."""
+    from django.db.models.query import QuerySet
+    from django.db.models.sql import Query
+
+    from common.managers import GuardedQuery, ScopedQuery, ScopedQuerySet
+
+    assert hasattr(Query, "combine")
+    assert hasattr(QuerySet, "_combinator_query")
+    assert "combine" in GuardedQuery.__dict__
+    assert "combine" in ScopedQuery.__dict__
+    assert "_combinator_query" in ScopedQuerySet.__dict__
 
 
 # --------------------------------------------------------------------------

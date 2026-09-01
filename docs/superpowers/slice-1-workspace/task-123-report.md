@@ -1451,3 +1451,899 @@ Added by this round:
 12. **`User.objects` / `AuditLog.objects` are not `GuardedQuery`-backed**, so a
     hand-built `+` lookup key rooted at those two models still resolves. Never
     build ORM lookup keys from request data.
+
+---
+
+# FIX ROUND 2
+
+Scope handed to me: **B1, B4, B5, B6**. A1, A2, B2 and B3 were already on disk
+when I started; I verified they are present and did not touch them. Section C
+(devops DB roles, the ops naming invariant, the username `CheckConstraint`),
+`.env*`, `README.md` and `docs/SETUP.md` were out of scope and are untouched.
+
+## B1 - the `common/db.py` stability contract, enforced
+
+**Design chosen: (b) versioned constants *and* (c) a pinned hash - they are not
+alternatives.** (b) is structural and (c) is the tripwire.
+
+- (b) alone is a naming convention. It makes an in-place edit *look* wrong, but
+  nothing stops it, and "looks wrong" is exactly what the previous docstring
+  already tried and failed to be.
+- (c) alone fires in CI, but leaves the engineer who tripped it with no sanctioned
+  way forward: the natural response to "hash mismatch" is to update the hash.
+- (a) - embedding the literal SQL in each migration - was rejected. It is the only
+  option that is genuinely immune, but it deletes the reason `common/db.py` exists:
+  slice 2 has four ledger tables (StockMovement, Payment, CapitalEntry, Payout) and
+  four copy-pasted plpgsql bodies drift by hand within one review cycle. Freezing
+  one shared copy is stronger than not sharing it.
+
+Together: the name states which shipped migrations depend on the exact text, the
+hash makes an edit fail, and the failure message names the sanctioned move
+(add `_V2` + a new migration) rather than "update this hash".
+
+Changed:
+
+- `common/db.py:39-110` - `CREATE_APPEND_ONLY_FUNCTION` -> `CREATE_APPEND_ONLY_FUNCTION_V1`,
+  `DROP_APPEND_ONLY_FUNCTION` -> `DROP_APPEND_ONLY_FUNCTION_V1`,
+  `append_only_triggers` -> `append_only_triggers_v1`. **No unversioned alias is
+  kept** - an alias re-opens the trap, because the next author imports the short
+  name and a later V3 silently changes what their migration installs. The Postgres
+  function name stays `raporo_append_only` and the frozen SQL spells it out
+  literally instead of interpolating `APPEND_ONLY_FUNCTION`, so renaming the
+  Python constant cannot rewrite frozen text. Module docstring (`common/db.py:1-33`)
+  now documents the V2 procedure: `CREATE OR REPLACE` the same function so a fresh
+  install (V1 then V2) and an already-migrated database (V2) converge on one body.
+- `apps/audit/migrations/0002_append_only_trigger.py:20-34,42-43` - imports the `_V1`
+  names. **The SQL it applies is byte-identical**; verified by diffing the strings
+  produced by `HEAD:common/db.py` against the new module:
+  `create IDENTICAL / drop IDENTICAL / fwd IDENTICAL / rev IDENTICAL`.
+- `tests/test_db_stability.py` (new, 5 tests) - SHA-256 of all four frozen strings,
+  plus the SQL the migration's `operations` actually carry (pinning the module is
+  not enough: the migration could be edited to build its SQL some other way), plus
+  two structural tests - every SQL string or SQL-emitting helper exported by
+  `common/db.py` must carry a version suffix, and no migration may import a name
+  from `common.db` that `PINNED_SQL` does not cover. The second one is what will
+  stop slice 2 from re-creating an unenforced contract for its own tables.
+
+Mutations run (all caught):
+
+| mutation | result |
+|---|---|
+| add `  -- harmless tidy-up` inside `CREATE_APPEND_ONLY_FUNCTION_V1` | `test_the_frozen_function_sql_has_not_changed` **and** `test_the_shipped_migration_still_carries_exactly_the_pinned_sql` fail; message prints the V2 procedure, the expected/actual hashes and the full offending text |
+| append `CREATE_APPEND_ONLY_FUNCTION = CREATE_APPEND_ONLY_FUNCTION_V1` | `test_every_sql_helper_in_common_db_is_versioned` fails: `common/db.py exports unversioned SQL: ['CREATE_APPEND_ONLY_FUNCTION']` |
+| add `apps/audit/migrations/0003_probe.py` importing a new unpinned `APPEND_ONLY_FUNCTION_V2` | `test_no_migration_imports_an_unpinned_name_from_common_db` fails and names the file and the symbol |
+
+## B4 - stale reversibility docstring
+
+`apps/orgs/migrations/0001_initial.py:16-21`. The old paragraph described reversing
+to "a plain `unique=True` slug", a scenario that requires the partial-unique
+constraint to have arrived in a *later* migration. It arrives in this one
+(`AddConstraint` at line 167), so `migrate orgs zero` drops the composite keys,
+then the constraints, then the tables. Rewritten to say that: no step can fail on
+existing data because nothing survives to conflict, and reversal destroys every
+organization, store, role, membership and store-access row. No new caveats invented.
+Docstring only - no test, as agreed.
+
+## B5 - the `app_configs` test now earns its name
+
+`tests/test_common_checks.py:45-93`. Two tests, one per direction, and both bite:
+
+- `test_the_check_honours_the_app_configs_it_is_given` declares a rogue
+  `unique=True` model in an `@isolate_apps("tests.testapp")` registry, asserts the
+  premise (that model is the only model in the config being passed), then asserts
+  the check **reports** `common.E005` when handed `testapp` and **stays silent**
+  when handed `accounts`. The rogue model exists only in the isolated registry, so
+  a check that ignored `app_configs` and fell back to the project registry could
+  not see it.
+- `test_the_check_stays_silent_about_apps_it_was_not_given` covers the other
+  direction with the rogue model reachable from the registry the whole-project run
+  walks (`monkeypatch.setattr(checks, "global_apps", ...)`), so a check that
+  dropped the filter would report it while being asked only about `accounts`.
+
+Mutation - `common/checks.py:check_store_scoped_models` reduced to
+`models = global_apps.get_models()` (the `app_configs` branch deleted):
+
+```
+>       assert "common.E005" in ids(check_store_scoped_models([testapp_config]))
+E       AssertionError: assert 'common.E005' in set()
+>       assert check_store_scoped_models([global_apps.get_app_config("accounts")]) == []
+E       AssertionError: assert [<Error: leve...common.E005'>] == []
+FAILED tests/test_common_checks.py::test_the_check_honours_the_app_configs_it_is_given
+FAILED tests/test_common_checks.py::test_the_check_stays_silent_about_apps_it_was_not_given
+2 failed, 16 passed
+```
+
+Filter restored: `18 passed`.
+
+## B6 - loaddata against the composite FKs, and a correction
+
+**The premise this item was written on is false, and the test now says so.**
+
+The brief (and the database-engineer's decision verdict) held that Django's
+Postgres backend issues `SET CONSTRAINTS ALL DEFERRED` around fixture loading via
+`disable_constraint_checking`, so `DEFERRABLE INITIALLY IMMEDIATE` would still
+tolerate out-of-order fixtures. It does not. Verified against the installed
+Django 6.1: `django.db.backends.postgresql.base.DatabaseWrapper` **never overrides**
+`disable_constraint_checking`, so `BaseDatabaseWrapper.disable_constraint_checking`
+runs, emits no SQL and returns `False`. `loaddata`'s
+`with connection.constraint_checks_disabled():` is therefore a no-op on Postgres;
+Django gets away with it because *its own* foreign keys are already
+`DEFERRABLE INITIALLY DEFERRED`. Only the final `check_constraints()` touches
+`SET CONSTRAINTS`, and by then every row is in.
+
+My first draft of this test asserted the reviewer's expectation and failed:
+
+```
+E django.db.utils.IntegrityError: Problem installing fixture
+  '/app/tests/fixtures/orgs_out_of_order.json': Could not load orgs.StoreAccess(pk=1):
+  insert or update on table "orgs_storeaccess" violates foreign key constraint
+  "orgs_storeaccess_membership_same_org_fk"
+E DETAIL:  Key (membership_id, org_id)=(1, 1) is not present in table "orgs_membership".
+```
+
+Consequence, and why I did **not** change the schema: the only thing that breaks is
+a *hand-written or hand-reordered* fixture that lists children before parents.
+`dumpdata` emits models in registration order, and `orgs/models.py` defines
+Organization -> Store -> Role -> Membership -> StoreAccess, so the real
+backup/restore path works. Relaxing the keys to `INITIALLY DEFERRED` would buy
+child-first fixtures at the cost of statement-time refusal, which is the entire
+point of the design - and schema changes are the database-engineer's call, not
+mine. **Flagged for the database-engineer re-review**: verdict (1) in the ledger
+should be re-stated as "correct, and loaddata is not broken *for dependency-ordered
+fixtures, which is what dumpdata produces*".
+
+`tests/test_fixture_loading.py` (new, 5 tests) + three fixtures in
+`tests/fixtures/`:
+
+- `test_django_does_not_defer_constraints_for_loaddata` pins the premise
+  (`connection.disable_constraint_checking() is False`), so a future Django that
+  changes this tells us here instead of in production;
+- `test_a_dependency_ordered_fixture_loads` - the ordinary case;
+- `test_a_child_first_fixture_is_refused_by_the_composite_key` - the same six rows
+  reversed; documents the real cost of `INITIALLY IMMEDIATE` in a test rather than
+  in someone's memory, and asserts nothing is left half-loaded;
+- `test_a_fixture_that_mixes_two_organizations_is_refused` - membership 2 in org 1
+  holding org 2's role, in a dependency-correct file so the cross-org row is the
+  only fault. Fixtures load through `save_base(raw=True)`: no model validation runs
+  at all, so the composite key is the only thing that can refuse it;
+- `test_a_dumpdata_round_trip_restores_every_row` - create, `dumpdata`, raw
+  `DELETE` of all six tables, `loaddata`, assert every row is back. This is the
+  path that actually matters, and it is the regression guard for slice 2: a ledger
+  model declared above its parent would pass every other test in the suite and
+  break restore.
+
+Mutations run (all caught):
+
+| mutation | result |
+|---|---|
+| the three orgs composite FKs changed to `DEFERRABLE INITIALLY DEFERRED` (`--create-db`) | `test_a_child_first_fixture_is_refused_by_the_composite_key` fails - `DID NOT RAISE IntegrityError`. The cross-org test still passes, which is the informative half: deferral changes *when* the guard fires, not whether |
+| `orgs_membership_role_same_org_fk` block deleted from `orgs/0001` (`--create-db`) | `test_a_fixture_that_mixes_two_organizations_is_refused` fails - `DID NOT RAISE IntegrityError` |
+| dumped JSON reversed before reload (mutating the test, to prove it depends on dump order) | `test_a_dumpdata_round_trip_restores_every_row` fails with `violates foreign key constraint "orgs_storeaccess_membership_same_org_fk"` |
+
+## Files changed this round
+
+- `common/db.py` - versioned + frozen constants, mechanism documented
+- `apps/audit/migrations/0002_append_only_trigger.py` - imports `_V1` names (SQL byte-identical)
+- `apps/orgs/migrations/0001_initial.py` - reversibility docstring
+- `tests/test_common_checks.py` - B5
+- `tests/test_db_stability.py` (new) - B1
+- `tests/test_fixture_loading.py` (new) - B6
+- `tests/fixtures/orgs_dependency_ordered.json`, `tests/fixtures/orgs_child_first.json`,
+  `tests/fixtures/orgs_cross_org_membership.json` (new)
+
+## Verbatim evidence
+
+### `docker compose run --rm web pytest -v`
+
+```
+============================= test session starts ==============================
+platform linux -- Python 3.13.15, pytest-9.1.1, pluggy-1.6.0 -- /usr/local/bin/python3.13
+cachedir: .pytest_cache
+django: version: 6.1, settings: config.settings.test (from option)
+rootdir: /app
+configfile: pytest.ini
+plugins: django-4.14.0
+collecting ... collected 268 items
+
+tests/test_audit.py::test_record_writes_a_row PASSED                     [  0%]
+tests/test_audit.py::test_record_without_a_target_or_actor_is_allowed PASSED [  0%]
+tests/test_audit.py::test_record_derives_the_org_from_the_store PASSED   [  1%]
+tests/test_audit.py::test_record_rejects_a_store_from_another_org PASSED [  1%]
+tests/test_audit.py::test_record_rejects_a_malformed_action[] PASSED     [  1%]
+tests/test_audit.py::test_record_rejects_a_malformed_action[   ] PASSED  [  2%]
+tests/test_audit.py::test_record_rejects_a_malformed_action[User.Created] PASSED [  2%]
+tests/test_audit.py::test_record_rejects_a_malformed_action[user created] PASSED [  2%]
+tests/test_audit.py::test_record_rejects_a_malformed_action[user..created] PASSED [  3%]
+tests/test_audit.py::test_record_rejects_a_malformed_action[user] PASSED [  3%]
+tests/test_audit.py::test_record_rejects_a_malformed_action[xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx] PASSED [  4%]
+tests/test_audit.py::test_record_rejects_a_malformed_action[None] PASSED [  4%]
+tests/test_audit.py::test_record_rejects_an_unsaved_target PASSED        [  4%]
+tests/test_audit.py::test_record_redacts_sensitive_values PASSED         [  5%]
+tests/test_audit.py::test_record_rejects_changes_it_cannot_serialise PASSED [  5%]
+tests/test_audit.py::test_record_requires_a_mapping_for_changes PASSED   [  5%]
+tests/test_audit.py::test_record_serialises_decimals_and_dates PASSED    [  6%]
+tests/test_audit.py::test_record_stores_the_ip PASSED                    [  6%]
+tests/test_audit.py::test_record_rejects_a_bogus_ip PASSED               [  7%]
+tests/test_audit.py::test_audit_rows_cannot_be_updated PASSED            [  7%]
+tests/test_audit.py::test_audit_rows_cannot_be_bulk_updated PASSED       [  7%]
+tests/test_audit.py::test_audit_rows_cannot_be_deleted PASSED            [  8%]
+tests/test_audit.py::test_the_action_field_carries_the_validator PASSED  [  8%]
+tests/test_audit.py::test_audit_log_has_no_soft_delete_columns PASSED    [  8%]
+tests/test_audit.py::test_the_actor_reference_is_protected PASSED        [  9%]
+tests/test_audit.py::test_newest_rows_come_first PASSED                  [  9%]
+tests/test_audit.py::test_an_audit_row_cannot_be_overwritten_through_an_explicit_pk PASSED [ 10%]
+tests/test_audit.py::test_an_audit_row_cannot_be_overwritten_with_force_insert PASSED [ 10%]
+tests/test_audit.py::test_the_base_manager_cannot_delete_audit_rows PASSED [ 10%]
+tests/test_audit.py::test_bulk_create_cannot_be_turned_into_an_upsert PASSED [ 11%]
+tests/test_audit.py::test_the_append_only_triggers_exist_in_postgres PASSED [ 11%]
+tests/test_audit.py::test_the_database_refuses_a_raw_update PASSED       [ 11%]
+tests/test_audit.py::test_the_database_refuses_a_raw_delete PASSED       [ 12%]
+tests/test_audit.py::test_the_database_refuses_a_truncate PASSED         [ 12%]
+tests/test_audit.py::test_audit_rows_cannot_mix_an_org_with_a_foreign_store PASSED [ 13%]
+tests/test_audit.py::test_an_org_only_or_store_only_audit_row_is_still_legal PASSED [ 13%]
+tests/test_audit.py::test_a_long_string_is_truncated_distinguishably PASSED [ 13%]
+tests/test_audit.py::test_an_oversized_payload_is_replaced_by_a_marker PASSED [ 14%]
+tests/test_common_bases.py::test_soft_delete_hides_from_default_manager PASSED [ 14%]
+tests/test_common_bases.py::test_soft_delete_stamps_who_and_when PASSED  [ 14%]
+tests/test_common_bases.py::test_soft_delete_is_idempotent PASSED        [ 15%]
+tests/test_common_bases.py::test_soft_delete_requires_an_actor_keyword PASSED [ 15%]
+tests/test_common_bases.py::test_hard_delete_is_forbidden_on_instances PASSED [ 16%]
+tests/test_common_bases.py::test_hard_delete_is_forbidden_on_querysets PASSED [ 16%]
+tests/test_common_bases.py::test_queryset_soft_delete_stamps_every_row PASSED [ 16%]
+tests/test_common_bases.py::test_audited_model_stamps_timestamps PASSED  [ 17%]
+tests/test_common_bases.py::test_audited_actor_fields_are_optional_but_protected PASSED [ 17%]
+tests/test_common_bases.py::test_no_store_scoped_model_carries_its_own_org_pointer PASSED [ 17%]
+tests/test_common_bases.py::test_store_fk_is_declared_by_the_base_not_by_consumers PASSED [ 18%]
+tests/test_common_bases.py::test_unscoped_query_raises[list] PASSED      [ 18%]
+tests/test_common_bases.py::test_unscoped_query_raises[len] PASSED       [ 19%]
+tests/test_common_bases.py::test_unscoped_query_raises[bool] PASSED      [ 19%]
+tests/test_common_bases.py::test_unscoped_query_raises[count] PASSED     [ 19%]
+tests/test_common_bases.py::test_unscoped_query_raises[exists] PASSED    [ 20%]
+tests/test_common_bases.py::test_unscoped_query_raises[first] PASSED     [ 20%]
+tests/test_common_bases.py::test_unscoped_query_raises[last] PASSED      [ 20%]
+tests/test_common_bases.py::test_unscoped_query_raises[get] PASSED       [ 21%]
+tests/test_common_bases.py::test_unscoped_query_raises[aggregate] PASSED [ 21%]
+tests/test_common_bases.py::test_unscoped_query_raises[iterator] PASSED  [ 22%]
+tests/test_common_bases.py::test_unscoped_query_raises[values_list] PASSED [ 22%]
+tests/test_common_bases.py::test_unscoped_query_raises[chained_filter] PASSED [ 22%]
+tests/test_common_bases.py::test_unscoped_query_raises[in_bulk] PASSED   [ 23%]
+tests/test_common_bases.py::test_unscoped_query_raises[explain] PASSED   [ 23%]
+tests/test_common_bases.py::test_unscoped_query_raises[update] PASSED    [ 23%]
+tests/test_common_bases.py::test_unscoped_query_raises_on_the_manager_itself PASSED [ 24%]
+tests/test_common_bases.py::test_unscoped_subquery_raises PASSED         [ 24%]
+tests/test_common_bases.py::test_raw_sql_is_refused_on_the_scoped_manager PASSED [ 25%]
+tests/test_common_bases.py::test_own_meta_child_is_still_guarded PASSED  [ 25%]
+tests/test_common_bases.py::test_for_store_returns_only_that_store PASSED [ 25%]
+tests/test_common_bases.py::test_for_store_hides_soft_deleted_rows PASSED [ 26%]
+tests/test_common_bases.py::test_for_store_survives_further_chaining PASSED [ 26%]
+tests/test_common_bases.py::test_for_store_accepts_a_primary_key PASSED  [ 26%]
+tests/test_common_bases.py::test_for_store_rejects_a_missing_or_bogus_store[None] PASSED [ 27%]
+tests/test_common_bases.py::test_for_store_rejects_a_missing_or_bogus_store[] PASSED [ 27%]
+tests/test_common_bases.py::test_for_store_rejects_a_missing_or_bogus_store[0] PASSED [ 27%]
+tests/test_common_bases.py::test_for_store_rejects_a_missing_or_bogus_store[bad3] PASSED [ 28%]
+tests/test_common_bases.py::test_for_store_rejects_a_missing_or_bogus_store[not-a-store] PASSED [ 28%]
+tests/test_common_bases.py::test_for_store_rejects_a_saved_instance_of_another_model PASSED [ 29%]
+tests/test_common_bases.py::test_for_stores_rejects_a_saved_instance_of_another_model PASSED [ 29%]
+tests/test_common_bases.py::test_for_store_rejects_an_unsaved_store PASSED [ 29%]
+tests/test_common_bases.py::test_for_stores_covers_several_stores_and_nothing_else PASSED [ 30%]
+tests/test_common_bases.py::test_for_stores_rejects_an_empty_collection PASSED [ 30%]
+tests/test_common_bases.py::test_scoped_update_is_allowed_and_stays_scoped PASSED [ 30%]
+tests/test_common_bases.py::test_scoped_queryset_still_refuses_hard_delete PASSED [ 31%]
+tests/test_common_bases.py::test_creating_a_row_needs_a_store_named_or_pinned PASSED [ 31%]
+tests/test_common_bases.py::test_creating_a_row_with_no_store_at_all_is_refused PASSED [ 32%]
+tests/test_common_bases.py::test_for_store_fills_in_the_store_on_create PASSED [ 32%]
+tests/test_common_bases.py::test_for_store_refuses_to_create_in_another_store PASSED [ 32%]
+tests/test_common_bases.py::test_for_store_refuses_to_bulk_create_in_another_store PASSED [ 33%]
+tests/test_common_bases.py::test_bulk_create_fills_in_the_pinned_store PASSED [ 33%]
+tests/test_common_bases.py::test_update_cannot_move_a_row_to_another_store PASSED [ 33%]
+tests/test_common_bases.py::test_update_cannot_repoint_a_foreign_key_into_another_store PASSED [ 34%]
+tests/test_common_bases.py::test_update_refuses_to_reparent_a_row_even_within_scope PASSED [ 34%]
+tests/test_common_bases.py::test_save_with_update_fields_store_revalidates_every_foreign_key PASSED [ 35%]
+tests/test_common_bases.py::test_get_or_create_cannot_reach_into_another_store PASSED [ 35%]
+tests/test_common_bases.py::test_get_or_create_uses_the_pinned_store PASSED [ 35%]
+tests/test_common_bases.py::test_all_objects_is_the_documented_escape_hatch PASSED [ 36%]
+tests/test_common_bases.py::test_django_internals_use_an_unguarded_default_manager PASSED [ 36%]
+tests/test_common_bases.py::test_store_scoped_models_have_no_reverse_accessor_from_store PASSED [ 36%]
+tests/test_common_bases.py::test_validation_error_is_not_how_scope_violations_surface PASSED [ 37%]
+tests/test_common_bases.py::test_an_org_level_parent_has_no_accessor_to_its_store_scoped_children PASSED [ 37%]
+tests/test_common_bases.py::test_a_store_scoped_parent_has_no_accessor_to_its_children PASSED [ 38%]
+tests/test_common_bases.py::test_children_are_read_through_for_store PASSED [ 38%]
+tests/test_common_bases.py::test_a_cross_store_foreign_key_is_refused_on_create PASSED [ 38%]
+tests/test_common_bases.py::test_a_cross_store_foreign_key_is_refused_on_a_plain_save PASSED [ 39%]
+tests/test_common_bases.py::test_a_cross_store_foreign_key_is_refused_in_bulk_create PASSED [ 39%]
+tests/test_common_bases.py::test_a_cross_store_foreign_key_is_refused_when_only_the_id_is_given PASSED [ 39%]
+tests/test_common_bases.py::test_same_store_foreign_keys_are_fine PASSED [ 40%]
+tests/test_common_bases.py::test_a_partial_save_skips_the_unrelated_relation_check PASSED [ 40%]
+tests/test_common_bases.py::test_a_scoped_query_cannot_join_back_out_to_other_tenants PASSED [ 41%]
+tests/test_common_bases.py::test_the_join_existence_oracle_is_gone PASSED [ 41%]
+tests/test_common_bases.py::test_the_aggregate_shape_of_the_same_leak_is_gone PASSED [ 41%]
+tests/test_common_bases.py::test_a_scoped_query_reads_its_own_store_only PASSED [ 42%]
+tests/test_common_bases.py::test_all_objects_cannot_hard_delete PASSED   [ 42%]
+tests/test_common_bases.py::test_the_base_manager_cannot_hard_delete_either PASSED [ 42%]
+tests/test_common_bases.py::test_all_objects_still_sees_retired_rows PASSED [ 43%]
+tests/test_common_bases.py::test_or_with_an_unscoped_queryset_is_refused PASSED [ 43%]
+tests/test_common_bases.py::test_and_with_an_unscoped_queryset_is_refused PASSED [ 44%]
+tests/test_common_bases.py::test_or_of_two_scoped_querysets_stays_scoped PASSED [ 44%]
+tests/test_common_bases.py::test_and_of_two_scoped_querysets_stays_scoped PASSED [ 44%]
+tests/test_common_bases.py::test_for_stores_refuses_a_mixed_organization_set PASSED [ 45%]
+tests/test_common_bases.py::test_for_stores_refuses_unknown_store_ids PASSED [ 45%]
+tests/test_common_bases.py::test_for_stores_accepts_several_stores_of_one_org PASSED [ 45%]
+tests/test_common_bases.py::test_soft_delete_refuses_a_missing_actor PASSED [ 46%]
+tests/test_common_bases.py::test_soft_delete_accepts_a_declared_system_action PASSED [ 46%]
+tests/test_common_bases.py::test_queryset_soft_delete_refuses_a_missing_actor PASSED [ 47%]
+tests/test_common_bases.py::test_the_hidden_relation_cannot_be_traversed_from_the_parent PASSED [ 47%]
+tests/test_common_bases.py::test_the_hidden_relation_cannot_be_traversed_from_a_scoped_query PASSED [ 47%]
+tests/test_common_bases.py::test_the_hidden_relation_is_refused_on_all_objects_too PASSED [ 48%]
+tests/test_fixture_loading.py::test_django_does_not_defer_constraints_for_loaddata PASSED [ 48%]
+tests/test_fixture_loading.py::test_a_dependency_ordered_fixture_loads PASSED [ 48%]
+tests/test_fixture_loading.py::test_a_child_first_fixture_is_refused_by_the_composite_key PASSED [ 49%]
+tests/test_fixture_loading.py::test_a_fixture_that_mixes_two_organizations_is_refused PASSED [ 49%]
+tests/test_fixture_loading.py::test_a_dumpdata_round_trip_restores_every_row PASSED [ 50%]
+tests/test_healthz.py::test_healthz_returns_ok PASSED                    [ 50%]
+tests/test_orgs_models.py::test_organization_defaults_are_rwanda_first PASSED [ 50%]
+tests/test_orgs_models.py::test_organization_slug_is_unique PASSED       [ 51%]
+tests/test_orgs_models.py::test_organization_slug_uniqueness_is_enforced_by_the_database PASSED [ 51%]
+tests/test_orgs_models.py::test_a_soft_deleted_organization_releases_its_slug PASSED [ 51%]
+tests/test_orgs_models.py::test_organization_rejects_a_bogus_currency_code[rwf] PASSED [ 52%]
+tests/test_orgs_models.py::test_organization_rejects_a_bogus_currency_code[RW] PASSED [ 52%]
+tests/test_orgs_models.py::test_organization_rejects_a_bogus_currency_code[RWFX] PASSED [ 52%]
+tests/test_orgs_models.py::test_organization_rejects_a_bogus_currency_code[R1F] PASSED [ 53%]
+tests/test_orgs_models.py::test_organization_rejects_a_bogus_currency_code[] PASSED [ 53%]
+tests/test_orgs_models.py::test_organization_rejects_an_unknown_timezone[Africa/Kigaly] PASSED [ 54%]
+tests/test_orgs_models.py::test_organization_rejects_an_unknown_timezone[CAT] PASSED [ 54%]
+tests/test_orgs_models.py::test_organization_rejects_an_unknown_timezone[] PASSED [ 54%]
+tests/test_orgs_models.py::test_organization_rejects_an_unknown_timezone[UTC+2] PASSED [ 55%]
+tests/test_orgs_models.py::test_organization_accepts_another_real_timezone PASSED [ 55%]
+tests/test_orgs_models.py::test_store_name_is_unique_within_an_org PASSED [ 55%]
+tests/test_orgs_models.py::test_store_name_uniqueness_is_enforced_by_the_database PASSED [ 56%]
+tests/test_orgs_models.py::test_the_same_store_name_is_fine_in_another_org PASSED [ 56%]
+tests/test_orgs_models.py::test_a_soft_deleted_store_name_can_be_reused PASSED [ 57%]
+tests/test_orgs_models.py::test_store_carries_the_only_org_pointer PASSED [ 57%]
+tests/test_orgs_models.py::test_permission_catalog_is_exactly_the_agreed_set PASSED [ 57%]
+tests/test_orgs_models.py::test_presets_are_owner_manager_seller PASSED  [ 58%]
+tests/test_orgs_models.py::test_manager_preset_runs_a_store_but_does_not_own_the_org PASSED [ 58%]
+tests/test_orgs_models.py::test_role_rejects_an_unknown_permission_code PASSED [ 58%]
+tests/test_orgs_models.py::test_role_permissions_must_be_a_list_of_unique_codes[sale.record] PASSED [ 59%]
+tests/test_orgs_models.py::test_role_permissions_must_be_a_list_of_unique_codes[bad1] PASSED [ 59%]
+tests/test_orgs_models.py::test_role_permissions_must_be_a_list_of_unique_codes[bad2] PASSED [ 60%]
+tests/test_orgs_models.py::test_role_permissions_must_be_a_list_of_unique_codes[bad3] PASSED [ 60%]
+tests/test_orgs_models.py::test_role_accepts_catalog_codes_and_answers_has PASSED [ 60%]
+tests/test_orgs_models.py::test_role_name_is_unique_within_an_org PASSED [ 61%]
+tests/test_orgs_models.py::test_role_defaults_to_no_permissions_and_not_preset PASSED [ 61%]
+tests/test_orgs_models.py::test_membership_is_unique_per_user_and_org PASSED [ 61%]
+tests/test_orgs_models.py::test_membership_uniqueness_is_enforced_by_the_database PASSED [ 62%]
+tests/test_orgs_models.py::test_membership_rejects_a_role_from_another_org PASSED [ 62%]
+tests/test_orgs_models.py::test_store_access_rejects_a_store_from_another_org PASSED [ 63%]
+tests/test_orgs_models.py::test_store_access_is_unique_per_membership_and_store PASSED [ 63%]
+tests/test_orgs_models.py::test_store_access_accepts_a_store_in_the_same_org PASSED [ 63%]
+tests/test_orgs_models.py::test_unique_constraints_only_cover_live_rows[Organization.orgs_organization_unique_live_slug] PASSED [ 64%]
+tests/test_orgs_models.py::test_unique_constraints_only_cover_live_rows[Store.orgs_store_unique_live_name_per_org] PASSED [ 64%]
+tests/test_orgs_models.py::test_unique_constraints_only_cover_live_rows[Role.orgs_role_unique_live_name_per_org] PASSED [ 64%]
+tests/test_orgs_models.py::test_unique_constraints_only_cover_live_rows[Membership.orgs_membership_unique_live_user_per_org] PASSED [ 65%]
+tests/test_orgs_models.py::test_unique_constraints_only_cover_live_rows[StoreAccess.orgs_storeaccess_unique_live_membership_store] PASSED [ 65%]
+tests/test_orgs_models.py::test_orgs_models_are_soft_deletable_and_audited[Organization] PASSED [ 66%]
+tests/test_orgs_models.py::test_orgs_models_are_soft_deletable_and_audited[Store] PASSED [ 66%]
+tests/test_orgs_models.py::test_orgs_models_are_soft_deletable_and_audited[Role] PASSED [ 66%]
+tests/test_orgs_models.py::test_orgs_models_are_soft_deletable_and_audited[Membership] PASSED [ 67%]
+tests/test_orgs_models.py::test_orgs_models_are_soft_deletable_and_audited[StoreAccess] PASSED [ 67%]
+tests/test_orgs_models.py::test_orgs_models_refuse_hard_delete[Organization] PASSED [ 67%]
+tests/test_orgs_models.py::test_orgs_models_refuse_hard_delete[Store] PASSED [ 68%]
+tests/test_orgs_models.py::test_orgs_models_refuse_hard_delete[Role] PASSED [ 68%]
+tests/test_orgs_models.py::test_orgs_models_refuse_hard_delete[Membership] PASSED [ 69%]
+tests/test_orgs_models.py::test_orgs_models_refuse_hard_delete[StoreAccess] PASSED [ 69%]
+tests/test_orgs_models.py::test_orgs_models_are_not_store_scoped PASSED  [ 69%]
+tests/test_orgs_models.py::test_store_branding_defaults_to_inheriting_the_org PASSED [ 70%]
+tests/test_orgs_models.py::test_store_brand_must_be_a_mapping PASSED     [ 70%]
+tests/test_orgs_models.py::test_membership_cannot_take_a_role_from_another_org PASSED [ 70%]
+tests/test_orgs_models.py::test_store_access_cannot_reach_a_store_in_another_org PASSED [ 71%]
+tests/test_orgs_models.py::test_store_access_derives_its_org_from_the_membership PASSED [ 71%]
+tests/test_orgs_models.py::test_store_access_full_clean_does_not_demand_the_derived_org PASSED [ 72%]
+tests/test_orgs_models.py::test_the_same_org_composite_keys_exist_in_postgres PASSED [ 72%]
+tests/test_orgs_models.py::test_a_real_png_is_accepted PASSED            [ 72%]
+tests/test_orgs_models.py::test_an_svg_disguised_as_a_png_is_rejected PASSED [ 73%]
+tests/test_orgs_models.py::test_an_svg_extension_is_rejected PASSED      [ 73%]
+tests/test_orgs_models.py::test_an_oversized_image_is_rejected PASSED    [ 73%]
+tests/test_orgs_models.py::test_the_stored_logo_filename_is_random PASSED [ 74%]
+tests/test_orgs_models.py::test_media_root_is_outside_the_source_tree PASSED [ 74%]
+tests/test_user_model.py::test_the_project_user_model_is_ours PASSED     [ 75%]
+tests/test_user_model.py::test_username_field_and_required_fields PASSED [ 75%]
+tests/test_user_model.py::test_phone_rejects_bad_formats[+250788123456] PASSED [ 75%]
+tests/test_user_model.py::test_phone_rejects_bad_formats[0788123456] PASSED [ 76%]
+tests/test_user_model.py::test_phone_rejects_bad_formats[250 788 123 456] PASSED [ 76%]
+tests/test_user_model.py::test_phone_rejects_bad_formats[250788] PASSED  [ 76%]
+tests/test_user_model.py::test_phone_rejects_bad_formats[2507881234567890] PASSED [ 77%]
+tests/test_user_model.py::test_phone_rejects_bad_formats[25078812345a] PASSED [ 77%]
+tests/test_user_model.py::test_phone_rejects_bad_formats[] PASSED        [ 77%]
+tests/test_user_model.py::test_phone_accepts_country_code_digits[250788123456] PASSED [ 78%]
+tests/test_user_model.py::test_phone_accepts_country_code_digits[12345678] PASSED [ 78%]
+tests/test_user_model.py::test_phone_accepts_country_code_digits[999999999999999] PASSED [ 79%]
+tests/test_user_model.py::test_email_is_required PASSED                  [ 79%]
+tests/test_user_model.py::test_email_must_be_unique_case_insensitively PASSED [ 79%]
+tests/test_user_model.py::test_email_uniqueness_is_enforced_by_the_database_too PASSED [ 80%]
+tests/test_user_model.py::test_username_must_be_unique_case_insensitively PASSED [ 80%]
+tests/test_user_model.py::test_phone_must_be_unique PASSED               [ 80%]
+tests/test_user_model.py::test_language_defaults_to_english PASSED       [ 81%]
+tests/test_user_model.py::test_language_choices_match_the_configured_languages PASSED [ 81%]
+tests/test_user_model.py::test_language_rejects_an_unconfigured_code PASSED [ 82%]
+tests/test_user_model.py::test_password_is_argon2 PASSED                 [ 82%]
+tests/test_user_model.py::test_create_user_validates_its_input PASSED    [ 82%]
+tests/test_user_model.py::test_create_user_requires_identity_fields[username] PASSED [ 83%]
+tests/test_user_model.py::test_create_user_requires_identity_fields[email] PASSED [ 83%]
+tests/test_user_model.py::test_create_user_requires_identity_fields[phone] PASSED [ 83%]
+tests/test_user_model.py::test_create_user_normalises_the_email_domain PASSED [ 84%]
+tests/test_user_model.py::test_create_user_without_a_password_cannot_log_in PASSED [ 84%]
+tests/test_user_model.py::test_create_superuser_is_staff_and_superuser PASSED [ 85%]
+tests/test_user_model.py::test_create_superuser_refuses_to_be_downgraded PASSED [ 85%]
+tests/test_user_model.py::test_new_users_are_active_and_not_staff PASSED [ 85%]
+tests/test_user_model.py::test_username_cannot_impersonate_another_identifier[victim@example.com] PASSED [ 86%]
+tests/test_user_model.py::test_username_cannot_impersonate_another_identifier[250788111111] PASSED [ 86%]
+tests/test_user_model.py::test_username_cannot_impersonate_another_identifier[250-788-111-111] PASSED [ 86%]
+tests/test_user_model.py::test_username_cannot_impersonate_another_identifier[eva mugisha] PASSED [ 87%]
+tests/test_user_model.py::test_username_cannot_impersonate_another_identifier[eva@] PASSED [ 87%]
+tests/test_user_model.py::test_ordinary_usernames_are_accepted[eva] PASSED [ 88%]
+tests/test_user_model.py::test_ordinary_usernames_are_accepted[eva.mugisha] PASSED [ 88%]
+tests/test_user_model.py::test_ordinary_usernames_are_accepted[eva_m1] PASSED [ 88%]
+tests/test_user_model.py::test_ordinary_usernames_are_accepted[eva-m] PASSED [ 89%]
+tests/test_user_model.py::test_ordinary_usernames_are_accepted[eva+shop] PASSED [ 89%]
+tests/test_user_model.py::test_create_user_rejects_an_ambiguous_username PASSED [ 89%]
+tests/test_user_model.py::test_a_user_cannot_be_hard_deleted PASSED      [ 90%]
+tests/test_user_model.py::test_users_cannot_be_hard_deleted_in_bulk PASSED [ 90%]
+tests/test_user_model.py::test_the_user_base_manager_cannot_hard_delete_either PASSED [ 91%]
+tests/test_user_model.py::test_deactivation_is_the_supported_path PASSED [ 91%]
+tests/test_common_checks.py::test_the_real_models_pass PASSED            [ 91%]
+tests/test_common_checks.py::test_non_scoped_models_are_ignored PASSED   [ 92%]
+tests/test_common_checks.py::test_the_check_honours_the_app_configs_it_is_given PASSED [ 92%]
+tests/test_common_checks.py::test_the_check_stays_silent_about_apps_it_was_not_given PASSED [ 92%]
+tests/test_common_checks.py::test_a_model_that_overrides_objects_is_rejected PASSED [ 93%]
+tests/test_common_checks.py::test_an_extra_manager_that_steals_the_default_is_rejected PASSED [ 93%]
+tests/test_common_checks.py::test_a_model_that_makes_the_guarded_manager_the_default_is_rejected PASSED [ 94%]
+tests/test_common_checks.py::test_the_real_models_keep_the_unguarded_default_manager PASSED [ 94%]
+tests/test_common_checks.py::test_a_model_that_repoints_the_store_fk_is_rejected PASSED [ 94%]
+tests/test_common_checks.py::test_a_model_that_makes_the_store_optional_is_rejected PASSED [ 95%]
+tests/test_common_checks.py::test_a_forward_fk_that_creates_an_accessor_on_the_parent_is_rejected PASSED [ 95%]
+tests/test_common_checks.py::test_a_reverse_accessor_into_a_store_scoped_model_is_rejected PASSED [ 95%]
+tests/test_common_checks.py::test_a_global_unique_field_is_rejected PASSED [ 96%]
+tests/test_common_checks.py::test_a_unique_constraint_without_store_is_rejected PASSED [ 96%]
+tests/test_common_checks.py::test_a_unique_constraint_that_ignores_soft_delete_is_rejected PASSED [ 97%]
+tests/test_common_checks.py::test_unique_together_is_rejected PASSED     [ 97%]
+tests/test_common_checks.py::test_a_per_store_live_unique_constraint_passes PASSED [ 97%]
+tests/test_common_checks.py::test_an_org_level_model_pointing_at_a_store_scoped_model_is_rejected PASSED [ 98%]
+tests/test_db_stability.py::test_the_frozen_function_sql_has_not_changed PASSED [ 98%]
+tests/test_db_stability.py::test_the_frozen_trigger_sql_has_not_changed PASSED [ 98%]
+tests/test_db_stability.py::test_the_shipped_migration_still_carries_exactly_the_pinned_sql PASSED [ 99%]
+tests/test_db_stability.py::test_every_sql_helper_in_common_db_is_versioned PASSED [ 99%]
+tests/test_db_stability.py::test_no_migration_imports_an_unpinned_name_from_common_db PASSED [100%]
+
+======================= 268 passed in 433.34s (0:07:13) ========================
+```
+
+### `docker compose run --rm web ruff check .`
+
+```
+All checks passed!
+```
+
+### `docker compose run --rm web python manage.py check`
+
+```
+System check identified no issues (0 silenced).
+```
+
+### `docker compose run --rm web python manage.py makemigrations --check --dry-run`
+
+```
+No changes detected
+```
+
+### `docker compose run --rm web python manage.py makemigrations --check --dry-run --settings=config.settings.test`
+
+```
+No changes detected
+```
+
+---
+
+# FIX ROUND 3
+
+Scope: sections **A**, **B** and **D** of `task-123-fix-round-3.md`. Section C
+(entrypoint, Dockerfile, `.gitignore`, `.dockerignore`) belongs to a devops
+round running concurrently and was not touched; section E is carried forward.
+**D8** lives in `docker/Dockerfile` and is therefore also devops', not this
+round's — it is the one item in section D that did not land here.
+
+Baseline at start: 268 passed. End state: **330 passed**, ruff clean,
+`manage.py check` silent, no drift under either settings module.
+
+## A1 — the whole combinator surface, guarded at the seam
+
+The two seams, not a list of method names:
+
+* `sql.Query.combine` — `|`, `&` and `^` all reach it. `GuardedQuery.combine`
+  refuses a pinned/unpinned merge from *either* side (the unscoped base class
+  carries the scope flags now, so it can see both). `ScopedQuery.combine` then
+  re-resolves the merged pin set through `_store_pks()` — the same resolver that
+  already refuses `for_stores([A, RIVAL])`, which is what `|` was a synonym for.
+* `QuerySet._combinator_query` — `union()`, `intersection()` and `difference()`
+  all reach it and never call `combine()`. Overridden on `NoHardDeleteQuerySet`
+  (refusal) and on `ScopedQuerySet` (refusal + merged resolution).
+
+Both seams are the *only* callers in Django 6.1 — verified, not assumed:
+
+```
+$ grep -rn '\.combine(' django/db/ | grep -v 'def combine'
+django/db/models/query.py:500:        combined.query.combine(other.query, sql.AND)
+django/db/models/query.py:519:        combined.query.combine(other.query, sql.OR)
+django/db/models/query.py:538:        combined.query.combine(other.query, sql.XOR)
+
+$ grep -rn '_combinator_query' django/db/
+django/db/models/query.py:1700:    def _combinator_query(self, combinator, *other_qs, all=False):
+django/db/models/query.py:1720:            return qs[0]._combinator_query("union", *qs[1:], all=all)
+django/db/models/query.py:1723:        return self._combinator_query("union", *other_qs, all=all)
+django/db/models/query.py:1732:        return self._combinator_query("intersection", *other_qs)
+django/db/models/query.py:1738:        return self._combinator_query("difference", *other_qs)
+```
+
+`^` also needed queryset-level cover on the unscoped side, and while adding it
+a latent bug surfaced: `NoHardDeleteQuerySet.__ror__` / `__rand__` called
+`super().__ror__()` / `super().__rand__()`, **which do not exist** — Django's
+`QuerySet` defines only `__or__`, `__and__` and `__xor__`
+(`'__ror__' in QuerySet.__dict__` is `False`; the `hasattr` that presumably
+justified them finds `type.__ror__` on the metaclass, i.e. PEP-604 union
+syntax). Every reflected operator would have raised `AttributeError` the first
+time one ran. They now delegate to the forward operator, which is the same set
+operation.
+
+### Before — the four leaking expressions from the brief, executed
+
+```
+Product.objects.for_store(A) | Product.objects.for_store(B)        -> ['RIVAL', 'mine']
+Product.objects.for_store(A).union(Product.objects.for_store(B))   -> ['RIVAL', 'mine']
+Product.objects.for_store(A) ^ Product.all_objects.all()           -> ['RIVAL', 'mine2']
+Product.all_objects.all() ^ Product.objects.for_store(A)           -> ['RIVAL', 'mine2']
+```
+
+### After — the same four expressions, same fixtures, same probe
+
+```
+Product.objects.for_store(A) | Product.objects.for_store(B)        -> CrossStoreReferenceError
+Product.objects.for_store(A).union(Product.objects.for_store(B))   -> CrossStoreReferenceError
+Product.objects.for_store(A) ^ Product.all_objects.all()           -> UnscopedQueryError
+Product.all_objects.all() ^ Product.objects.for_store(A)           -> UnscopedQueryError
+```
+
+### The matrix
+
+`["__or__","__and__","__xor__","__ror__","__rand__","__rxor__","union",
+"intersection","difference"]` × {unscoped right, unscoped left, cross-org,
+cross-org reversed, same-org} — 45 cases, each materialised (`sorted(row.name
+for row in ...)`), because a build-time refusal and a fetch-time leak look
+identical until something iterates. Plus a "stays pinned to both stores" leg and
+a structural test that both seams are still overridden and still exist upstream.
+
+Before the fix, **30 of the new A1/A2 cases failed**:
+
+```
+FAILED tests/test_common_bases.py::test_a_multi_store_pin_refuses_to_update_a_store_scoped_foreign_key
+FAILED tests/test_common_bases.py::test_a_multi_store_pin_refuses_even_an_in_scope_foreign_key
+FAILED tests/test_common_bases.py::test_a_combinator_refuses_an_unscoped_right_hand_side[__xor__]
+FAILED tests/test_common_bases.py::test_a_combinator_refuses_an_unscoped_right_hand_side[__rxor__]
+FAILED tests/test_common_bases.py::test_a_combinator_refuses_an_unscoped_left_hand_side[__xor__]
+FAILED tests/test_common_bases.py::test_a_combinator_refuses_an_unscoped_left_hand_side[__rxor__]
+FAILED tests/test_common_bases.py::test_a_combinator_refuses_a_cross_organization_merge[__or__]
+FAILED tests/test_common_bases.py::test_a_combinator_refuses_a_cross_organization_merge[__and__]
+FAILED tests/test_common_bases.py::test_a_combinator_refuses_a_cross_organization_merge[__xor__]
+FAILED tests/test_common_bases.py::test_a_combinator_refuses_a_cross_organization_merge[__ror__]
+FAILED tests/test_common_bases.py::test_a_combinator_refuses_a_cross_organization_merge[__rand__]
+FAILED tests/test_common_bases.py::test_a_combinator_refuses_a_cross_organization_merge[__rxor__]
+FAILED tests/test_common_bases.py::test_a_combinator_refuses_a_cross_organization_merge[union]
+FAILED tests/test_common_bases.py::test_a_combinator_refuses_a_cross_organization_merge[intersection]
+FAILED tests/test_common_bases.py::test_a_combinator_refuses_a_cross_organization_merge[difference]
+FAILED tests/test_common_bases.py::test_a_combinator_refuses_a_cross_organization_merge_in_the_other_order[__or__]
+FAILED tests/test_common_bases.py::test_a_combinator_refuses_a_cross_organization_merge_in_the_other_order[__and__]
+FAILED tests/test_common_bases.py::test_a_combinator_refuses_a_cross_organization_merge_in_the_other_order[__xor__]
+FAILED tests/test_common_bases.py::test_a_combinator_refuses_a_cross_organization_merge_in_the_other_order[__ror__]
+FAILED tests/test_common_bases.py::test_a_combinator_refuses_a_cross_organization_merge_in_the_other_order[__rand__]
+FAILED tests/test_common_bases.py::test_a_combinator_refuses_a_cross_organization_merge_in_the_other_order[__rxor__]
+FAILED tests/test_common_bases.py::test_a_combinator_refuses_a_cross_organization_merge_in_the_other_order[union]
+FAILED tests/test_common_bases.py::test_a_combinator_refuses_a_cross_organization_merge_in_the_other_order[intersection]
+FAILED tests/test_common_bases.py::test_a_combinator_refuses_a_cross_organization_merge_in_the_other_order[difference]
+FAILED tests/test_common_bases.py::test_a_combinator_allows_two_stores_of_one_organization[__ror__]
+FAILED tests/test_common_bases.py::test_a_combinator_allows_two_stores_of_one_organization[__rand__]
+FAILED tests/test_common_bases.py::test_a_combinator_allows_two_stores_of_one_organization[__rxor__]
+FAILED tests/test_common_bases.py::test_a_merged_queryset_stays_pinned_to_both_stores[__xor__]
+FAILED tests/test_common_bases.py::test_a_merged_queryset_stays_pinned_to_both_stores[union]
+FAILED tests/test_common_bases.py::test_the_combinator_guard_sits_on_the_query_seam_not_on_a_list_of_names
+30 failed, 22 passed, 91 deselected
+```
+
+After: `52 passed, 91 deselected`.
+
+Cost, stated plainly: every `|`, `&`, `^`, `union()`, `intersection()` and
+`difference()` between two scoped querysets now issues one extra `SELECT id,
+org_id FROM orgs_store WHERE id IN (...)`. That is the price of resolving
+ownership instead of assuming it, and it is the same query `for_stores()`
+already pays.
+
+## A2 — a multi-store pin refuses store-scoped FK updates outright
+
+`_check_update_fk_stores` tested membership in the *pinned set*; the invariant
+`save()` enforces is equality with the *row's own* store. A multi-store pin
+cannot know each row's store, so it now refuses rather than approximates. The
+single-store path is unchanged (there, membership and equality are the same
+test) and is covered by its own passing test so the fix is not just a ban.
+
+### Before
+
+```
+SaleLine.objects.for_stores([A, A2]).update(product_id=<A2 product>) -> 1 row updated
+  SaleLine(store=A).product now lives in store: 2 (row's own store is 1)
+```
+
+### After
+
+```
+SaleLine.objects.for_stores([A, A2]).update(product_id=<A2 product>) -> CrossStoreReferenceError
+```
+
+## B1 — `common.E100` runs again
+
+`@register(Tags.database)` → `@register(Tags.security)`. The check does pure
+`settings.DATABASES` string inspection and opens no connection, so the database
+tag was simply wrong, and pointing the entrypoint at `check --database default`
+would have made a connection-free guard depend on a reachable database at boot.
+The two false statements in scope were corrected: `config/settings/prod.py:16-23`
+(which now states the tag choice and its reason, and no longer asserts what
+`docker/entrypoint.sh` does — that file is devops' this round) and the
+`common/checks.py` docstring. `docker/entrypoint.sh` and `docs/DEVELOPMENT.md`
+were routed elsewhere.
+
+### Before — prod settings, `POSTGRES_DB=test_raporo`
+
+```
+$ python manage.py check
+System check identified no issues (0 silenced).
+
+$ python manage.py check --database default
+SystemCheckError: System check identified some issues:
+
+ERRORS:
+?: (common.E100) Database 'default' is named 'test_raporo', which starts with 'test_'. The append-only TRUNCATE guard waives itself for such names, so this must never be a production database.
+	HINT: Rename the database, or unset ENFORCE_NON_TEST_DATABASE.
+
+System check identified 1 issue (0 silenced).
+```
+
+### After — same command, no `--database` argument
+
+```
+$ python manage.py check
+SystemCheckError: System check identified some issues:
+
+ERRORS:
+?: (common.E100) Database 'default' is named 'test_raporo', which starts with 'test_'. The append-only TRUNCATE guard waives itself for such names, so this must never be a production database.
+	HINT: Rename the database, or unset ENFORCE_NON_TEST_DATABASE.
+
+System check identified 1 issue (0 silenced).
+```
+
+And it still passes a legitimately named database (`POSTGRES_DB=raporo`):
+
+```
+$ python manage.py check
+System check identified no issues (0 silenced).
+```
+
+## B2 — six tests, all through the registry
+
+Every one drives `django.core.checks.run_checks()` or `call_command("check")`;
+none calls `check_database_is_not_test_named` directly. The suite's own database
+is named `test_raporo`, so flipping `ENFORCE_NON_TEST_DATABASE` on inside a test
+*is* the production misconfiguration, reproduced. Covered: fires through the
+registry; fails `manage.py check` end to end with `SystemCheckError`; is not
+tagged `database` and gives the same answer with and without a `databases`
+argument; silent with the flag off; silent on a normally-named database; names
+the alias and keeps its hint.
+
+### Before — the same six tests against `@register(Tags.database)`
+
+```
+FAILED tests/test_common_checks.py::test_e100_fires_through_the_registry_on_a_test_named_database
+FAILED tests/test_common_checks.py::test_manage_py_check_refuses_to_pass_on_a_test_named_database
+FAILED tests/test_common_checks.py::test_e100_is_not_tagged_database_because_that_tag_is_skipped_by_default
+FAILED tests/test_common_checks.py::test_e100_names_the_offending_alias_and_stays_actionable
+4 failed, 2 passed, 18 deselected, 1 warning
+```
+
+(The two that passed on the broken code are the two that assert *absence* — the
+tautology class the constraint on this fix existed to avoid.)
+
+### After
+
+```
+6 passed
+```
+
+## D1 — one test, four escape hatches
+
+`test_every_run_sql_statement_in_every_migration_is_pinned` imports every
+`apps/*/migrations/*.py` module and hashes every statement of every `RunSQL`
+operation's `sql` and `reverse_sql` (handling the string / list-of-strings /
+list-of-`(sql, params)` forms, and `None` / `RunSQL.noop`). It does not care how
+the text got there: inline, in a dict, in a class attribute, via
+`import common.db as cdb`, or produced by a pinned helper called with a new
+table name. Premise assertions keep it from going vacuous if the glob stops
+matching.
+
+That surfaced something the brief did not expect: `orgs/0001_initial` and
+`audit/0001_initial` **already inline** eight statements (the four
+`*_same_org_fk` keys, forward and reverse) that nothing pinned. They are now in
+`PINNED_MIGRATION_SQL`, kept separate from `PINNED_SQL` so the import-name scan
+is not polluted by path-shaped keys.
+
+`_looks_like_sql` is gone, replaced by `_holds_text`: every module-level
+non-underscore name in `common/db.py` that is — or contains, through a list,
+tuple, set, dict or class attribute — a string must be versioned unless
+allowlisted. `REVOKE`, `GRANT`, `INSERT`, `TRUNCATE`, `DO $$` and `WITH ...
+UPDATE` no longer walk past it.
+
+Mutation-checked, both directions at once (an unversioned `REVOKE_TRUNCATE`
+constant in `common/db.py` and an extra inline `RunSQL` in `audit/0002`):
+
+```
+FAILED tests/test_db_stability.py::test_the_shipped_migration_still_carries_exactly_the_pinned_sql
+FAILED tests/test_db_stability.py::test_every_run_sql_statement_in_every_migration_is_pinned
+FAILED tests/test_db_stability.py::test_every_sql_helper_in_common_db_is_versioned
+3 failed, 3 passed
+```
+
+Both mutations reverted; `git status` confirms neither file kept them.
+
+## D2 / D3 — the V1→V2 path, corrected
+
+`common/db.py`'s docstring now says, with reasons: a V2 in another app must
+declare an explicit dependency on **every** migration installing an earlier
+version (`("audit", "0002_append_only_trigger")` included) or Django's graph is
+free to apply it first on a fresh install and leave that database on the V1
+body; and a V2's `reverse_sql` is `CREATE_APPEND_ONLY_FUNCTION_V1`, never a
+DROP, because `DROP FUNCTION raporo_append_only()` is refused by Postgres while
+any guarded table's trigger depends on it. A worked "guard a new table" example
+follows: depend on `audit/0002`, carry **only** the trigger operation, pin the
+new table's forward and reverse text. `audit/0002`'s own docstring says the same
+from the other end — it owns the function's lifecycle, and copying both of its
+operations is what makes a second guarded table's migration irreversible.
+
+## D4 — `migrate orgs zero` destroys the audit log
+
+Measured, not reasoned:
+
+```
+$ python manage.py migrate orgs zero --plan | grep -iE 'audit|Planned'
+Planned operations:
+audit.0002_append_only_trigger
+    Raw SQL operation -> DROP TRIGGER IF EXISTS audit_auditl…
+audit.0001_initial
+    Undo Create model AuditLog
+    Raw SQL operation -> ALTER TABLE audit_auditlog DROP CON…
+```
+
+The migration's docstring now names that row-set: the one command that can erase
+the append-only forensic record wholesale.
+
+## D5 — the post-`loaddata` deferral window
+
+Three tests and a prominent module docstring warning. The baseline (a cross-org
+`UPDATE` refused at statement time), the landmine (the identical write
+**accepted** after a `loaddata` in the same transaction, then proved still armed
+by a `SET CONSTRAINTS ALL IMMEDIATE` that raises), and the remedy (issue
+`SET CONSTRAINTS ALL IMMEDIATE` right after loading and the guard is back). The
+landmine test restores the row before it ends — `TestCase._fixture_teardown`
+runs the same check, and leaving it would fail the *next* test, which is exactly
+the confusion being documented.
+
+## D6 — `tests/test_fixture_loading.py`
+
+* The ordered fixture now carries an `audit.auditlog` row, so all four
+  `*_same_org_fk` keys are exercised — including the one that shares a table
+  with the append-only trigger.
+* The child-first test asserts the specific constraint name
+  (`orgs_storeaccess_membership_same_org_fk`), matching the cross-org test.
+* The round-trip dump is derived from `INSTALLED_APPS` and excludes only
+  `contenttypes`, `auth.Permission`, `sessions` and `admin.LogEntry`, so a
+  slice-2 app registered above `apps.orgs` will actually break it.
+* `disable_constraint_checking()` is wrapped in `try/finally` with
+  `enable_constraint_checking()`.
+
+## D7 — `bulk_update` and the poisoned transaction
+
+`ScopedQuerySet.update()` now carries the warning: `bulk_update` runs its
+`update()` calls inside `transaction.atomic(savepoint=False)`, so a
+`CrossStoreReferenceError` escapes an atomic block with no savepoint to roll
+back to. A caller that catches it cannot continue in the same transaction.
+
+## Not in this round
+
+* **Section C** (C1–C5) and **D8** — `docker/`, `compose.yaml`, `.gitignore`,
+  `.dockerignore`, `requirements.txt`. Concurrent devops round.
+* **Section E** — carried forward unchanged.
+* `README.md`, `docs/SETUP.md`, `docs/DEVELOPMENT.md` — tech-writer's, including
+  the false E100 claim at `docs/DEVELOPMENT.md:189-192`.
+
+## Files changed this round
+
+```
+common/managers.py                            A1, A2, D7
+common/checks.py                              B1
+config/settings/prod.py                       B1 (comment)
+common/db.py                                  D2, D3
+apps/audit/migrations/0002_append_only_trigger.py   D3 (docstring only)
+apps/orgs/migrations/0001_initial.py          D4 (docstring only)
+tests/test_common_bases.py                    A1, A2
+tests/test_common_checks.py                   B2
+tests/test_db_stability.py                    D1
+tests/test_fixture_loading.py                 D5, D6
+tests/fixtures/orgs_dependency_ordered.json   D6
+```
+
+No migration operation was altered — the two migration files changed docstrings
+only, which is why `makemigrations --check` is clean and every pinned hash still
+matches.
+
+## Verbatim evidence
+
+### `docker compose run --rm web pytest -v`
+
+```
+======================= 330 passed in 659.37s (0:10:59) ========================
+```
+
+(Full per-test listing omitted here for length; the run was clean, 330 of 330,
+and the new test names appear in the list below.)
+
+New this round:
+
+```
+tests/test_common_bases.py::test_a_multi_store_pin_refuses_to_update_a_store_scoped_foreign_key
+tests/test_common_bases.py::test_a_multi_store_pin_refuses_even_an_in_scope_foreign_key
+tests/test_common_bases.py::test_a_single_store_pin_still_updates_a_foreign_key_in_its_own_store
+tests/test_common_bases.py::test_a_combinator_refuses_an_unscoped_right_hand_side[9 operators]
+tests/test_common_bases.py::test_a_combinator_refuses_an_unscoped_left_hand_side[9 operators]
+tests/test_common_bases.py::test_a_combinator_refuses_a_cross_organization_merge[9 operators]
+tests/test_common_bases.py::test_a_combinator_refuses_a_cross_organization_merge_in_the_other_order[9 operators]
+tests/test_common_bases.py::test_a_combinator_allows_two_stores_of_one_organization[9 operators]
+tests/test_common_bases.py::test_a_merged_queryset_stays_pinned_to_both_stores[__or__, __xor__, union]
+tests/test_common_bases.py::test_the_combinator_guard_sits_on_the_query_seam_not_on_a_list_of_names
+tests/test_common_checks.py::test_e100_fires_through_the_registry_on_a_test_named_database
+tests/test_common_checks.py::test_manage_py_check_refuses_to_pass_on_a_test_named_database
+tests/test_common_checks.py::test_e100_is_not_tagged_database_because_that_tag_is_skipped_by_default
+tests/test_common_checks.py::test_e100_is_silent_when_the_flag_is_off
+tests/test_common_checks.py::test_e100_is_silent_on_a_normally_named_database
+tests/test_common_checks.py::test_e100_names_the_offending_alias_and_stays_actionable
+tests/test_db_stability.py::test_every_run_sql_statement_in_every_migration_is_pinned
+tests/test_fixture_loading.py::test_a_cross_organization_role_is_refused_at_statement_time
+tests/test_fixture_loading.py::test_loaddata_leaves_the_composite_keys_deferred_for_the_rest_of_the_transaction
+tests/test_fixture_loading.py::test_set_constraints_all_immediate_restores_the_guard_after_a_loaddata
+```
+
+### `docker compose run --rm web ruff check .`
+
+```
+All checks passed!
+```
+
+### `docker compose run --rm web python manage.py check`
+
+```
+System check identified no issues (0 silenced).
+```
+
+### `docker compose run --rm web python manage.py makemigrations --check --dry-run`
+
+```
+No changes detected
+```
+
+### `docker compose run --rm web python manage.py makemigrations --check --dry-run --settings=config.settings.test`
+
+```
+No changes detected
+```

@@ -289,15 +289,26 @@ def check_store_scoped_models(app_configs, **kwargs):
     return audit_store_scoped_models(models)
 
 
-@register(Tags.database)
+@register(Tags.security)
 def check_database_is_not_test_named(app_configs, **kwargs):
     """E100: refuse a production database whose name starts with `test_`.
 
     Gated on `settings.ENFORCE_NON_TEST_DATABASE`, set only by prod settings, so
     it never fires while Django is building/using a real `test_*` database in the
     suite. The append-only trigger waives its TRUNCATE guard for `test_*` names;
-    a mis-named production database would inherit that waiver silently, so the
-    container's pre-boot `manage.py check` refuses to start on one.
+    a mis-named production database would inherit that waiver silently, so a
+    pre-boot `manage.py check` refuses to start on one.
+
+    NOT `Tags.database`, which is where this started and where it was inert:
+    `CheckRegistry.run_checks` drops every database-tagged check unless an alias
+    is passed explicitly ("they do more than mere static code analysis"), and
+    plain `manage.py check` passes none - so the guard never ran. This one is
+    pure `settings.DATABASES` string inspection and opens no connection, so it
+    belongs with the security checks, and asking the entrypoint for
+    `check --database default` would have been the wrong repair: it would make a
+    connection-free guard depend on a reachable database at boot.
+    `tests/test_common_checks.py` drives it through the registry, never directly,
+    because a direct call passed with the broken tag.
     """
     if not getattr(settings, "ENFORCE_NON_TEST_DATABASE", False):
         return []

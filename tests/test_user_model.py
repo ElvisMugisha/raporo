@@ -41,12 +41,12 @@ def test_username_field_and_required_fields():
 @pytest.mark.parametrize(
     "phone",
     [
-        "+250788123456",  # the leading + must be rejected
-        "0788123456",  # local format, no country code
-        "250 788 123 456",  # spaces
         "250788",  # too short
         "2507881234567890",  # too long
         "25078812345a",  # letters
+        "250+788123456",  # + in the middle
+        "00250788123456",  # international dialling prefix
+        "0912345678",  # no such Rwandan destination code
         "",
     ],
 )
@@ -58,8 +58,26 @@ def test_phone_rejects_bad_formats(phone):
 
 
 @pytest.mark.parametrize("phone", ["250788123456", "12345678", "999999999999999"])
-def test_phone_accepts_country_code_digits(phone):
+def test_phone_accepts_a_canonical_stored_number(phone):
     build_user(phone=phone).full_clean()  # must not raise
+
+
+@pytest.mark.parametrize(
+    ("typed", "stored"),
+    [
+        ("0788123456", "250788123456"),  # how a Rwandan writes it
+        ("+250788123456", "250788123456"),
+        ("788123456", "250788123456"),
+        ("0788 123 456", "250788123456"),
+        ("+254712345678", "254712345678"),  # another country, kept in full
+    ],
+)
+def test_full_clean_canonicalises_the_phone_before_anything_compares_it(typed, stored):
+    """`tests/test_phone_identity.py` owns the invariant this makes possible."""
+    user = build_user(phone=typed)
+    user.full_clean()
+
+    assert user.phone == stored
 
 
 def test_email_is_required():
@@ -124,7 +142,7 @@ def test_create_user_validates_its_input():
         User.objects.create_user(
             username="a",
             email="a@example.rw",
-            phone="+250788123456",
+            phone="0912345678",  # trunk prefix, but no such destination code
             password="S3cure!passphrase",
         )
 

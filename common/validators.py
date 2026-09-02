@@ -3,6 +3,7 @@
 User-facing messages are wrapped in `gettext_lazy`: they surface in forms.
 """
 
+import re
 from functools import lru_cache
 from zoneinfo import available_timezones
 
@@ -11,15 +12,216 @@ from django.core.validators import FileExtensionValidator, RegexValidator
 from django.utils.translation import gettext_lazy as _
 from PIL import Image, UnidentifiedImageError
 
-#: Country code + subscriber number, digits only, no leading `+` and no zero
-#: first digit (E.164 without the plus). Example: 250788123456.
+# --------------------------------------------------------------------------
+# Phone numbers
+# --------------------------------------------------------------------------
+#
+# A phone number is an *identifier* here: unique per account and one of the
+# three things a person can log in with. So the only thing that matters is that
+# one human phone maps to exactly one stored string. `PHONE_REGEX` alone never
+# gave that - it checks shape, not identity, and `788123456` and
+# `250788123456` are the same SIM under two strings it both accepted, in two
+# rows `unique=True` had no grounds to refuse. Anything that reaches the
+# column, or looks the column up, goes through `normalize_phone()` first.
+#
+# Rwanda's numbering plan, checked rather than assumed. Primary source: the
+# National Numbering Plan RURA communicated to ITU-T on 14.X.2009, published as
+# "Rwanda (country code +250)" (ITU doc T02020000AE) - country code 250,
+# national significant number minimum 8 and maximum 9 digits, destination codes
+# 25 geographic/fixed, 72 / 75 / 78 mobile, 06 satellite (NSN 8). That document
+# predates today's operators, so it is cross-checked against Google's
+# libphonenumber metadata for territory RW, which is maintained: national
+# prefix 0, international prefix 00, mobile `7[237-9]xxxxxxx`, fixed
+# `(?:06|2[23568]x)xxxxxx`, toll-free `800xxxxxx`, premium `900xxxxxx` - all 9
+# digits except the 8-digit satellite range.
+#
+# So a Rwandan subscriber number is 9 digits opening with 2 (fixed) or 7
+# (mobile), written locally with the trunk prefix as 0788 123 456, and 250 +
+# those 9 is the 12-digit canonical form. Three ranges from the plan are
+# deliberately *not* accepted for a user account, and each exclusion is a
+# choice, not an oversight:
+#
+#   * 800 / 900 - toll-free and premium rate are not subscriber lines. Nobody
+#     signs up with one, and a premium-rate number in a field we will later
+#     send OTPs to is a billing-fraud shape.
+#   * 06 satellite - its destination code itself starts with a zero, which
+#     cannot be told apart from the trunk prefix every real user relies on
+#     (`06123456` reads as trunk + a 7-digit number). Rwanda Satellite is
+#     defunct and libphonenumber records no live example; the ambiguity is not
+#     worth carrying for a range with no subscribers. Widening this is one
+#     regex, `RWANDA_NSN_REGEX`.
+#
+# Numbers from other countries are accepted only in full international form
+# (`+254712345678`), because a bare national number cannot be attributed to a
+# country and guessing would re-create the exact ambiguity this closes. We do
+# not validate another country's plan - that needs libphonenumber's dataset,
+# which is a dependency and a monthly data refresh; the shape check below is
+# E.164's own bound and the honest limit of what we know.
+
+#: The canonical **stored** form: E.164 without the plus. Every value written
+#: to a phone column matches this, and `normalize_phone()` is what makes that
+#: true. Kept as the field validator too, as a floor under the normaliser.
 PHONE_REGEX = r"^[1-9][0-9]{7,14}$"
+
+RWANDA_COUNTRY_CODE = "250"
+RWANDA_TRUNK_PREFIX = "0"
+RWANDA_NSN_LENGTH = 9
+
+#: A Rwandan national significant number: 9 digits, fixed (2…) or mobile (7…).
+#: Deliberately not the exact allocated destination codes (25, 72, 73, 78, 79):
+#: RURA allocates new mobile codes, and a plan-perfect regex would refuse a
+#: real new number at signup - the same friction bug in a new coat. Opening
+#: digit is enough to keep the canonical space unambiguous, which is what this
+#: is for.
+RWANDA_NSN_REGEX = re.compile(r"^[27][0-9]{8}$")
+
+#: A Rwandan number in canonical form: 250 + 9 digits.
+_RWANDA_E164_LENGTH = len(RWANDA_COUNTRY_CODE) + RWANDA_NSN_LENGTH
+
+#: E.164: 15 digits maximum, and no country code starts with 0.
+_E164_REGEX = re.compile(r"^[1-9][0-9]{7,14}$")
+_ASCII_DIGITS_REGEX = re.compile(r"^[0-9]+$")
+
+#: Presentation only, in every convention: `+250 788 123 456`,
+#: `(078) 812-3456`, `0788.123.456`. Stripped before anything is decided,
+#: because a login identifier typed with the spaces the owner's own contact
+#: card shows must resolve to their account. Deliberately not `\s`: a newline
+#: or a carriage return is not a separator in any convention, it is two fields
+#: pasted into one, and `\s` would silently splice them into one number.
+_PHONE_SEPARATORS_REGEX = re.compile("[ \t\u00a0\u202f\u2009().\u2013\u2014-]+")
+
+#: The widest *input* we will look at: `+250 788 123 456` is 16 characters and
+#: a 15-digit international number written in groups can reach ~20. Bounds the
+#: work done on hostile input, and is what the form field is sized to - the
+#: column stores at most 15.
+PHONE_INPUT_MAX_LENGTH = 24
+
+_PHONE_HELP = _("Write a Rwandan number as 0788123456, or another country's as +254712345678.")
 
 phone_validator = RegexValidator(
     regex=PHONE_REGEX,
-    message=_("Enter the phone number with its country code, digits only, without +."),
+    message=_PHONE_HELP,
     code="invalid_phone",
 )
+
+
+def _invalid_phone(message) -> ValidationError:
+    return ValidationError(message, code="invalid_phone")
+
+
+def normalize_phone(value) -> str:
+    """Return the canonical stored form of `value`, or raise `ValidationError`.
+
+    ::
+
+        0788123456     -> 250788123456   (trunk prefix, how Rwandans write it)
+        +250788123456  -> 250788123456
+        250788123456   -> 250788123456
+        788123456      -> 250788123456   (bare national: assume Rwanda)
+        +254712345678  -> 254712345678   (another country, kept in full)
+
+    **Where this runs.** `apps.accounts.models.PhoneField` calls it from
+    `to_python()` (so `full_clean()` and every ModelForm normalise before the
+    field validators, before `clean()`, and before `validate_unique()` runs its
+    query), from `pre_save()` (so `save()`, `objects.create()`,
+    `bulk_create()`, `loaddata` and the admin normalise even though they never
+    call `full_clean()`) and from `get_prep_value()` (so `QuerySet.update()`,
+    `bulk_update()` and an `=` lookup normalise at the SQL layer). Uniqueness -
+    the unique index, and the `validate_unique()` query in front of it - is
+    therefore always evaluated on canonical strings.
+
+    **Closure.** Every string this returns normalises to itself
+    (`tests/test_phone_normalization.py` fuzzes the property). Without that, a
+    number could be stored under one string and looked up under another, which
+    is the original defect one layer down.
+
+    **At the login box** (task 5's multi-identifier backend), the identifier a
+    person typed must come through here before it is compared with the stored
+    column, or whoever signed up as `0788123456` cannot log in with it. An
+    identifier that is not a phone number is not an error there, so ask
+    forgiveness::
+
+        try:
+            phone = normalize_phone(identifier)
+        except ValidationError:
+            phone = None  # a username or an email address, then
+    """
+    if not isinstance(value, str):
+        # An int has already lost the leading zero that decides the country,
+        # and `None` is "no number" - neither is ours to guess at.
+        raise _invalid_phone(_("Enter a phone number.") if value is None else _PHONE_HELP)
+
+    raw = value.strip()
+    if not raw:
+        raise _invalid_phone(_("Enter a phone number."))
+    if len(raw) > PHONE_INPUT_MAX_LENGTH:
+        # Refused on width before any scanning: nothing this long is a number.
+        raise _invalid_phone(_PHONE_HELP)
+
+    plus_prefixed = raw.startswith("+")
+    digits = _PHONE_SEPARATORS_REGEX.sub("", raw[1:] if plus_prefixed else raw)
+    # `[0-9]`, never `\d`: `\d` matches Arabic-Indic and full-width digits, and
+    # `٢٥٠…` stored next to `250…` is two strings for one number again. A `+`
+    # anywhere but the front survives the strip and is caught here too.
+    if not _ASCII_DIGITS_REGEX.fullmatch(digits):
+        raise _invalid_phone(_PHONE_HELP)
+
+    if digits.startswith("00"):
+        # `00` is the prefix you *dial* to leave the country, not part of any
+        # number. Refused rather than guessed at, because a leading zero is
+        # already claimed by the trunk prefix.
+        raise _invalid_phone(
+            _("Do not start with 00: write +250788123456, or 0788123456 for a Rwandan number.")
+        )
+
+    if plus_prefixed:
+        return _from_international(digits)
+    if digits.startswith(RWANDA_TRUNK_PREFIX):
+        # The trunk prefix is Rwandan by definition; no international number
+        # opens with a zero, so there is nothing else this can be.
+        return RWANDA_COUNTRY_CODE + _rwanda_nsn(digits[1:])
+    if len(digits) == RWANDA_NSN_LENGTH and RWANDA_NSN_REGEX.fullmatch(digits):
+        return RWANDA_COUNTRY_CODE + digits
+    if digits.startswith(RWANDA_COUNTRY_CODE) and len(digits) == _RWANDA_E164_LENGTH:
+        # 250 + 9 digits can only be a Rwandan number: 250 is the country code
+        # and no shorter code (2, 25) is assigned.
+        return _from_international(digits)
+    return _international(digits)
+
+
+def _rwanda_nsn(nsn: str) -> str:
+    if not RWANDA_NSN_REGEX.fullmatch(nsn):
+        raise _invalid_phone(
+            _(
+                "A Rwandan number is nine digits starting with 7 for mobile or 2 for "
+                "a landline, written as 0788123456 or +250788123456."
+            )
+        )
+    return nsn
+
+
+def _from_international(digits: str) -> str:
+    if digits.startswith(RWANDA_COUNTRY_CODE):
+        return RWANDA_COUNTRY_CODE + _rwanda_nsn(digits[len(RWANDA_COUNTRY_CODE) :])
+    return _international(digits)
+
+
+def _international(digits: str) -> str:
+    if not _E164_REGEX.fullmatch(digits):
+        raise _invalid_phone(_PHONE_HELP)
+    if len(digits) == RWANDA_NSN_LENGTH and RWANDA_NSN_REGEX.fullmatch(digits):
+        # Refused to keep the canonical space closed: stored bare, this value
+        # would normalise to `250…` next time it was read, so it could be
+        # written under one string and looked up under another. No country's
+        # real E.164 number is nine digits long opening with 2 or 7, so
+        # nothing legitimate is being turned away.
+        raise _invalid_phone(
+            _(
+                "A nine-digit number is read as Rwandan: write a Rwandan number as "
+                "0788123456, or another country's in full, as +254712345678."
+            )
+        )
+    return digits
 
 #: Deliberately narrower than Django's `UnicodeUsernameValidator`: `@` is
 #: excluded so a username can never look like an email address, and an

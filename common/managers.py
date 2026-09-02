@@ -24,6 +24,22 @@ enumerating dunders is exactly how `^` shipped unguarded, and how
 `for_store(A) | for_store(RIVAL)` stayed a synonym for the `for_stores([A,
 RIVAL])` that `_store_pks()` already refused.
 
+One shape reaches neither seam, so `union()` itself is overridden as well:
+`QuerySet.union()` drops `self` when it is an `EmptyQuerySet` and, with exactly
+one non-empty leg left, hands that leg back *without* building a combined query
+at all - `for_store(A).none().union(all_objects.all())` returned every
+organization's rows. Nothing is gained by it (the queryset returned is one the
+caller already held, so no capability crosses), and three or more legs are
+refused correctly because Django then does call `_combinator_query` on the first
+surviving leg - but the seam is the contract, so the seam is consulted.
+`intersection()` / `difference()` short-circuit too and need no override: their
+short-circuit only ever returns an *empty* queryset.
+
+A `|` or `^` involving a *sliced* store-scoped queryset is refused outright:
+Django rebuilds a sliced operand through the base manager, which is neither
+store-pinned nor live-only, so the merge cannot be proven safe. Combine first,
+then slice.
+
 The messages here are for developers, not users: reaching them means a bug in
 our code, never bad input from a request. They stay untranslated on purpose.
 """
@@ -142,22 +158,48 @@ def require_actor(by, system: bool):
     return by
 
 
-def merge_scope_pks(left_pks, right_pks, connector: str) -> tuple[int, ...]:
+def merge_scope_pks(
+    model, left_pks, right_pks, operator: str, *, narrow: bool
+) -> tuple[int, ...]:
     """The store set a combined query is pinned to, resolved - never assumed.
 
     A plain set union is what leaked: `for_stores([A, RIVAL])` is refused by
     `_store_pks()`, so `for_store(A) | for_store(RIVAL)` is its synonym and has
-    to go through the same resolver. Every merge therefore re-resolves ownership
-    against the database, which also catches a pin whose store was deleted
-    between the two legs.
+    to go through the same resolver. A merge that widens the set therefore
+    re-resolves ownership against the database.
 
-    `AND` narrows to the intersection when there is one (the conjunction can
-    only return rows in both); an empty intersection falls back to the resolved
+    A pin is an upper bound on where the result's rows can come from, so
+    *widening* it is always sound and *narrowing* it only is when the result is
+    provably inside both legs - `&` and `intersection()`. `difference()` is not
+    one of those: its rows come from the left leg, about which the right leg's
+    pin says nothing. Hence a `narrow` flag rather than the connector: the two
+    call sites speak different vocabularies (`sql.AND`/`OR`/`XOR` against
+    `"union"`/`"intersection"`/`"difference"`), and a string compared against one
+    of them is dead code on the other path - `intersection()` used to pin to
+    both stores where `&` narrowed. An empty intersection falls back to the
     union, because a pin of no stores would read as "unpinned" downstream.
+
+    Two unpinned legs are refused here rather than left to the compile-time
+    guard: `_store_pks(())` would raise `ValueError` naming a function the caller
+    never called, which no `except UnscopedQueryError` catches.
     """
-    resolved = _store_pks(sorted(set(left_pks) | set(right_pks)))
-    if connector == AND:
-        narrowed = set(left_pks) & set(right_pks)
+    left, right = set(left_pks), set(right_pks)
+    if not left and not right:
+        raise UnscopedQueryError(
+            f"{model.__name__} is store-scoped: `{operator}` combines two unpinned "
+            f"querysets, so the combined query would carry no store predicate. "
+            f"Pin every side with for_store()/for_stores()."
+        )
+    if left == right:
+        # Nothing new to resolve: this exact set was validated against the
+        # database when `for_store()` / `for_stores()` pinned it, and stores are
+        # never hard-deleted, so a second lookup can only confirm it. Skipping it
+        # is what keeps `a | a` lazy - a widening merge is worth the query, but
+        # building a queryset should not hit the database on its own.
+        return tuple(sorted(left))
+    resolved = _store_pks(sorted(left | right))
+    if narrow:
+        narrowed = left & right
         if narrowed:
             return tuple(pk for pk in resolved if pk in narrowed)
     return tuple(resolved)
@@ -251,6 +293,42 @@ def refuse_scope_mix(left, others, operator: str) -> None:
             )
 
 
+def refuse_sliced_combine(operands, operator: str) -> None:
+    """`|` / `^` on a *sliced* store-scoped queryset, refused by name.
+
+    SQL cannot express "OR the first two rows of that", so `QuerySet.__or__` and
+    `__xor__` quietly rebuild a sliced operand as
+    `model._base_manager.filter(pk__in=<the slice>)`. `_base_manager` here is
+    `all_objects`: neither store-pinned nor live-only. The slice itself survives
+    as a subquery and still compiles through the scope guard, but the *outer*
+    query carries no store predicate and no `deleted_at IS NULL`, so the merged
+    query cannot be proven safe - tombstones reappear, and before
+    `GuardedQuery.combine` refused the mismatch, `for_store(A)[:2] |
+    for_store(RIVAL)` returned both organizations' rows.
+
+    So this refusal is about the message, not the safety: `GuardedQuery.combine`
+    is what actually stops the merge (and stops it for any operator Django adds
+    later), but it can only say "one side is unpinned" - which reads as a lie to
+    an author who pinned both sides and never asked for a base-manager query.
+
+    `&` is deliberately not here. It takes no such rewrite: Django itself raises
+    `TypeError("Cannot combine queries once a slice has been taken.")` for a
+    sliced left operand, which is accurate, and a sliced right operand is merged
+    as an ordinary WHERE clause with its limit dropped - no guarantee is lost.
+    Non-scoped models are not here either: for them `_base_manager` is the same
+    unfiltered `all_objects` the operands already came from, so the rewrite
+    removes nothing.
+    """
+    for operand in operands:
+        if isinstance(operand, ScopedQuerySet) and operand.query.is_sliced:
+            raise UnscopedQueryError(
+                f"{operand.model.__name__}: `{operator}` on a *sliced* queryset. Django "
+                f"rebuilds a sliced operand through the base manager, which is neither "
+                f"store-pinned nor live-only, so the merge cannot be proven safe. "
+                f"Combine first, then slice."
+            )
+
+
 def guarded_queryset(manager, queryset_class):
     """A queryset of `queryset_class` on a `GuardedQuery`."""
     return queryset_class(
@@ -274,7 +352,11 @@ class ScopedQuery(GuardedQuery):
         """
         self.refuse_scope_mismatch(rhs, connector)
         merged = merge_scope_pks(
-            self.store_scope_pks, getattr(rhs, "store_scope_pks", ()), connector
+            self.model,
+            self.store_scope_pks,
+            getattr(rhs, "store_scope_pks", ()),
+            connector,
+            narrow=connector == AND,
         )
         result = super().combine(rhs, connector)
         self.store_scoped = True
@@ -290,6 +372,13 @@ class ScopedQuery(GuardedQuery):
                 f"data migrations."
             )
         return super().get_compiler(*args, **kwargs)
+
+
+#: Combinators whose result is provably inside *every* leg, so the merged pin
+#: may narrow to the intersection of the legs' pins. `union` and `difference` are
+#: absent on purpose: a union's rows come from either leg, and a difference's
+#: come from the left one, which the right leg's pin does not bound.
+NARROWING_COMBINATORS = frozenset({"intersection"})
 
 
 class NoHardDeleteQuerySet(models.QuerySet):
@@ -328,6 +417,7 @@ class NoHardDeleteQuerySet(models.QuerySet):
 
     def __or__(self, other):
         refuse_scope_mix(self, [other], "|")
+        refuse_sliced_combine([self, other], "|")
         return super().__or__(other)
 
     def __and__(self, other):
@@ -336,6 +426,7 @@ class NoHardDeleteQuerySet(models.QuerySet):
 
     def __xor__(self, other):
         refuse_scope_mix(self, [other], "^")
+        refuse_sliced_combine([self, other], "^")
         return super().__xor__(other)
 
     # Django's QuerySet defines no reflected operators, so there is no `super()`
@@ -358,6 +449,33 @@ class NoHardDeleteQuerySet(models.QuerySet):
         """The seam behind `union()`, `intersection()` and `difference()`."""
         refuse_scope_mix(self, other_qs, f"{combinator}()")
         return super()._combinator_query(combinator, *other_qs, **kwargs)
+
+    def union(self, *other_qs, **kwargs):
+        """Guarded here as well, because `union()` can skip the seam entirely.
+
+        `QuerySet.union()` drops `self` when it is an `EmptyQuerySet` and, with
+        exactly one non-empty leg left, returns that leg without ever calling
+        `_combinator_query` - so `for_store(A).none().union(all_objects.all())`
+        reached no refusal at all and iterated every organization's rows.
+        Nothing is *gained* by it (Django hands back the caller's own queryset,
+        so the caller could have iterated it directly, and `all_objects` is the
+        sanctioned audit view), which is why this is a seam fix rather than a
+        leak fix: every combination is refused where it is written.
+
+        The short-circuit itself still stands where both legs are pinned -
+        including to two different organizations. Nothing is merged there, so
+        there is no combined query to resolve and no scope to widen: Django
+        returns the surviving leg, which the caller already had and could have
+        iterated on its own. `test_a_short_circuited_union_returns_the_surviving_
+        leg_unchanged` pins that by identity, so the day Django merges instead,
+        the merge goes through `_combinator_query` like every other.
+
+        `intersection()` and `difference()` short-circuit on an empty leg too and
+        need no override - their short-circuit only ever returns an *empty*
+        queryset, so there is nothing to prove about the result.
+        """
+        refuse_scope_mix(self, other_qs, "union()")
+        return super().union(*other_qs, **kwargs)
 
 
 class SoftDeleteQuerySet(NoHardDeleteQuerySet):
@@ -428,7 +546,13 @@ class ScopedQuerySet(SoftDeleteQuerySet):
         clone = super()._combinator_query(combinator, *other_qs, **kwargs)
         merged = self._scope_pks()
         for other in other_qs:
-            merged = merge_scope_pks(merged, queryset_scope(other)[1], combinator)
+            merged = merge_scope_pks(
+                self.model,
+                merged,
+                queryset_scope(other)[1],
+                f"{combinator}()",
+                narrow=combinator in NARROWING_COMBINATORS,
+            )
         return self._pin(clone, merged)
 
     # -- writes ----------------------------------------------------------

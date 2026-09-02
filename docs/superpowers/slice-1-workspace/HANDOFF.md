@@ -1,108 +1,71 @@
-# Slice 1 — Handoff (home laptop → work laptop, 2026-09-01 night)
+# Slice 1 — Handoff (2026-09-02)
 
-Committed as **work-in-progress**. Slice 1 is NOT finished. This file + `LEDGER.md` + the `task-*` reports here are the full record; the live SDD workspace (`.superpowers/`) is gitignored and does NOT travel, which is why these copies exist.
+The foundation task is **through the merge gate**. Slice 1 as a whole is not finished — Tasks 4–14 are untouched. This file + `LEDGER.md` + the `task-*` reports here are the full record; the live SDD workspace (`.superpowers/`) is gitignored and does NOT travel, which is why these copies exist.
 
-**Read this file, then `LEDGER.md`, before touching code.** Every claim below has a command next to it. Run the commands — do not trust the prose. The last handoff was accurate about seven things and optimistic about one, and the optimistic one cost a full round.
+**Read this file, then `LEDGER.md`, before touching code.** Every claim below has a command next to it. Run the commands — do not trust the prose. Across this slice, four separate controls were found *present, correctly named, documented, and never executed*. Prose is not evidence.
 
 ---
 
-## Where we are in one paragraph
+## Where we are
 
-Slice 1 has 14 tasks. **Task 0** (dockerized Django 6.1 scaffold) is complete and reviewed. **Tasks 1+2+3** were merged into one dispatch (`common/` bases + accounts + audit + orgs + all migrations) and have now been through **three fix rounds and four gate reviews**. Fix round 3 is **fully landed on disk and independently verified**, but **its gate re-reviews have not been run** — that is the first job tomorrow. **Tasks 4–14 have not been started.**
+| | |
+| --- | --- |
+| **Task 0** — dockerized Django 6.1 scaffold | ✅ complete, reviewed |
+| **Tasks 1+2+3** (merged) — `common/` bases, accounts, audit, orgs, all migrations | ✅ **4 fix rounds, 8 gate reviews, tech-lead MERGE WITH FOLLOW-UPS** |
+| **Tasks 4–14** | ⏳ not started |
 
-## First thing tomorrow, in order
-
-1. `git fetch && git checkout feat/slice-1-foundation && git pull`
-2. **`docker compose build`** — the image changed (multi-stage, entrypoint, `postgresql-client` in the dev target). A stale image will behave nothing like this document says.
-3. `cp .env.example .env`
-4. **Add `DJANGO_MEDIA_ROOT` to `.env.example` by hand** — still outstanding, still cannot be automated (see "Blocked on Elvis" below).
-5. `docker compose down -v && docker compose up -d --wait` — should reach both-containers-healthy in ~25s.
-6. Verify the state this document claims (the block below). If anything disagrees, believe the machine.
-7. **Then: run the three gate re-reviews on fix round 3** (code-reviewer, security-engineer, database-engineer). Security's BLOCK cannot lift until it re-runs its own harness against A1/A2.
+Round-3 gate verdicts: **code-reviewer** APPROVE WITH NITS · **database-engineer** APPROVE WITH NITS · **security-engineer** APPROVE WITH NITS, **BLOCK withdrawn** ("security-engineer says merge"). Round 4 closed the two findings that were more than cosmetic. **tech-lead: MERGE WITH FOLLOW-UPS.**
 
 ## Verify the claimed state — run these, don't assume
 
 ```bash
-docker compose run --rm web pytest -q                      # expect: 330 passed
-docker compose run --rm web ruff check .                   # expect: All checks passed!
-docker compose run --rm web python manage.py check         # expect: no issues (0 silenced)
+cp .env.example .env                                        # if starting fresh
+docker compose build                                        # the image changed; a stale one lies
+docker compose run --rm web pytest -q                       # expect: 369 passed
+docker compose run --rm web ruff check .                    # expect: All checks passed!
+docker compose run --rm web python manage.py check          # expect: no issues (0 silenced)
 docker compose run --rm web python manage.py makemigrations --check --dry-run
 docker compose run --rm web python manage.py makemigrations --check --dry-run --settings=config.settings.test
-docker compose run --rm web pytest -q -k runserver | grep -c "entrypoint:"   # expect: 0
-curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/healthz       # expect: 200
+docker compose run --rm web python -m pytest --version | grep -c "entrypoint:"   # expect: 0
+docker compose down -v && docker compose up -d --wait       # expect: healthy in 12-40s
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/healthz           # expect: 200
 ```
 
-All of the above were green at 2026-09-01 end of session, run by the controller, not by the implementing agents.
+All green at 2026-09-02, run by the controller and independently reproduced by the tech-lead — not by the implementing agents.
 
 ---
 
-## Fix round 3 — what landed (all verified by execution)
+## Follow-ups, in order. None blocked the commit; **items 3 and 4 block Task 4.**
 
-Brief: `task-123-fix-round-3.md`. It consolidates four gate reports and is the document tomorrow's re-reviews should be judged against.
+1. **`RAPORO_ROLE` validation ordering + the stale `environment:` prohibition** — devops. Round 4's never-list `exec`s before the role validation, so `RAPORO_ROLE=bogus pytest` is silently accepted (rc=0) while every other command exits 64. Safety is intact (a test runner is never pre-booted); the *diagnostic* is lost, on the one invocation a pipeline is most likely to typo. Separately, four places state "never put `RAPORO_ROLE=server` in a compose `environment:`" as absolute — round 4 made it conditional, and two of the four contradict a sibling paragraph in the same file. True rule: **not in `compose.yaml`; yes in `compose.prod.yaml`, because the never-list is what makes it safe.**
+2. **This file and `ROADMAP.md`** — kept current as of this rewrite. Re-check after item 1 lands.
+3. **Resolve 14 add/add conflicts with `origin/dev`, as its own commit on this branch, before Task 4.** Verified: `git merge-base HEAD origin/dev` is the *initial commit*, because `dev` acquired the AI-team setup through separate PRs after this branch diverged. `git merge-tree HEAD origin/dev` → rc=1, 14 conflicts, all docs/config, **no source code**: seven `.claude/agents/*-engineer.md`, `.claude/skills/new-feature/SKILL.md`, `.gitignore`, `README.md`, `docs/PRODUCT.md`, `docs/ROADMAP.md`, `docs/SETUP.md`, `docs/superpowers/specs/2026-09-01-...`. **The resolution is not "take HEAD"** — dev's copies arrived after the divergence, so each needs `git diff HEAD origin/dev -- <path>`. A ~20-minute tech-writer job. Do it now while it is 14 markdown files, not later when it is 14 plus slice 2.
+4. **`privacy-compliance` ruling on Rwanda Law 058/2021, before Task 4** — not before an account-deletion UI, which is where it was previously scheduled. The tech-lead re-dated it and the reasoning is sound: `AuditLog` is append-only at the *database* level with a TRUNCATE trigger, so **any PII that reaches an audit row is structurally un-erasable without a migration**, and Task 4 writes the first services that call `audit.record` for user events. This is a scoped confirmation, not a redesign — the security gate already verified "audit redaction + IP validation + IDs-only logging". Rule on (a) whether the current redaction policy satisfies Law 058/2021, and (b) whether the erasure pathway is `anonymize()` or soft-delete-plus-redaction. Two reviewers converged on this independently, which is the strongest signal in the ledger.
+5. **`common.E101`** — make the "nothing the app writes at runtime may live under `/app`" invariant a mechanism rather than prose. It is pure settings-string inspection with no database connection, the same shape as `common.E100`, which now works: refuse a `MEDIA_ROOT` or `STATIC_ROOT` under `BASE_DIR`. Converts a deploy-time `PermissionError` three decisions from its cause into a `manage.py check` failure.
 
-| Item | What it was | Verified how |
-| --- | --- | --- |
-| **A1** | Cross-org `\|`/`union`/`intersection`/`difference` leaked across organizations; `^`/`__rxor__` unguarded both directions | All four leaking expressions executed before and after; 45-case operator matrix (9 operators × 5 legs), 30 cases failed pre-fix |
-| **A2** | Multi-store `for_stores()` pin allowed a cross-store FK update | Probe executed before and after |
-| **B1** | `common.E100` was inert — registered `@register(Tags.database)`, which bare `manage.py check` skips | Re-tagged `Tags.security`; controller confirmed it now **refuses** a `test_`-named prod DB and stays silent on a normal one |
-| **B2** | E100 had zero tests | 6 registry-driven tests; 4 fail on the old tag |
-| **C1** | Entrypoint dispatch failed open and also fired on `pytest -k runserver` (it migrated a real database) | 13-shape matrix measured before and after |
-| **C2** | `runtime` stage claimed to be "the deployable image" while shipping Django's dev server | Reframed as an explicit placeholder — see the decision below |
-| **C3** | `.env*` neither gitignored nor dockerignored | `git check-ignore` both directions; `.env.example` confirmed still tracked |
-| **C4/C5** | `/app` writable by the runtime user; `tests/`, `CLAUDE.md`, `.mcp.json` in the runtime image | Confirmed in the built image |
-| **D1–D8** | B1 escape hatches, V1→V2 path errors, the post-`loaddata` deferral window, fixture-test gaps | Each with a regression test; D1 mutation-checked |
+Also owed: a `craft-editor` pass has now run on `README.md` and `docs/DEVELOPMENT.md`. It left five technical statements flagged-but-unresolved; three were adjudicated and fixed, and its remaining two notes are in `LEDGER.md`.
 
-Two findings from inside the round that were nobody's assignment:
-
-- **A latent bug the gates missed.** `NoHardDeleteQuerySet.__ror__`/`__rand__` delegated to `super().__ror__()` — and Django 6.1's `QuerySet` defines neither. Both would have raised `AttributeError` on first real use. They were present (a grep found them) and unreachable. `hasattr` also lies here: it finds `type.__ror__` via PEP-604. This is precisely how round 2's A2 was reported closed.
-- **Healthcheck budgets were too tight for a cold start.** The first wiped-volume `up --wait` *failed*: `db` had `start_period: 15s` against a ~30s `initdb`, and `web` came in at 102s against a budget of exactly 102s. Fixed with `start_period` (db 60s, web 120s), deliberately not `retries`.
-
-## Decisions taken this session (do not re-litigate)
-
-- **C2 — no production server yet.** `runtime` is an honest placeholder, not a deployable image. Adding gunicorn now means a dependency with no consumer and no reviewed configuration (worker model, timeouts, graceful shutdown, access-log format, proxy header trust). Those belong with the deploy task.
-- **C1 — the entrypoint fails closed.** Pre-boot runs by default; a narrow tooling list is exempt. This overruled the fix brief, which suggested an exempt list that was itself fail-open.
-- **B1 — retag, don't change the entrypoint.** The check is pure `settings.DATABASES` string inspection; making a connection-free guard depend on a reachable database at boot would be worse.
+---
 
 ## Two things about the entrypoint you will trip over
 
-1. **`RAPORO_ROLE=server` must never go in a compose service's `environment:`.** `docker compose run` inherits it and would force the pre-boot sequence back onto `pytest`, reintroducing the exact bug C1 fixed. It belongs on a deploy workload spec.
-2. **Fail-closed has a visible price.** `docker compose run --rm web python -c '...'` and `bash -c 'ruff check .'` now run check + migrate. Opt out with `-e RAPORO_ROLE=tooling`. `docker compose exec` bypasses the entrypoint entirely and is unaffected.
-
----
-
-## Open work, in priority order
-
-### 1. Run the three fix-round-3 gate re-reviews (blocking the slice)
-Nothing has reviewed round 3. Security's **BLOCK stands** on the record until it re-runs its own ~120-probe harness against A1 and A2 and lifts it. Dispatch all three against `task-123-fix-round-3.md`, each in its own compose project (`-p raporo-gate-sec` etc.) so they don't race the same test database — three concurrent `pytest --create-db` runs on the default project will collide.
-
-### 2. `docs/DEVELOPMENT.md` has 8 known-stale lines
-The C1 polarity inversion landed after the docs were written. Route to tech-writer:
-- **L53–54** — says the pre-boot sequence only runs for `runserver`/`gunicorn`/`uvicorn`/`daphne`. Polarity is now the opposite: it runs by default, a short list is exempt.
-- **L62–64** — "Every other command is exec'd untouched: `pytest`, `ruff`, `manage.py <anything>`, `bash`." Three corrections: `manage.py <anything>` is now *except* `runserver`/`runserver_plus`/`testserver`; `bash` means bash *with no arguments*; and `python -c`, `python -m`, `sh -c '…'` now **do** get the pre-boot sequence.
-- **L134** — "the deployable image". Now explicitly wrong (C2).
-- **env table** — `RAPORO_ROLE` is new and undocumented. Needs a row beside `RAPORO_AUTO_MIGRATE`, including the never-put-it-in-compose warning.
-- **L171–172** — "`runtime` target is what deploys". Nothing deploys it.
-- **L173** — "for server commands only" → "for everything except an exempt tooling list".
-- **L204–205** — cold start is now budgeted up to 2 minutes (30–100s in practice); one clause so nobody kills it early.
-- **L206–208** — the entrypoint's diagnostics now go to **stderr**, and an exempt command prints nothing at all.
-
-A `craft-editor` pass is also still owed on `README.md` and `docs/DEVELOPMENT.md` — neither has had one.
-
-### 3. Then Tasks 4–14
-`docs/superpowers/plans/2026-09-01-slice-1-foundation.md`. Task 4 is services on top of the models that now exist.
+1. **`RAPORO_AUTO_MIGRATE=1` is in the compose service `environment:`, and every `docker compose run` inherits it.** What makes that safe is that `migrate` requires a *positively identified server*; an unrecognised command gets `check` only and says so on stderr. Do not "simplify" that gate away.
+2. **Fail-closed has a visible price.** An unrecognised command runs `manage.py check` before yours. `pytest`, `ruff`, `manage.py <sub>`, a bare shell, and `python -m`/`sh -c` wrappers resolving to known tooling are all exempt. Opt out with `-e RAPORO_ROLE=tooling`; `docker compose exec` bypasses the entrypoint entirely.
 
 ## Carried forward — deliberately not this slice
 
-- **Slice 2 must know all of this before copying the append-only pattern** to StockMovement / Payment / CapitalEntry / Payout. It is written up in `LEDGER.md` under the database-engineer's round-2 re-review; the four that matter most:
-  1. Do **not** copy the function-install operation — declare `dependencies = [("audit", "0002_append_only_trigger")]` and carry the trigger operation only, or your migration is irreversible once two tables are guarded.
-  2. **Never assert a constraint violation after a `loaddata` in the same test.** Postgres' `check_constraints()` ends with `SET CONSTRAINTS ALL DEFERRED`, which is transaction-scoped, so every composite key goes quiet for the rest of that test and the assertion passes vacuously.
-  3. Fixtures must be parent-first — our composite keys are `INITIALLY IMMEDIATE`, Django's own FKs are not, so intuitions from other Django projects do not transfer.
-  4. An append-only table cannot be wiped. "Restore over an existing database" is not a supported operation; restore means fresh DB → `migrate` → `loaddata`.
-- **`MEDIA_ROOT` must stay outside `/app`.** C4 (root-owned application code) is only safe because of it. If a later change points `MEDIA_ROOT` back into the tree, C4 becomes an outage rather than a hardening nit. Deserves to be a written ops invariant.
-- **Deploy-time, devops-engineer:** runtime DB role must not own these tables nor hold `TRUNCATE`; "no prod/staging database named `test_*`" as a written ops invariant; a standalone `compose.prod.yaml` (recorded shape: split by *file*, never a profile or an override-merge — `DEBUG=True` should be absent from the file you deploy, not switched off in it).
-- **Security, at first HTML page:** no CSP, `SECURE_PROXY_SSL_HEADER` or `CSRF_TRUSTED_ORIGINS` in `config/settings/prod.py`. Harmless while `/healthz` is the only view.
-- **Product/privacy, before any account-deletion UI:** `User` erasure / anonymisation under Rwanda Law 058/2021. Flagged independently by two reviewers. Soft delete alone does not satisfy erasure while PII columns remain.
-- A DB `CheckConstraint` for the username shape — accepted as residual.
+- **Nothing the app writes at runtime may live under `/app`.** `MEDIA_ROOT` and `STATIC_ROOT` are its two instances. Measured in the built runtime image: `STATIC_ROOT` unset → `ImproperlyConfigured` (**this is why root-owning `/app` is currently safe**), `/app/staticfiles` → `PermissionError`, `/var/tmp/raporo-static` → 130 files copied. See follow-up 5.
+- **A new top-level Python package must be added to the Dockerfile's COPY list**, or it is missing from the shipped image — and the dev bind mount hides that locally, so it first fails at deploy. The rule is stated at the COPY block.
+- **Slice 2, before copying the append-only pattern** to StockMovement / Payment / CapitalEntry / Payout:
+  1. Do **not** copy the function-install operation. Declare `dependencies = [("audit", "0002_append_only_trigger")]` and carry the trigger operation only, or the migration is irreversible once two tables are guarded (measured: Postgres refuses `DROP FUNCTION` while any trigger depends on it).
+  2. **Never assert a constraint violation after a `loaddata` in the same test.** Postgres' `check_constraints()` ends with `SET CONSTRAINTS ALL DEFERRED`, which is transaction-scoped, so every composite key goes quiet for the rest of that test and the assertion passes vacuously. `tests/conftest.py::load_fixture` re-arms with `SET CONSTRAINTS ALL IMMEDIATE` — use it.
+  3. Fixtures must be parent-first: our composite keys are `INITIALLY IMMEDIATE`, Django's own FKs are not, so intuitions from other Django projects do not transfer.
+  4. An append-only table cannot be wiped. "Restore over an existing database" is not supported; restore means fresh DB → `migrate` → `loaddata`.
+  5. The stability contract is **enforced by construction** — a guard migration cannot be committed green; `test_every_run_sql_statement_in_every_migration_is_pinned` prints the SQL and the digest to paste.
+- **Security, at the first HTML page (Task 8):** no CSP, `SECURE_PROXY_SSL_HEADER` or `CSRF_TRUSTED_ORIGINS` in `config/settings/prod.py`. The tech-lead's instruction: make this an **acceptance criterion on Task 8 owned by security-engineer**, not a handoff note — "a note in a handoff is how E100 shipped inert."
+- **Deploy, devops:** runtime DB role must not own these tables nor hold `TRUNCATE` (in dev the app connects as owner *and* superuser, so the audit trail is only as strong as that role); "no prod/staging database named `test_*`" as a written ops invariant; a standalone `compose.prod.yaml` — **split by file, never a Compose profile or an override-merge**, because both leave dev defaults reachable by omission and `DEBUG=True` should be absent from the file you deploy, not switched off in it. It sets `RAPORO_ROLE=server`, leaves `RAPORO_AUTO_MIGRATE` unset, drops the bind mount, takes secrets from the platform store. A pipeline `--target runtime` build must run `manage.py check` inside the image. `runtime` must not become pipeline-reachable before it has a real server.
+- **`performance-engineer`, when ledger writes land:** `merge_scope_pks()` issues a store lookup per widening combinator at build time (a combinator in a loop is an N+1); `_check_update_fk_stores()` issues one lookup per named store-scoped FK per `update()`, so `bulk_update` pays it per batch. **Do not let slice 2 optimise the first one away without re-proving the leak it closed.**
+- Username-shape `CheckConstraint` — accepted residual; the Python validators refuse every shape the security gate threw, including Devanagari numerals.
 
 ## Blocked on Elvis (cannot be automated)
 
@@ -110,10 +73,15 @@ A `craft-editor` pass is also still owed on `README.md` and `docs/DEVELOPMENT.md
 ```
 DJANGO_MEDIA_ROOT=/var/lib/raporo/media
 ```
-Agents are refused by the `Read(./.env*)` deny rule — confirmed this session that it blocks even a blind append. Dev is unaffected (`base.py` falls back to `/var/tmp/raporo-media`); prod requires it with no fallback, deliberately, so a deploy fails fast rather than scattering uploads.
+Agents are refused by the `Read(./.env*)` deny rule — confirmed this session that it blocks even a blind append. Dev falls back to `/var/tmp/raporo-media`; prod requires it with no fallback, deliberately, so a deploy fails fast rather than scattering uploads.
 
-## Process notes for the next session
+## Process notes — earned expensively, worth keeping
 
-- **Presence is not verification.** This round's two worst defects — a set-operator guard that delegated to a nonexistent superclass method, and a system check filtered out at runtime by a framework default — were both *present, correctly named, and referenced in documentation*. A grep found both and reported them closed. Verify by executing the thing, and for a guard specifically: it is unverified until you have watched it **refuse** something.
+- **Presence is not verification, and a grep is a presence check.** Four controls this slice were present, correctly named, referenced in documentation, and never executed: `common.E100` registered under a tag nothing ran; `__ror__`/`__rand__` delegating to a `super()` method Django does not define; `GuardedQuery.combine`'s guard with zero coverage; and a set-operator fix reported closed because a grep found the method names — by the implementer, and then again by the controller. **A guard is unverified until you have watched it refuse something.** Note `hasattr` lies about `__ror__` (it finds `type.__ror__` via PEP-604) — use `in QuerySet.__dict__`, or evaluate the expression.
+- **A new test can pass while the bug reproduces.** Round 4's prescribed test passed with the guard deleted, because a second guard added in the same round raised first. Validate a regression test by mutating *the specific guard it targets*, and state the observed failure.
+- **A reviewer's suggested mechanism is the least-verified artifact in the loop.** Three times this slice an implementer overruled a prescribed fix and was right: a fail-open exempt list, a test that could not reach its guard, and a check that was dead code on the path it targeted. The property was correct all three times; the mechanism was not. State the property and the acceptance test; label any mechanism "one option, untested". When an implementer overrules, send it back to the prescribing gate for a one-line acknowledgement, or the same gate re-prescribes the same shape next slice.
+- **No two parallel agents share a checkout** — implementer or reviewer. Isolated compose projects (`-p <name>`) worked flawlessly all slice; the shared *working tree* caused two incidents (a live security guard briefly deleted by an in-place mutation test, and a "mid-edit read" that looked exactly like a real regression). Use a `git worktree` per agent. Isolate the scratchpad too, per-agent subdirectory.
+- **Never mount into `/app/**`** — it leaves a zero-byte root-owned stub on the host, and an empty `.py` is ruff-clean, so lint will not catch it. Happened twice.
+- **The sequencing change the tech-lead wants for slice 2:** an implementer's report must contain, per guard it touched, the mutation output — guard removed, test red, guard restored, test green. No mutation evidence, and the dispatch comes back unreviewed rather than going to a gate. Eight gate reviews this slice were largely spent establishing that guards were unverified; that is work the implementer could do for free while the code is warm, and it frees the gates for the leaks nobody imagined.
 - Agents cannot run `git add`/`commit`/`push`. Elvis commits, and only once every agent has reported.
-- Three agent sessions have now been killed mid-flight by the host process exiting. Each time, file changes had landed and only the reports were lost. Check disk before re-dispatching.
+- Three agent sessions were killed mid-flight by the host process exiting. Each time, file changes had landed and only the reports were lost. **Check disk before re-dispatching.**

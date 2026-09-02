@@ -3,10 +3,15 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
-      # Builds the `dev` target: the `runtime` target plus psql, so
-      # `manage.py dbshell` works locally without a psql client in a shipped
-      # image. (`runtime` is an honest placeholder today, not yet deployable —
-      # see the comment on that stage in docker/Dockerfile.)
+      # Builds the `dev` target. `dev` and `runtime` are *siblings* off the
+      # shared `base` stage, not a chain: `dev` adds psql (so `manage.py
+      # dbshell` works locally without a psql client in a shipped image) plus
+      # `tests/`, `pytest.ini` and `ruff.toml`, while `runtime` adds nothing
+      # to `base` at all. Siblings rather than a chain is what makes "no
+      # shipped layer ever contains tests/" true by construction — nothing
+      # absent was ever copied in and then deleted. (`runtime` is an honest
+      # placeholder today, not yet deployable — see the comment on that stage
+      # in docker/Dockerfile.)
       target: dev
     env_file: .env
     environment:
@@ -14,6 +19,14 @@ services:
       # Local dev only: one container, no rolling deploy, so the entrypoint may
       # migrate on boot and a fresh clone's first `up` serves a real schema.
       # Deploys leave this unset — see docker/entrypoint.sh.
+      #
+      # Note what putting it here means: `docker compose run --rm web <cmd>`
+      # inherits the whole service `environment:`, so every one-off command
+      # inherits this permission too. The entrypoint therefore requires *both*
+      # this variable and a command it recognises as a server before it will
+      # migrate, and refuses outright for a test runner. It stays here rather
+      # than moving to `command:` because the point of it is the healthcheck
+      # contract above: `up --wait` must mean "migrated and answering".
       RAPORO_AUTO_MIGRATE: "1"
     volumes:
       - ".:/app"
@@ -43,7 +56,7 @@ services:
         condition: service_healthy
 
   db:
-    image: postgres:17
+    image: postgres:18
     env_file: .env
     healthcheck:
       # `-h 127.0.0.1` on purpose: during first-time initdb the server listens
@@ -59,7 +72,29 @@ services:
       # the whole stack with "dependency failed to start".
       start_period: 60s
     volumes:
-      - "pgdata:/var/lib/postgresql/data"
+      # `/var/lib/postgresql`, NOT `/var/lib/postgresql/data` — the mount point
+      # moved in postgres:18, and this line is the whole reason the image bump
+      # above is not a one-word change.
+      #
+      # Up to and including postgres:17 the image set
+      # `PGDATA=/var/lib/postgresql/data` and declared that same path as its
+      # VOLUME, so `pgdata:/var/lib/postgresql/data` was the documented mount.
+      # postgres:18 made PGDATA major-version-specific
+      # (`/var/lib/postgresql/18/docker`) and moved the declared VOLUME up one
+      # level, so a future major upgrade can hold 18/ and 19/ side by side in
+      # one volume and run `pg_upgrade --link` without crossing a mount
+      # boundary.
+      #
+      # Keeping the old path does not corrupt anything and does not quietly
+      # write to an anonymous volume: docker-entrypoint.sh in 18+ checks
+      # whether `/var/lib/postgresql/data` is a mount point *at all* —
+      # irrespective of contents, so a brand-new empty volume trips it too —
+      # and exits 1 with an explicit message ("/var/lib/postgresql/data (unused
+      # mount/volume)"). Verified: the container never reaches `pg_isready`, so
+      # `up --wait` aborts the stack on the `db` healthcheck. Loud and
+      # first-boot, which is why this comment is short on doom and long on the
+      # path: get the path right and there is nothing else to know.
+      - "pgdata:/var/lib/postgresql"
 
 volumes:
   pgdata: {}

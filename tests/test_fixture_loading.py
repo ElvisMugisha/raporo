@@ -25,9 +25,15 @@ are deferred until that transaction ends: the violation you expect to raise is
 accepted, your `pytest.raises` fails, or worse it passes vacuously somewhere
 else and the error surfaces at teardown attributed to a different test. Slice 2
 will load ledger fixtures and then assert cross-org writes are refused - that
-combination is the landmine. Either keep the two in separate test methods, or
-issue `SET CONSTRAINTS ALL IMMEDIATE` immediately after loading.
-`test_loaddata_leaves_the_composite_keys_deferred_...` pins both halves.
+combination is the landmine. `test_loaddata_leaves_the_composite_keys_deferred_
+...` pins both halves.
+
+**The remedy is a fixture, not this paragraph.** A warning here only reaches
+people who open this file, and the next author to load a fixture will be writing
+`tests/test_ledger_fixtures.py`. So `tests/conftest.py` - the file everyone
+opens for fixtures - provides `load_fixture`, which loads and then re-arms with
+`SET CONSTRAINTS ALL IMMEDIATE`. Use it; the tests below use raw `loaddata` only
+where the un-remedied behaviour is the subject.
 
 What that means in practice, and what these tests hold:
 
@@ -80,7 +86,23 @@ TABLES_CHILD_FIRST = (
 #: Excluded from the round-trip dump. Not application data: content types and
 #: permissions are recreated by `migrate` and collide on their natural keys,
 #: sessions are transient, and admin log entries point at content types.
-NOT_APPLICATION_DATA = ["contenttypes", "auth.Permission", "sessions", "admin.LogEntry"]
+#:
+#: `audit` is excluded for a different and harder reason: an audit row cannot be
+#: restored by `loaddata` at all. The append-only trigger refuses UPDATE and
+#: DELETE, and `loaddata` writes with `save_base(raw=True)`, which issues an
+#: UPDATE first - so re-loading a dumped audit row over an existing one is
+#: refused by the trigger, and wiping the table first is refused by it too
+#: (`TRUNCATE` inside a test transaction fails with "pending trigger events",
+#: and the row's foreign key to `orgs_store` then blocks the store's DELETE).
+#: Restoring audit history is a `pg_restore`-into-an-empty-database operation,
+#: not a fixture one. Excluding it here keeps the dump honest about that.
+NOT_APPLICATION_DATA = [
+    "contenttypes",
+    "auth.Permission",
+    "sessions",
+    "admin.LogEntry",
+    "audit",
+]
 
 
 def test_django_does_not_defer_constraints_for_loaddata(db):
@@ -103,8 +125,8 @@ def test_django_does_not_defer_constraints_for_loaddata(db):
         connection.enable_constraint_checking()
 
 
-def test_a_dependency_ordered_fixture_loads(db):
-    call_command("loaddata", ORDERED, verbosity=0)
+def test_a_dependency_ordered_fixture_loads(load_fixture):
+    load_fixture(ORDERED)
 
     access = StoreAccess.all_objects.get(pk=1)
     entry = AuditLog.objects.get(pk=1)
@@ -158,6 +180,11 @@ def dumped_app_labels() -> list[str]:
     `INSTALLED_APPS` order and nothing else. A slice-2 app registered above
     `apps.orgs` produces an unrestorable full dump while a two-app dump stays
     green.
+
+    Scanning every app is necessary but not sufficient: `dumpdata` emits nothing
+    for an empty table, so the round-trip test only notices a badly ordered app
+    once that app has at least one row *created in this test*. Adding a model to
+    the schema is not enough - add it to the fixture data below as well.
     """
     return [config.label for config in global_apps.get_app_configs()]
 
@@ -169,6 +196,10 @@ def test_a_dumpdata_round_trip_restores_every_row(db, tmp_path):
     registration order, so it produces a loadable file only while every model is
     defined after the models it points at. A ledger model declared above its
     parent would still pass every other test in the suite and break restore.
+
+    It only notices a new app once that app has rows here, so extend the data
+    below when slice 2 lands - and create it through managers, not through a
+    service: services write audit rows, and the wipe below cannot remove those.
     """
     user = get_user_model().objects.create_user(
         username="eva",
@@ -191,6 +222,22 @@ def test_a_dumpdata_round_trip_restores_every_row(db, tmp_path):
             indent=2,
             stdout=handle,
         )
+
+    # The wipe below is a plain child-first DELETE, and `audit_auditlog` cannot
+    # be in it: the append-only trigger refuses DELETE, and the row's foreign key
+    # to `orgs_store` would then refuse the store's DELETE as well. So this test
+    # may not create audit rows - and every service call in slice 2 writes one,
+    # which is why this is an assertion with a remedy rather than a comment: the
+    # alternative is a foreign-key violation five lines further down that reads
+    # like a broken dump.
+    assert AuditLog.objects.count() == 0, (
+        "This round trip cannot survive an audit row: the append-only trigger "
+        "refuses both the DELETE that would wipe it and the UPDATE that "
+        "`loaddata` issues to restore it. Build this test's data through the "
+        "model managers rather than through a service, or move the test to "
+        "`pytest.mark.django_db(transaction=True)` and TRUNCATE the tables "
+        "outside the test transaction."
+    )
 
     with connections[DEFAULT_DB_ALIAS].cursor() as cursor:
         for table in TABLES_CHILD_FIRST:
@@ -283,3 +330,20 @@ def test_set_constraints_all_immediate_restores_the_guard_after_a_loaddata(db):
 
     with pytest.raises(IntegrityError):
         point_at(membership, their_role)
+
+
+def test_the_shared_load_fixture_re_arms_the_keys_by_itself(load_fixture):
+    """The same remedy, reached without knowing it exists.
+
+    `tests/conftest.py`'s `load_fixture` is the mechanism that replaces the
+    warning in this module's docstring, so it needs the test the warning never
+    had: after loading through it, the cross-organization write that the plain
+    `loaddata` above silently accepts is refused at statement time again.
+    """
+    load_fixture(ORDERED)
+    membership, their_role = a_membership_and_another_organizations_role()
+
+    with pytest.raises(IntegrityError) as exc:
+        point_at(membership, their_role)
+
+    assert "orgs_membership_role_same_org_fk" in str(exc.value)

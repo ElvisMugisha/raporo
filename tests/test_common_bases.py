@@ -816,6 +816,242 @@ def test_the_combinator_guard_sits_on_the_query_seam_not_on_a_list_of_names():
 
 
 # --------------------------------------------------------------------------
+# A2 (fix round 4) - the shapes the A1 matrix could not see.
+#
+# A1 covers two whole querysets combined. These cover the three ways a leg
+# stops being a whole queryset: it was *sliced* (Django rebuilds it through the
+# base manager), it was *never pinned* (the merged pin set is empty), or it was
+# *empty* (Django returns the other leg without merging anything at all). Each
+# was measured leaking or raising the wrong type before this round.
+# --------------------------------------------------------------------------
+
+#: The operators that merge into one WHERE clause. `union()` / `intersection()`
+#: / `difference()` are excluded here on purpose: `_combinator_query` calls
+#: `clear_limits()`, so they never see a slice in the first place.
+MERGING_OPERATORS = ["__or__", "__and__", "__xor__", "__ror__", "__rand__", "__rxor__"]
+
+#: The subset Django rewrites through `model._base_manager` when an operand is
+#: sliced. `&` merges a sliced right operand as an ordinary WHERE clause (with
+#: its limit dropped) and raises `TypeError` for a sliced left one.
+REWRITING_OPERATORS = ["__or__", "__xor__", "__ror__", "__rxor__"]
+
+
+@pytest.mark.parametrize("operator", MERGING_OPERATORS)
+def test_a_sliced_operand_cannot_smuggle_an_unpinned_query_into_a_merge(
+    operator, one_row_per_store, store, foreign_store
+):
+    """The IDOR shape again, one slice further on.
+
+    `QuerySet.__or__` cannot put a slice in a WHERE clause, so it replaces the
+    sliced operand with `model._base_manager.filter(pk__in=<the slice>)` -
+    `all_objects`, unpinned. The queryset-level guard has already run and passed
+    (both operands *were* pinned), so what it hands `Query.combine` is a pinned
+    query and an unpinned one. Deleting `refuse_scope_mismatch` from
+    `GuardedQuery.combine` made this return `['RIVAL', 'mine']`.
+    """
+    with pytest.raises(UnscopedQueryError):
+        combine(
+            operator,
+            ScopedThing.objects.for_store(store)[:2],
+            ScopedThing.objects.for_store(foreign_store),
+        )
+
+
+@pytest.mark.parametrize("operator", MERGING_OPERATORS)
+def test_a_sliced_operand_is_refused_in_the_other_position_too(
+    operator, one_row_per_store, store, foreign_store
+):
+    with pytest.raises(UnscopedQueryError):
+        combine(
+            operator,
+            ScopedThing.objects.for_store(store),
+            ScopedThing.objects.for_store(foreign_store)[:2],
+        )
+
+
+@pytest.mark.parametrize("operator", REWRITING_OPERATORS)
+@pytest.mark.parametrize("position", ["left", "right"])
+def test_the_refusal_of_a_sliced_merge_names_the_slice_not_a_missing_pin(
+    operator, position, one_row_per_store, store
+):
+    """Both sides pinned, to the same store, and it is still refused - so the
+    message has to say what actually happened.
+
+    The unpinned operand is one Django constructed, not one the author wrote, so
+    "pin every side with for_store()" sends them looking for a bug that is not
+    there. Refusing is right: the base-manager rewrite drops `deleted_at IS
+    NULL` as well, so tombstones would come back.
+    """
+    whole = ScopedThing.objects.for_store(store)
+    sliced = ScopedThing.objects.for_store(store)[:2]
+    left, right = (sliced, whole) if position == "left" else (whole, sliced)
+
+    with pytest.raises(UnscopedQueryError) as exc:
+        combine(operator, left, right)
+
+    message = str(exc.value)
+    assert "sliced" in message
+    assert "Combine first, then slice." in message
+    assert "Pin every side" not in message
+
+
+def test_the_query_seam_still_refuses_a_rewritten_slice_on_its_own(
+    one_row_per_store, store, foreign_store
+):
+    """Defence in depth, and the only way to reach it.
+
+    The test above is satisfied by the queryset-level refusal alone, so it says
+    nothing about `GuardedQuery.combine` - the guard that actually stops the
+    merge, and the one whose deletion leaked. Django's own `__or__` is therefore
+    called directly here, bypassing our override, which is exactly the state a
+    future refactor of `NoHardDeleteQuerySet` would leave behind.
+    """
+    with pytest.raises(UnscopedQueryError):
+        list(
+            models.QuerySet.__or__(
+                ScopedThing.objects.for_store(store)[:2],
+                ScopedThing.objects.for_store(foreign_store),
+            )
+        )
+
+
+@pytest.mark.parametrize("operator", COMBINATORS)
+def test_combining_two_unpinned_querysets_raises_the_documented_error(operator, db):
+    """Neither side pinned: still a scope violation, and it must arrive as one.
+
+    `CrossStoreReferenceError.__doc__` promises a single `except
+    UnscopedQueryError` covers every invariant-#1 violation, and a service will
+    write that `except`. This shape used to surface as `ValueError:
+    for_stores() needs at least one store.` - the wrong type, naming a function
+    the author never called.
+    """
+    with pytest.raises(UnscopedQueryError) as exc:
+        combine(operator, ScopedThing.objects.all(), ScopedThing.objects.all())
+
+    assert "unpinned" in str(exc.value)
+
+
+def test_an_empty_leg_does_not_let_union_skip_the_guard(one_row_per_store, store):
+    """`union()` drops an `EmptyQuerySet` `self` and, with one leg left, returns
+    that leg without building a combined query - so `_combinator_query` never
+    ran and `for_store(A).none().union(all_objects.all())` iterated every
+    organization's rows.
+    """
+    with pytest.raises(UnscopedQueryError):
+        list(ScopedThing.objects.for_store(store).none().union(ScopedThing.all_objects.all()))
+
+
+def test_an_empty_leg_does_not_let_union_skip_the_guard_in_the_other_order(
+    one_row_per_store, store
+):
+    with pytest.raises(UnscopedQueryError):
+        list(ScopedThing.all_objects.none().union(ScopedThing.objects.for_store(store)))
+
+
+def test_a_short_circuited_union_returns_the_surviving_leg_unchanged(
+    one_row_per_store, store, other_store
+):
+    """Why the shape above is a seam fix and not a leak fix.
+
+    Django does not merge anything here: it hands back the very queryset object
+    the caller passed in, so no query is built and no scope is widened. The
+    identity assertion is the point - the day Django starts merging instead,
+    this fails and the merge goes through `_combinator_query` like every other.
+    """
+    surviving = ScopedThing.objects.for_store(other_store)
+
+    result = ScopedThing.objects.for_store(store).none().union(surviving)
+
+    assert result is surviving
+    assert sorted(row.name for row in result) == ["mine2"]
+
+
+# --------------------------------------------------------------------------
+# A3 (fix round 4) - what a merged pin costs, and what it means
+# --------------------------------------------------------------------------
+
+
+def test_the_union_override_still_passes_djangos_keyword_through(
+    one_row_per_store, store
+):
+    """`union()` is overridden, so keeping its signature honest is now our job:
+    `all=True` is what asks for UNION ALL, and dropping it would silently
+    de-duplicate a report."""
+    both_legs = ScopedThing.objects.for_store(store).union(
+        ScopedThing.objects.for_store(store), all=True
+    )
+
+    assert sorted(row.name for row in both_legs) == ["mine", "mine"]
+
+
+def test_merging_a_pin_with_itself_costs_no_query(
+    one_row_per_store, store, django_assert_num_queries
+):
+    """Building a queryset must not hit the database.
+
+    Every merge re-resolves ownership against `orgs_store`, which is what makes
+    `for_store(A) | for_store(RIVAL)` a synonym for the `for_stores([A, RIVAL])`
+    that is refused - but a merge of one store set with itself adds no store, so
+    there is nothing to resolve and `qs = a | a` stays lazy.
+    """
+    with django_assert_num_queries(0):
+        ScopedThing.objects.for_store(store) | ScopedThing.objects.for_store(store)
+
+
+def test_widening_a_pin_still_resolves_ownership(
+    one_row_per_store, store, other_store, django_assert_num_queries
+):
+    """The counterpart: a merge that adds a store pays for the check that keeps
+    the two stores in one organization."""
+    with django_assert_num_queries(1):
+        merged = ScopedThing.objects.for_store(store) | ScopedThing.objects.for_store(
+            other_store
+        )
+
+    assert set(merged.query.store_scope_pks) == {store.pk, other_store.pk}
+
+
+def test_intersection_narrows_its_pin_exactly_like_and(
+    one_row_per_store, store, other_store
+):
+    """`&` and `intersection()` mean the same thing about stores.
+
+    They used to disagree: the merge took the *connector*, and the two seams
+    speak different vocabularies (`sql.AND` against `"intersection"`), so the
+    narrowing branch was dead on the combinator path and `intersection()` pinned
+    to both stores.
+    """
+    both = [store, other_store]
+
+    narrowed_by_operator = ScopedThing.objects.for_stores(both) & ScopedThing.objects.for_store(
+        other_store
+    )
+    narrowed_by_combinator = ScopedThing.objects.for_stores(both).intersection(
+        ScopedThing.objects.for_store(other_store)
+    )
+
+    assert set(narrowed_by_operator.query.store_scope_pks) == {other_store.pk}
+    assert set(narrowed_by_combinator.query.store_scope_pks) == {other_store.pk}
+
+
+def test_union_and_difference_keep_the_wider_pin(one_row_per_store, store, other_store):
+    """A pin is an upper bound on where rows can come from, so narrowing is only
+    sound when the result is provably inside both legs. A difference's rows come
+    from its left leg, which the right leg's pin says nothing about."""
+    both = [store, other_store]
+
+    united = ScopedThing.objects.for_stores(both).union(
+        ScopedThing.objects.for_store(other_store)
+    )
+    differenced = ScopedThing.objects.for_stores(both).difference(
+        ScopedThing.objects.for_store(other_store)
+    )
+
+    assert set(united.query.store_scope_pks) == {store.pk, other_store.pk}
+    assert set(differenced.query.store_scope_pks) == {store.pk, other_store.pk}
+
+
+# --------------------------------------------------------------------------
 # D2 - for_stores() may not span organizations
 # --------------------------------------------------------------------------
 

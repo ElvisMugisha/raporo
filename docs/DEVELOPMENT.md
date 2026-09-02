@@ -3,17 +3,17 @@
 Everything runs in Docker. You do not need Python, Postgres, or Node on your machine. The `web`
 container has the interpreter and dependencies; the `db` container has Postgres 17.
 
-> **State of the app (2026-09-01).** Slice 1 (foundation) is still in progress. What exists today
-> is the data layer — users, organizations, stores, roles, the audit trail — plus a healthcheck
-> endpoint. There is no login page, no UI, and no seed data yet. Screens start arriving in slice 1's
-> remaining tasks; see [ROADMAP.md](ROADMAP.md) for what lands when.
+> **State of the app (2026-09-01).** Slice 1 (foundation) is in progress. What exists today is the
+> data layer — users, organizations, stores, roles, the audit trail — plus a healthcheck endpoint.
+> There is no login page, no UI, and no seed data yet. Screens start arriving in slice 1's
+> remaining tasks; [ROADMAP.md](ROADMAP.md) says what lands when.
 
 ## Prerequisites
 
 | Tool | Version | Notes |
 | --- | --- | --- |
-| Docker Engine | 24+ | Verified on 29.6.2 |
-| Docker Compose | v2+ (the `docker compose` plugin, not `docker-compose`) | Verified on v5.3.1 |
+| Docker Engine | 24+ | Verified on 29.7.2 |
+| Docker Compose | v2+ (the `docker compose` plugin, not `docker-compose`) | Verified on v5.5.0 |
 | git | any recent | |
 
 On WSL2, run everything from inside the Linux filesystem (`~/projects/...`), not `/mnt/c`: bind
@@ -33,39 +33,87 @@ docker compose run --rm web pytest -q
 
 There is no separate `migrate` step. The image entrypoint runs `manage.py check` and then
 `manage.py migrate` before the server starts, and `up --wait` returns only once the app answers on
-`/healthz`, so that one command gets you from empty volume to serving app. Allow about 90 seconds
-the first time: Postgres has to initialise its data directory before Django can connect.
+`/healthz`, so that one command gets you from an empty volume to a serving app.
 
-**About that `down -v`.** It destroys the `pgdata` volume. You only need it if the machine already
-has a Raporo database volume created before `AUTH_USER_MODEL` was introduced. That history makes
-`accounts.0001_initial` unapplicable, and migrations fail with a swappable-model error. On a genuinely
-fresh clone there is no volume yet and you can skip the line. It is a one-time-per-machine fix, not
-part of the normal loop.
+Allow up to two minutes the first time. Postgres has to initialise its data directory before Django
+can connect, and the healthchecks budget that much on purpose (`start_period`: db 60s, web 120s).
+Measured runs land between 12 and 40 seconds on an already-built image, and `up --wait` returns on
+the first successful probe, so a fast boot costs nothing. The budget is sized for a loaded machine,
+not the typical one.
 
-**One thing `.env.example` is still missing.** `DJANGO_MEDIA_ROOT` is not in it yet. Development
-works without it (`config/settings/base.py` falls back to `/var/tmp/raporo-media`), but
-`config/settings/prod.py` reads it with no fallback, so a production deploy will refuse to boot until
-it is set. Add a line for it to `.env.example` by hand (automation is blocked from writing `.env*`
-files on purpose).
+**About that `down -v`.** It destroys the `pgdata` volume. You need it only if the machine already
+has a Raporo database volume created before `AUTH_USER_MODEL` was introduced: that history makes
+`accounts.0001_initial` unapplicable, and migrations fail with a swappable-model error. A fresh
+clone has no volume yet, so skip the line. One-time per machine, not part of the normal loop.
+
+**One gap in `.env.example`.** `DJANGO_MEDIA_ROOT` is not in it. Development works without it
+(`config/settings/base.py` falls back to `/var/tmp/raporo-media`), but `config/settings/prod.py`
+reads it with no fallback, so a production deploy refuses to boot until it is set. Add the line by
+hand; automation is blocked from writing `.env*` files on purpose.
 
 ## How the container boots
 
-`docker/entrypoint.sh` is the image `ENTRYPOINT`. It only does anything when the container command
-starts an application server (`runserver`, `gunicorn`, `uvicorn`, `daphne`):
+`docker/entrypoint.sh` is the image `ENTRYPOINT`, and its pre-boot sequence is the **default**.
+Unless the command is on an explicit list of known one-off tooling, the container runs:
 
-1. `manage.py check` always runs, so a misconfigured app refuses to serve instead of half-working.
-2. `manage.py migrate --noinput` runs **only if `RAPORO_AUTO_MIGRATE=1`**. `compose.yaml` sets that
-   for local dev. Deployments leave it unset and run `migrate` as their own reviewed step, because
-   with more than one replica every new container would race the same migration lock, and an
-   unreviewed schema change would ship with whatever code happened to carry it.
+1. `manage.py check`, so a misconfigured app refuses to serve instead of half-working.
+2. `manage.py migrate --noinput`, but **only if `RAPORO_AUTO_MIGRATE=1` and the command is a
+   recognised server** — or `RAPORO_ROLE=server` says it is one. `compose.yaml` sets
+   `RAPORO_AUTO_MIGRATE` for local dev. Deployments leave it unset and run `migrate` as their own
+   reviewed step, because with more than one replica every new container would race the same
+   migration lock, and an unreviewed schema change would ship with whatever code happened to carry
+   it.
 
-Every other command is exec'd untouched with no pre-boot sequence: `pytest`, `ruff`,
-`manage.py <anything>`, `bash`. Tests create and drop their own database, and a one-off
-`manage.py shell` must never silently mutate the schema.
+Everything the entrypoint prints about its own work goes to **stderr**, prefixed `entrypoint:`.
+Django's `check` and `migrate` output goes to stdout, ahead of whatever your command prints.
 
-The `web` service also has a healthcheck against `/healthz`, which is why `docker compose up --wait`
-means "migrated and answering requests" rather than "process started". That makes it the right
-command in CI and in any script that needs the app ready before it does something.
+The exempt list is matched *after* the entrypoint has resolved `python -m …` and `sh -c '…'`
+wrappers down to the payload that will really run. What each command shape gets:
+
+| Command shape | Pre-boot sequence |
+| --- | --- |
+| `pytest`, `py.test`, and any wrapper that resolves to one: `python -m pytest`, `bash -c 'pytest -q'` | **never**, whatever `RAPORO_ROLE` says |
+| `ruff` | skipped |
+| `bash` (or `sh`, `dash`, `ash`, `zsh`) **with no arguments** — a debug shell | skipped |
+| `python manage.py <subcommand>`, anything except the three below | skipped |
+| `python manage.py runserver` / `runserver_plus` / `testserver` | `check` + `migrate` |
+| a resolvable wrapper around other exempt tooling: `python -m ruff`, `bash -c 'ruff check .'` | skipped |
+| a wrapper it cannot resolve: `sh -c 'gunicorn …'`, `bash -c 'ruff check . && pytest -q'`, `bash -lc '…'`, `python -c '…'` | `check` only |
+| anything else: `gunicorn`, `uvicorn`, `daphne`, `granian`, `coverage`, and whatever replaces them | `check` only |
+
+`pytest` is on a never-list checked *before* `RAPORO_ROLE`, so no environment can turn a test run
+into a migration: it creates and drops its own database, and a `migrate` here would land on the
+*development* one. A command that only reached the guard because nothing recognised it gets
+`check`, which is read-only, but not `migrate`; the
+[`RAPORO_AUTO_MIGRATE` note](#environment-variables) says why that distinction exists.
+
+Matching is on the basename of the **resolved payload**, not of the first argument. The resolver
+walks `python [opts] -m MOD`, `python [opts] script.py` and `sh -c '<one simple command>'`, and it
+is deliberately conservative: `python -c`, `python -`, a bare interpreter, `bash -lc`, a shell
+given a script path or extra arguments, and any `-c` string containing a character outside
+`[[:alnum:][:blank:]_.,:/=+-]` (so anything with `;`, `&&`, `|`, a redirection, a glob, quoting or
+`$`) all resolve to *nothing*. Nothing resolved counts as unknown, and unknown is guarded. So
+`/usr/local/bin/gunicorn` in a Kubernetes `command:` is the same command as bare `gunicorn`, and
+`python -m pytest` the same as bare `pytest`, while `bash -c 'pytest -q && ruff check .'` is
+neither.
+
+The polarity is that way round deliberately. An earlier version of the script asked "does this look
+like a server?" and ran the sequence if so, which was wrong in both directions:
+`pytest -k runserver` migrated the live development database, while `sh -c "gunicorn …"` started a
+server with no check and no migrate at all. Failing closed means an unfamiliar command is noisy
+rather than unguarded, and `RAPORO_ROLE` (see [Environment variables](#environment-variables)) is
+the override for the cases inference cannot reach.
+
+An exempt command is exec'd in silence, with no entrypoint output whatsoever. Admin commands are on
+that list for the same kind of reason as tests: a one-off `manage.py shell` must never silently
+mutate the schema. The price of the default is that `python -c`, and any `bash -c` payload the
+resolver will not touch, pay for a `check`: a second or two, read-only, no schema change.
+`bash -c '<one known tool>'` pays nothing. See [Troubleshooting](#troubleshooting) for the opt-out.
+
+The `web` service has its own healthcheck against `/healthz`, which is what makes
+`docker compose up --wait` mean "migrated and answering requests" rather than "process started".
+That makes it the right command in CI and in any script that needs the app ready before it does
+something.
 
 ## The everyday loop
 
@@ -124,15 +172,25 @@ docker compose run --rm web python manage.py dbshell             # SQL prompt on
 docker compose run --rm web bash                                 # poke around the container
 ```
 
-`manage.py migrate` is still there when you want it (after pulling a branch that adds migrations,
-say). It is no longer needed as a separate first-run step.
+Reach for `manage.py migrate` after pulling a branch that adds migrations. It is not a first-run
+step.
 
 Use `docker compose run --rm` when the stack is down (it starts `db` for you and throws the
-container away afterwards) and `docker compose exec web ...` when it is already up.
+container away afterwards) and `docker compose exec web ...` when it is already up. `exec` never
+invokes the `ENTRYPOINT`, which occasionally matters; see the fail-closed entry in
+[Troubleshooting](#troubleshooting).
 
 `dbshell` works because `compose.yaml` builds the Dockerfile's `dev` target, which adds
-`postgresql-client` on top of the deployable image. The default `runtime` target does not carry it:
-a psql client in a production image is 59 MB of attack surface that nothing there needs.
+`postgresql-client` on top of the shared `base` stage. That costs about 59 MB (the Debian package
+drags in perl and krb5), which is why the other target, `runtime`, does not carry it.
+
+`runtime` is a placeholder, not a deployable image, and nothing deploys it today. It inherits
+`CMD python manage.py runserver` — Django's development server, which Django itself documents as
+unfit to serve a site — and `requirements.txt` has no WSGI/ASGI server yet. The stage exists so
+that `--target runtime` is a stable name for a pipeline, and so "what is in a shipped image" has
+one answer: `base`, no psql, no apt layer, no `tests/`, non-root, `/app` not writable by the
+runtime user. A real server, and the reviewed configuration that goes with it (workers, timeouts,
+graceful shutdown, access-log format, proxy headers), lands with the deploy task.
 
 ## Settings modules
 
@@ -148,8 +206,9 @@ a psql client in a production image is 59 MB of attack surface that nothing ther
 ## Environment variables
 
 Everything down to `DJANGO_ALLOWED_HOSTS` lives in `.env` (gitignored) and is loaded by both compose
-services; `.env.example` is the committed template. `RAPORO_AUTO_MIGRATE` is the exception — it is
-set in `compose.yaml` itself, not in `.env`. Never commit real values.
+services; `.env.example` is the committed template. The two `RAPORO_*` variables are the exceptions:
+`RAPORO_AUTO_MIGRATE` is set in `compose.yaml` itself, and `RAPORO_ROLE` is set nowhere — you pass
+it per command when you need it. Never commit real values.
 
 | Variable | Read by | Required? | What it is |
 | --- | --- | --- | --- |
@@ -161,16 +220,33 @@ set in `compose.yaml` itself, not in `.env`. Never commit real values.
 | `POSTGRES_PORT` | `base.py` (defaults to `5432`) | No | Postgres port. |
 | `DJANGO_MEDIA_ROOT` | `base.py` (defaults to `/var/tmp/raporo-media`), `prod.py` (no fallback) | Production only | Where uploads (organization logos today) are written. Deliberately outside the source tree so uploaded files can never be served as static content. Not yet in `.env.example`. |
 | `DJANGO_ALLOWED_HOSTS` | `prod.py` | Production only | Comma-separated hostnames. Ignored in dev, which allows `*`. |
-| `RAPORO_AUTO_MIGRATE` | `docker/entrypoint.sh` | No, and deliberately unset outside dev | `1` makes the entrypoint run `manage.py migrate` before starting the server. `compose.yaml` sets it for local dev, where there is one container and the alternative is a broken first run. Off by default: with several replicas a rolling deploy would have every container racing the same migration lock, and an unreviewed schema change would ship with whatever code carried it. |
+| `RAPORO_AUTO_MIGRATE` | `docker/entrypoint.sh` | No, and deliberately unset outside dev | `1` makes the entrypoint run `manage.py migrate` before starting the server — but only when the command is a recognised server, or `RAPORO_ROLE=server` says it is one. Anything else is told on stderr why it did not migrate. `compose.yaml` sets it for local dev, where there is one container and the alternative is a broken first run. Off by default everywhere else, for the reasons in [How the container boots](#how-the-container-boots). |
+| `RAPORO_ROLE` | `docker/entrypoint.sh` | No, and set nowhere by default | Overrides the entrypoint's inference about whether a command needs the pre-boot sequence. `server` forces it (deploys, and launchers this script has never heard of) — except for `pytest`/`py.test`, which are never pre-booted and say so on stderr; `tooling` skips it and prints `entrypoint: RAPORO_ROLE=tooling — skipping pre-boot sequence for: <argv[0]>` on stderr so the skip is never silent; unset means infer from the command. Any other value exits 64 rather than being ignored, so a typo fails loudly instead of quietly picking a default. Pass it per command: `docker compose run --rm -e RAPORO_ROLE=tooling web python -c '…'`. |
+
+> **`RAPORO_ROLE=server` goes in `compose.prod.yaml`, never in `compose.yaml`.** `docker compose
+> run --rm web <cmd>` inherits the whole service environment, and `compose.yaml` is the file every
+> one-off command inherits from — so `RAPORO_ROLE=server` there would force `check` + `migrate`
+> onto a `manage.py shell`, a `ruff` run, an ad-hoc script. The never-list protects `pytest` from
+> exactly this, and nothing else. In production the service really is a server and one-off jobs are
+> their own spec, so nothing inherits a role it shouldn't; the never-list is what makes an inherited
+> `server` role safe there.
+
+> **`RAPORO_AUTO_MIGRATE=1` *is* in the `web` service's `environment:`, and every `docker compose
+> run` does inherit it.** What makes that safe is the server gate, not luck: an inherited
+> `RAPORO_AUTO_MIGRATE=1` is permission to migrate *when this container is a server*, and a command
+> that only reached the guard because nothing recognised it is not one. It gets `check` and a stderr
+> line explaining the skip. That is why the two variables can live in different places.
 
 ## Project layout
 
 ```text
 manage.py              # Django entrypoint
 compose.yaml           # dev stack: web (Django) + db (Postgres 17), pgdata volume, healthchecks
-docker/Dockerfile      # python:3.13-slim, non-root `raporo` user; `dev` target adds psql,
-                       #   `runtime` target is what deploys
-docker/entrypoint.sh   # pre-boot check + opt-in migrate for server commands only
+docker/Dockerfile      # python:3.13-slim, non-root `raporo` user; `dev` target (compose builds
+                       #   this one) adds psql; `runtime` target is a placeholder, nothing
+                       #   deploys it yet
+docker/entrypoint.sh   # pre-boot check + opt-in, server-only migrate for everything except an
+                       #   exempt tooling list (pytest — never — ruff, admin commands, bare shell)
 requirements.txt       # pinned dependencies (Django 6.1, psycopg 3, argon2, pyotp, Pillow, pytest, ruff)
 pytest.ini             # pins the test settings module
 ruff.toml              # lint + import-order config (line length 100, target py313)
@@ -193,21 +269,72 @@ locale/                # translation catalogues for en / rw / fr
 docs/                  # this guide, PRODUCT.md, ROADMAP.md, adr/
 ```
 
-Two rules worth knowing before you touch `apps/`: business data is store-scoped and reached through
-`for_store()` / `for_stores()`, and nothing is ever hard-deleted. `common/managers.py` and
-`common/checks.py` enforce both, and they will raise at you rather than let a cross-tenant query run.
+Two rules before you touch `apps/`: business data is store-scoped and reached through `for_store()`
+/ `for_stores()`, and nothing is ever hard-deleted. `common/managers.py` and `common/checks.py`
+enforce both, and they raise at you rather than let a cross-tenant query run.
+
+One more, if you add a **new top-level Python package**: add it to the `COPY` list in
+`docker/Dockerfile`'s `base` stage. The stage copies path by path and `runtime` adds nothing on top,
+so a package nobody lists is absent from the shipped image, and the dev `.:/app` bind mount hides
+that locally until the first deploy fails. The `COPY` block says so itself; this is the pointer.
 
 ## Troubleshooting
 
 **Migrations fail with a swappable-model / `AUTH_USER_MODEL` error on a new machine.**
-An old `pgdata` volume predates the custom user model. `docker compose down -v`, then
-`docker compose up --wait` — the entrypoint migrates the fresh volume. One-time per machine.
+An old `pgdata` volume predates the custom user model. Run `docker compose down -v`, then
+`docker compose up --wait`; the entrypoint migrates the fresh volume. One-time per machine. Give it
+up to two minutes before you decide it has hung: the healthchecks budget that much
+(`start_period`: db 60s, web 120s), because a cold `initdb` is around 30 seconds of real work
+before Django can connect at all. Measured on this project with an already-built image:
+12s and 28s on two runs from an empty volume. The run that forced those budgets up took
+102s, on a machine that was also running three test suites at the time — the case the budget
+exists for, not the typical one.
+
+**A one-off command runs `check` before it starts.**
+Expected, not broken tooling. The entrypoint fails closed, so anything it cannot recognise as
+one-off tooling gets a `check`, including `docker compose run --rm web python -c '...'` and
+`docker compose run --rm web bash -c 'ruff check . && pytest -q'`. A shell payload the resolver
+cannot reduce to one known command could be wrapping a server, and `python -c` could be anything.
+`check` is read-only, costs a second or two, and its output lands on stdout ahead of yours. It will
+not migrate — see the next entry. Three ways past it:
+
+- opt out for the one command: `docker compose run --rm -e RAPORO_ROLE=tooling web python -c '...'`
+- give the shell **one** simple command rather than a chain: `... web bash -c 'ruff check .'` is
+  exempt, `... web bash -c 'ruff check . && pytest -q'` is not. Unwrapping it to
+  `... web ruff check .` is exempt as well
+- `docker compose exec web ...` when the stack is up: `exec` bypasses the `ENTRYPOINT` entirely and
+  is unaffected
+
+**`entrypoint: RAPORO_AUTO_MIGRATE=1 but this is not a recognised server — skipping migrate`.**
+Not a bug, and the entrypoint line you are most likely to meet. `compose.yaml` sets
+`RAPORO_AUTO_MIGRATE=1` on the `web` service and `docker compose run` inherits the service
+environment, so every one-off command arrives carrying migrate permission it has no business
+spending. The entrypoint wants a recognised *server* as well before it migrates, and tells you it
+declined instead of migrating quietly. Your command ran; the schema was untouched. If you did want
+the migration, run it as itself — `docker compose run --rm web python manage.py migrate` — or pass
+`-e RAPORO_ROLE=server`, which is what the hint at the end of the message means.
 
 **`web` exits or never turns healthy, and the log shows an entrypoint line.**
-Read the two lines the entrypoint prints. `running manage.py check` failing means a settings or
-model problem, not a database one. `RAPORO_AUTO_MIGRATE not set — skipping migrate` in local dev
-means your `compose.yaml` is not the committed one (an override may have replaced the
-`environment:` block); run `docker compose config` to see the merged result.
+The entrypoint's own output goes to stderr, prefixed `entrypoint:`; `docker compose logs web` shows
+it merged with Django's. A failing `running manage.py check` is a settings or model problem, not a
+database one. `RAPORO_AUTO_MIGRATE not set — skipping migrate` in local dev means your
+`compose.yaml` is not the committed one (an override may have replaced the `environment:` block);
+run `docker compose config` to see the merged result. Seeing *no* `entrypoint:` lines at all is not
+a symptom — an exempt command prints nothing by design.
+
+Three more lines mean "I did not recognise this, so I guarded it". None is an error on its own;
+each tells you which branch you landed in:
+
+- `unrecognised command 'X' — running pre-boot checks (fail closed)` — argv resolved cleanly to
+  `X` (the payload basename, so `granian` for `python -m granian`), and nothing on the tooling list
+  matched it. A server this script has never heard of, or `coverage`.
+- `could not resolve what 'X' will run — running pre-boot checks (fail closed)` — argv resolved to
+  nothing, so `X` is only the wrapper it started from. `python -c`, `bash -lc`, and a `-c` string
+  holding a pipe or an `&&` all land here.
+- `ignoring RAPORO_ROLE=server: a test runner is never pre-booted` — something set
+  `RAPORO_ROLE=server` in an environment a `pytest` run inherited. The test run is fine, but go and
+  find it: every *other* command in that environment is being pre-booted, `manage.py shell`
+  included.
 
 **`docker compose up` fails with "port is already allocated" (8000).**
 Something else holds the port, often a previous detached run. `docker compose down` first; if it
@@ -238,6 +365,6 @@ The previous `--rm` container can still hold a connection while the next run tri
 recreate the test database. Re-run, or use `--reuse-db` to skip the create/drop cycle.
 
 **`manage.py check` complains about a database named `test_*`.**
-That is `common.E100`, on only under `prod.py`. The append-only trigger waives its TRUNCATE guard
-for `test_*` databases so Django can tear down test databases; a production database with that name
-would silently inherit the waiver. Rename the database.
+That is `common.E100`, which is active only under `prod.py`. The append-only trigger waives its
+TRUNCATE guard for `test_*` databases so Django can tear down test databases, and a production
+database with that name would silently inherit the waiver. Rename the database.

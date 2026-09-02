@@ -4,7 +4,7 @@
 > Statuses: ✅ done · 🔄 in progress · ⏳ pending · ⛔ blocked (say by what).
 > Rules: never delete rows — flip statuses and date them. One line of note per flip. Details live in the linked docs, not here.
 
-**📍 NOW:** Slice 1, Task 0 ✅ and Tasks 1+2+3 (merged foundation data layer) in **fix round 3** (2026-09-01, night). Four gates have reported on the merged task: code-reviewer REQUEST CHANGES, security-engineer BLOCK (S1 closed, S2 not), database-engineer APPROVE WITH NITS, tech-writer docs landed. Fix round 3 is dispatched and partially landed — see `docs/superpowers/slice-1-workspace/HANDOFF.md` for the exact resume point. Tasks 4–14 not started.
+**📍 NOW:** Slice 1 — Task 0 ✅ and merged Tasks 1+2+3 (foundation data layer) ✅ **through the merge gate** (2026-09-02). Four fix rounds, eight gate reviews. Round-3 verdicts: code-reviewer, database-engineer and security-engineer all APPROVE WITH NITS, security's **BLOCK withdrawn**; round 4 closed the two findings that were more than cosmetic. tech-lead verdict: **MERGE WITH FOLLOW-UPS**. 369 tests. **Next: Tasks 4–14**, but two things gate Task 4 — a `privacy-compliance` ruling on Law 058/2021 (audit rows are append-only at the DB level, so PII reaching them is structurally un-erasable) and resolving 14 add/add conflicts with `origin/dev`.
 
 ---
 
@@ -34,7 +34,7 @@
 
 | #   | Slice               | Scope anchor                                                                                                                                                                             | Status                                                                                                                                                 |
 | --- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 1   | Foundation          | accounts (username/email/phone), max-security auth, 2FA-ready login flow, invite links, orgs, stores (1–5), custom RBAC, audit/soft-delete core, i18n + header switcher, Docker skeleton | 🔄 **in progress** — 14 tasks in `docs/superpowers/plans/2026-09-01-slice-1-foundation.md`. Task 0 ✅ (dockerized Django 6.1 scaffold). Tasks 1+2+3 merged (`common/` bases, accounts, audit, orgs + migrations) — built, 3 fix rounds, 4 gates; **fix round 3 open**. Tasks 4–14 ⏳ |
+| 1   | Foundation          | accounts (username/email/phone), max-security auth, 2FA-ready login flow, invite links, orgs, stores (1–5), custom RBAC, audit/soft-delete core, i18n + header switcher, Docker skeleton | 🔄 **in progress** — 14 tasks in `docs/superpowers/plans/2026-09-01-slice-1-foundation.md`. Task 0 ✅ scaffold. Tasks 1+2+3 ✅ merged (`common/` bases, accounts, audit, orgs + migrations) — 4 fix rounds, 8 gate reviews, tech-lead MERGE WITH FOLLOW-UPS. Tasks 4–14 ⏳ |
 | 2   | Products & stock    | per-store stock, variants/packs, restocks (cost + optional expiry), floor=cost rule, reference/latest prices, write-offs with reasons                                                    | ⏳                                                                                                                                                     |
 | 3   | Selling & owing     | sales (negotiated ≥ floor), orders + deposits + ✅ lifecycle, customers, credit book ("who owes us"), payments in/out                                                                    | ⏳                                                                                                                                                     |
 | 4   | The Report          | period engine (org TZ, biweekly 1–15/16–end), per-store + consolidated org reports, branded, WhatsApp-shareable image + PDF                                                              | ⏳                                                                                                                                                     |
@@ -43,7 +43,7 @@
 
 ### Cross-slice decisions taken mid-build (must not be lost)
 - ✅ **Branding chain (2026-09-01):** store → org → Raporo default; per-store `use_own_branding` toggle (empty = inherit); store name always local; logo/colors/typography inherit; consolidated report uses org branding. Recorded in PRODUCT.md + design spec §4-orgs.
-  - ⏳ **Slice 1 (now):** add `Store.brand` (JSONB, default `{}`) + `Store.use_own_branding` (bool, default False) — folded into the *uncommitted* `orgs/0001_initial` so no extra migration is spent.
+  - ✅ **Slice 1 (2026-09-01):** `Store.brand` (JSONB, default `{}`) + `Store.use_own_branding` (bool, default False) landed at `apps/orgs/models.py`, folded into `orgs/0001_initial` while it was still uncommitted — no extra migration spent.
   - ⏳ **Slice 4:** implement `resolve_branding(store)` and use it in every report/share-card/PDF path.
   - ⏳ **Slice 6:** settings UI for editing org and store branding, including the toggle.
 
@@ -57,7 +57,7 @@ Social login · SMS OTP · USD base option · DRF API + OpenAPI docs (when mobil
 
 ## Standing notes
 
-- **Dev environment (verified 2026-09-01):** `cp .env.example .env` → `docker compose build` → `docker compose up --wait` reaches a migrated, healthy app; `/healthz` returns 200. Full guide: [DEVELOPMENT.md](DEVELOPMENT.md). The container entrypoint runs `manage.py check` before boot and migrates only under `RAPORO_AUTO_MIGRATE=1` (dev only).
+- **Dev environment (verified 2026-09-01):** `cp .env.example .env` → `docker compose build` → `docker compose up --wait` reaches a migrated, healthy app; `/healthz` returns 200. Full guide: [DEVELOPMENT.md](DEVELOPMENT.md). The container entrypoint runs `manage.py check` before boot for every command it does not recognise as tooling, and migrates only when `RAPORO_AUTO_MIGRATE=1` **and** the command is a positively-identified server (dev only). `pytest` is never pre-booted, whatever `RAPORO_ROLE` says.
 - **`DJANGO_MEDIA_ROOT` is still absent from `.env.example`** — agents are blocked from writing `.env*` by a settings deny rule, so Elvis adds it by hand. Dev falls back to `/var/tmp/raporo-media`; prod requires it with no fallback.
 - Commits/merges are **human actions** (settings deny agent git writes) — when a step lands, Elvis commits, then flip the status here in the same change.
 - Every slice's gates (code-reviewer, security-engineer, data-reporting-engineer where relevant, tech-lead merge) must produce output — no silent skips.

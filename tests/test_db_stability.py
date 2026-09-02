@@ -23,10 +23,13 @@ import ast
 import hashlib
 import importlib
 import inspect
+import re
+import sys
 from pathlib import Path
 
 import pytest
 from django.db import migrations
+from django.db.migrations.loader import MigrationLoader
 
 from common import db
 
@@ -186,15 +189,47 @@ def _run_sql_statements(value) -> list[str]:
     return statements
 
 
-def _migration_modules() -> dict[str, object]:
-    """Every migration module in the project, keyed by repo-relative path."""
-    modules = {}
-    for path in sorted(REPO_ROOT.glob("apps/*/migrations/*.py")):
-        if path.name.startswith("__"):
+def _shipped_migrations() -> dict[str, migrations.Migration]:
+    """Every migration Django will actually run from this repo, by file path.
+
+    `MigrationLoader` is the discovery Django itself uses, so a migration this
+    repo ships from anywhere other than `apps/<app>/migrations/` is still read:
+    a `MIGRATION_MODULES` entry, an app that lives outside `apps/`, a package
+    layout slice 2 changes. The hard-coded glob this replaces read nothing for
+    those, and the premise assertions could not notice, because they can only
+    name migrations the glob already matched.
+
+    Third-party and contrib migrations are filtered out by *file location*
+    rather than by app label - their SQL is not ours to freeze, and a label
+    allowlist would silently exclude a new first-party app instead.
+    """
+    loader = MigrationLoader(None, ignore_no_migrations=True)
+    shipped: dict[str, migrations.Migration] = {}
+    for _key, migration in sorted(loader.disk_migrations.items()):
+        module = sys.modules[type(migration).__module__]
+        path = Path(inspect.getfile(module)).resolve()
+        if REPO_ROOT not in path.parents:
             continue
-        dotted = ".".join(path.relative_to(REPO_ROOT).with_suffix("").parts)
-        modules[str(path.relative_to(REPO_ROOT))] = importlib.import_module(dotted)
-    return modules
+        shipped[str(path.relative_to(REPO_ROOT))] = migration
+    return shipped
+
+
+def _run_sql_operations(operations, prefix: str = ""):
+    """Every `RunSQL` in `operations`, including the nested ones.
+
+    `SeparateDatabaseAndState` is the idiomatic way to install something the
+    state tracker must not see - a constraint, a trigger, exactly the shapes
+    this module freezes - and its children never appear in
+    `Migration.operations`. Walking only the top level left an unpinned guard
+    migration with the whole suite green (measured).
+    """
+    for index, operation in enumerate(operations):
+        where = f"{prefix}[{index}]"
+        if isinstance(operation, migrations.RunSQL):
+            yield where, operation
+        elif isinstance(operation, migrations.SeparateDatabaseAndState):
+            yield from _run_sql_operations(operation.database_operations, f"{where}.database")
+            yield from _run_sql_operations(operation.state_operations, f"{where}.state")
 
 
 def test_every_run_sql_statement_in_every_migration_is_pinned():
@@ -210,25 +245,30 @@ def test_every_run_sql_statement_in_every_migration_is_pinned():
 
     This one reads the operations Django will run, so it does not care how the
     text got there. Slice 2's ledger migrations are the next thing it will meet.
+
+    Not total, and the gap is worth knowing: a `RunPython` that calls
+    `schema_editor.execute("...")` builds its SQL at runtime, so there is no
+    text here to hash. Raw SQL belongs in `RunSQL`, where it can be frozen.
     """
     known = set(PINNED_SQL.values()) | set(PINNED_MIGRATION_SQL)
     seen: dict[str, list[str]] = {}
     unpinned = {}
 
-    for relative_path, module in _migration_modules().items():
-        for index, operation in enumerate(getattr(module.Migration, "operations", [])):
-            if not isinstance(operation, migrations.RunSQL):
-                continue
+    for relative_path, migration in _shipped_migrations().items():
+        for position, operation in _run_sql_operations(migration.operations):
             for attribute in ("sql", "reverse_sql"):
                 for statement in _run_sql_statements(getattr(operation, attribute)):
-                    where = f"{relative_path}[{index}].{attribute}"
+                    where = f"{relative_path}{position}.{attribute}"
                     seen.setdefault(relative_path, []).append(where)
                     if sha256(statement) not in known:
                         unpinned[where] = (sha256(statement), statement)
 
-    # Premise: the scan really did reach both migrations that carry raw SQL. A
-    # glob or an import that quietly matches nothing would make this vacuous.
+    # Premise: the scan really did reach every migration that carries raw SQL.
+    # Discovery that quietly matches nothing would make this vacuous - and
+    # `audit/0001` is here because two of the `PINNED_MIGRATION_SQL` entries are
+    # its, and would go unverified if the scan stopped reaching it.
     assert "apps/audit/migrations/0002_append_only_trigger.py" in seen
+    assert "apps/audit/migrations/0001_initial.py" in seen
     assert "apps/orgs/migrations/0001_initial.py" in seen
 
     assert unpinned == {}, (
@@ -286,7 +326,7 @@ def test_every_sql_helper_in_common_db_is_versioned():
             continue
         is_sql = _holds_text(value)
         is_helper = inspect.isfunction(value) and value.__module__ == db.__name__
-        if (is_sql or is_helper) and not name.lower().rstrip("0123456789").endswith("_v"):
+        if (is_sql or is_helper) and not re.search(r"_v\d+$", name.lower()):
             offenders.append(name)
 
     assert offenders == [], (
@@ -307,12 +347,13 @@ def test_no_migration_imports_an_unpinned_name_from_common_db():
     pinned_names = {key.split("(")[0] for key in PINNED_SQL}
     imported: dict[str, set[str]] = {}
 
-    for path in sorted(REPO_ROOT.glob("apps/*/migrations/*.py")):
+    for relative_path in _shipped_migrations():
+        path = REPO_ROOT / relative_path
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module == "common.db":
                 names = {alias.name for alias in node.names}
-                imported.setdefault(str(path.relative_to(REPO_ROOT)), set()).update(names)
+                imported.setdefault(relative_path, set()).update(names)
 
     # Premise: this scan actually sees the one migration we know imports the SQL.
     assert "apps/audit/migrations/0002_append_only_trigger.py" in imported

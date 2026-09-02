@@ -2,9 +2,40 @@
 
 import pytest
 from django.contrib.auth import get_user_model
+from django.core.management import call_command
+from django.db import DEFAULT_DB_ALIAS, connections
 
 from apps.orgs.models import Organization, Store
 from tests.testapp.models import Category, Product, Sale
+
+
+@pytest.fixture
+def load_fixture(db):
+    """`loaddata`, with the composite foreign keys re-armed afterwards.
+
+    Load fixtures through this, not through `call_command("loaddata", ...)`.
+
+    Postgres' `check_constraints()` - which `loaddata` runs at the end of every
+    load - finishes with `SET CONSTRAINTS ALL DEFERRED`, and that lasts until
+    the transaction ends. Every `db` test is one transaction, so from the first
+    plain `loaddata` onwards the four `*_same_org_fk` keys are checked at commit
+    time instead of statement time: a cross-organization write made after the
+    load is *accepted*, whatever `pytest.raises` you wrapped it in fails, and
+    the violation finally surfaces at teardown attributed to whichever test ran
+    last. `SET CONSTRAINTS ALL IMMEDIATE` puts them back.
+
+    Both halves are measured in `tests/test_fixture_loading.py`, including the
+    one test that deliberately does *not* use this fixture, because its subject
+    is the landmine itself.
+    """
+
+    def load(*fixtures, **kwargs):
+        kwargs.setdefault("verbosity", 0)
+        call_command("loaddata", *fixtures, **kwargs)
+        with connections[DEFAULT_DB_ALIAS].cursor() as cursor:
+            cursor.execute("SET CONSTRAINTS ALL IMMEDIATE")
+
+    return load
 
 
 @pytest.fixture

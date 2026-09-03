@@ -11,7 +11,7 @@ leaks the guard cannot see come from:
   a hand-built lookup key either;
 - a foreign key into a store-scoped model from something that is not
   store-scoped has no store to be checked against (E006);
-- a unique constraint that omits `store` turns `full_clean()` into a
+- a unique constraint that names no tenant column turns `full_clean()` into a
   cross-tenant existence oracle - "this code already exists" for a row the
   caller cannot see (E005);
 - a model that declares any manager of its own silently takes over
@@ -25,13 +25,39 @@ from django.apps import apps as global_apps
 from django.conf import settings
 from django.core.checks import Error, Tags, register
 from django.core.exceptions import FieldDoesNotExist
-from django.db.models import Q, UniqueConstraint
+from django.db.models import Q, UniqueConstraint, UUIDField
 
 from common.managers import STORE_FIELD, STORE_LABEL, StoreScopedManager
-from common.models import StoreScopedModel
+from common.models import (
+    IDENTITY_COLUMNS,
+    ORG_COLUMNS,
+    ORG_FIELD,
+    PUBLIC_ID_FIELD,
+    STORE_COLUMNS,
+    TENANT_COLUMNS,
+    StoreScopedModel,
+)
 
 DEFAULT_MANAGER_NAME = "all_objects"
-STORE_COLUMNS = {STORE_FIELD, f"{STORE_FIELD}_id"}
+
+#: Names for the primary key. A unique constraint that includes the primary key
+#: is logically implied by the primary key, so it enforces nothing - see
+#: `_check_fk_target`.
+PK_COLUMNS = frozenset({"id", "pk"})
+
+#: A unique constraint enforced across an organization's stores rather than
+#: within one store has to say so in its own name. Not inferred from its
+#: shape: `UniqueConstraint(fields=["org", "name"])` is what a developer types
+#: by habit when they meant per store, and inferring intent turns that typo
+#: into a constraint that rejects a legitimate row in the second shop, in
+#: production, months later. The suffix is one extra statement of the same
+#: intent, it lives on the database object, and it is what an operator reads
+#: out of an `IntegrityError`.
+PER_ORG_SUFFIX = "_per_org"
+
+#: The two names a composite-FK target may carry, keyed by the tenant column it
+#: pairs with the primary key.
+FK_TARGET_SUFFIXES = {"org": "_id_org_uniq", "store": "_id_store_uniq"}
 
 
 def _is_concrete_scoped_model(model) -> bool:
@@ -208,11 +234,240 @@ def _check_relations(model, label) -> list[Error]:
     return errors
 
 
+def is_public_id_surrogate(field) -> bool:
+    """True for the one non-primary-key `unique=True` E005 allows.
+
+    Deliberately narrow on all five counts, because this is the single hole in
+    a rule whose whole job is refusing global uniqueness:
+
+    * **the name** - `public_id` and nothing else. A `token` column with the
+      same type and the same `editable=False` is still the cross-tenant
+      existence oracle E005 exists for;
+    * **the type** - a `UUIDField`, so the value is 122 random bits and not a
+      guessable sequence;
+    * **`editable=False`** - it appears in no `ModelForm`, so no form can
+      report "already taken" for another tenant's value, and nothing can
+      rewrite an identifier a URL already names;
+    * **a default** - the row cannot be written without one;
+    * **`NOT NULL`** - PostgreSQL treats NULLs as distinct in a unique index,
+      so a nullable identifier column would be unique in name only, and a NULL
+      `public_id` has no URL at all.
+
+    Both `has_default()` and `has_db_default()` count: `PublicIdModel` uses a
+    Python default (see its docstring for why), and a later addition of
+    `db_default=UUID7()` alongside it must not turn this check red.
+    """
+    return (
+        field.name in IDENTITY_COLUMNS
+        and isinstance(field, UUIDField)
+        and not field.editable
+        and not field.null
+        and (field.has_default() or field.has_db_default())
+    )
+
+
+def _check_fk_target(model, label, constraint, tenant) -> list[Error]:
+    """The third valid shape: `(id, <tenant>)`, backing a composite FK.
+
+    Reached for any unique constraint that names the primary key, because such
+    a constraint is *logically implied by the primary key* - `id` is already
+    globally unique, so `(id, anything)` enforces nothing that was not already
+    enforced. Its one legitimate purpose is being the referenced side of a
+    `FOREIGN KEY (child_id, org_id) REFERENCES parent (id, org_id)`, which is
+    how this schema refuses a row that mixes two organizations.
+
+    Two consequences, and neither is discretionary:
+
+    * it is **exempt from the live-rows rule**, because PostgreSQL refuses a
+      partial unique index as a foreign-key target (measured: `ADD FOREIGN KEY`
+      answers "there is no unique constraint matching given keys for referenced
+      table"), and because it carries no existence oracle the primary key did
+      not already grant;
+    * conversely, a **conditioned** one is an error rather than a tolerated
+      oddity: it disarms the constraint's only purpose, and it fails later and
+      further away - in a migration, at `ADD FOREIGN KEY` time.
+    """
+    fields = set(constraint.fields or ())
+    suffix = FK_TARGET_SUFFIXES[ORG_FIELD if tenant <= ORG_COLUMNS else STORE_FIELD]
+
+    if len(tenant) != 1 or fields != {"id"} | tenant:
+        return [
+            Error(
+                f"{label}: unique constraint {constraint.name!r} includes the primary "
+                f"key, so it is implied by the primary key and enforces nothing. The "
+                f"only shape that has a purpose is exactly (id, org) or (id, store), "
+                f"backing a same-organization composite foreign key.",
+                hint=(
+                    "Drop the primary key from the constraint and condition the "
+                    "business key on deleted_at, or reduce it to (id, org) / "
+                    "(id, store) and name it accordingly."
+                ),
+                obj=model,
+                id="common.E005",
+            )
+        ]
+
+    errors = []
+    if not (constraint.name or "").endswith(suffix):
+        errors.append(
+            Error(
+                f"{label}: unique constraint {constraint.name!r} is shaped like a "
+                f"composite-foreign-key target but is not named like one, so it is "
+                f"exempt from the live-rows rule without saying why.",
+                hint=f"Name it <table>{suffix}.",
+                obj=model,
+                id="common.E005",
+            )
+        )
+    if constraint.condition is not None:
+        errors.append(
+            Error(
+                f"{label}: unique constraint {constraint.name!r} is a "
+                f"composite-foreign-key target and must be unconditional. A condition "
+                f"makes it a partial unique index, and PostgreSQL refuses a partial "
+                f"unique index as a foreign-key target.",
+                hint="Remove the condition; this constraint reserves nothing.",
+                obj=model,
+                id="common.E005",
+            )
+        )
+    return errors
+
+
+def _check_unique_constraint(model, label, constraint) -> list[Error]:
+    """One `UniqueConstraint`, classified into exactly one kind.
+
+    Classification is by the column *names the constraint references* and never
+    by the model's field set. That is what makes the rule correct both before
+    and after the `org` column arrives on `StoreScopedModel`: today no
+    store-scoped model has one, so shape 2 and the `(id, org)` target are
+    simply unreachable (Django's own `models.E012` reports a constraint naming
+    a field that does not exist), and the day the column lands they become
+    reachable with no change here.
+    """
+    fields = set(constraint.fields or ())
+    referenced = set(fields)
+    for expression in getattr(constraint, "expressions", ()) or ():
+        referenced |= _expression_names(expression)
+
+    if referenced & PK_COLUMNS:
+        # `fields`, not `referenced`: an expression-based constraint cannot back
+        # a foreign key at all, so `UniqueConstraint(Lower("id"), F("org"))`
+        # falls into the "enforces nothing" branch and is rejected there.
+        return _check_fk_target(model, label, constraint, fields & TENANT_COLUMNS)
+
+    errors = []
+    in_store = bool(referenced & STORE_COLUMNS)
+    in_org = bool(referenced & ORG_COLUMNS)
+    declared_org_wide = (constraint.name or "").endswith(PER_ORG_SUFFIX)
+
+    if not (in_store or in_org):
+        if referenced & IDENTITY_COLUMNS:
+            errors.append(
+                Error(
+                    f"{label}: unique constraint {constraint.name!r} names the public "
+                    f"identifier. Its uniqueness is declared once, on the field, and "
+                    f"a second declaration in Meta is one a subclass with its own Meta "
+                    f"can silently drop.",
+                    hint="Remove it: PublicIdModel already carries unique=True.",
+                    obj=model,
+                    id="common.E005",
+                )
+            )
+        else:
+            errors.append(
+                Error(
+                    f"{label}: unique constraint {constraint.name!r} names neither "
+                    f"`store` nor `org`, so it is enforced across every tenant and "
+                    f"full_clean() reports another tenant's value as taken.",
+                    hint=(
+                        'Add "store" to the constraint\'s fields, or "org" plus a '
+                        f'name ending in "{PER_ORG_SUFFIX}" if the key really is '
+                        "unique across the organization's stores."
+                    ),
+                    obj=model,
+                    id="common.E005",
+                )
+            )
+    elif in_store and declared_org_wide:
+        errors.append(
+            Error(
+                f"{label}: unique constraint {constraint.name!r} is named "
+                f'"{PER_ORG_SUFFIX}" but includes `store`, so the database enforces it '
+                f"per store while the name claims organization-wide. The name is what "
+                f"an operator reads out of an IntegrityError.",
+                hint=(
+                    f"Drop `store` from the fields, or drop the {PER_ORG_SUFFIX!r} "
+                    f"suffix from the name."
+                ),
+                obj=model,
+                id="common.E005",
+            )
+        )
+    elif in_org and not in_store and not declared_org_wide:
+        # `not in_store` is what keeps the recommended per-store shape legal:
+        # once `org` is on the base, `(org, store, name)` is the index the
+        # planner wants under RLS, and it is a *per store* key that happens to
+        # lead with the organization. Only `org` without `store` is org-wide.
+        errors.append(
+            Error(
+                f"{label}: unique constraint {constraint.name!r} is enforced across "
+                f"the whole organization, which has to be declared rather than "
+                f"inferred - it is also what a per-store key looks like when `org` "
+                f"was typed by habit.",
+                hint=(
+                    f"If it really is unique across the organization's stores, name "
+                    f"it <table>_unique_live_<rule>{PER_ORG_SUFFIX}. Otherwise use "
+                    f'"store" instead of "org".'
+                ),
+                obj=model,
+                id="common.E005",
+            )
+        )
+
+    if not _requires_live_rows(constraint.condition):
+        errors.append(
+            Error(
+                f"{label}: unique constraint {constraint.name!r} is not limited to "
+                f"live rows, so a soft-deleted row reserves its value for good.",
+                hint="Add condition=Q(deleted_at__isnull=True).",
+                obj=model,
+                id="common.E005",
+            )
+        )
+    return errors
+
+
 def _check_uniqueness(model, label) -> list[Error]:
-    """E005: uniqueness on a store-scoped table is per store, among live rows."""
+    """E005: uniqueness on a store-scoped table comes in exactly three shapes.
+
+    **(1) Per store** - the default: the constraint names `store`, and its
+    condition insists at AND level on `deleted_at IS NULL`. **(2) Per
+    organization, across its stores** - an invoice number unique across an
+    organization's five shops: it names `org`, excludes `store`, still insists
+    on live rows, and its name ends in `_per_org`. **(3) A composite-FK
+    target** - exactly `(id, org)` or `(id, store)`, named for it, and exempt
+    from the live-rows rule (`_check_fk_target`).
+
+    Everything else is a startup error: `unique=True` on a non-primary-key
+    field, except the `public_id` surrogate (`is_public_id_surrogate`);
+    `unique_together`, which cannot be conditioned on `deleted_at` at all; a
+    constraint naming neither tenant column; a correct organization-wide shape
+    that does not declare itself; a `_per_org` name that includes `store`; and
+    any of the three shapes missing what it needs.
+
+    E005 deliberately does **not** adjudicate whether a given business key
+    *should* be per store or per organization. `UniqueConstraint(fields=["org",
+    "name"], condition=LIVE, name="..._per_org")` on a table whose natural key
+    is per store is a business bug, not a tenancy leak, and a check that
+    guesses intent would be wrong in both directions. E005 refuses leaks; the
+    per-model choice belongs to product-owner and database-engineer.
+    """
     errors = []
     for field in model._meta.local_fields:
         if field.primary_key or not field.unique:
+            continue
+        if is_public_id_surrogate(field):
             continue
         errors.append(
             Error(
@@ -221,7 +476,9 @@ def _check_uniqueness(model, label) -> list[Error]:
                 f"when a row is soft-deleted.",
                 hint=(
                     "Replace it with UniqueConstraint(fields=[\"store\", "
-                    f'"{field.name}"], condition=Q(deleted_at__isnull=True), ...).'
+                    f'"{field.name}"], condition=Q(deleted_at__isnull=True), ...). '
+                    f"The only exemption is the {PUBLIC_ID_FIELD} surrogate on "
+                    f"PublicIdModel."
                 ),
                 obj=model,
                 id="common.E005",
@@ -240,29 +497,7 @@ def _check_uniqueness(model, label) -> list[Error]:
     for constraint in model._meta.constraints:
         if not isinstance(constraint, UniqueConstraint):
             continue
-        referenced = set(constraint.fields or ())
-        for expression in getattr(constraint, "expressions", ()) or ():
-            referenced |= _expression_names(expression)
-        if not referenced & STORE_COLUMNS:
-            errors.append(
-                Error(
-                    f"{label}: unique constraint {constraint.name!r} does not include "
-                    f"`store`, so it is enforced across every tenant.",
-                    hint="Add \"store\" to the constraint's fields.",
-                    obj=model,
-                    id="common.E005",
-                )
-            )
-        if not _requires_live_rows(constraint.condition):
-            errors.append(
-                Error(
-                    f"{label}: unique constraint {constraint.name!r} is not limited to "
-                    f"live rows, so a soft-deleted row reserves its value for good.",
-                    hint="Add condition=Q(deleted_at__isnull=True).",
-                    obj=model,
-                    id="common.E005",
-                )
-            )
+        errors += _check_unique_constraint(model, label, constraint)
     return errors
 
 

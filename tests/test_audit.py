@@ -19,7 +19,7 @@ pytestmark = pytest.mark.django_db
 
 def test_record_writes_a_row(actor):
     row = audit_services.record(
-        "user.created", actor=actor, target=actor, changes={"username": "eva"}
+        "user.created", actor=actor, target=actor, changes={"fields_set": ["username", "email"]}
     )
 
     assert row.pk is not None
@@ -27,7 +27,7 @@ def test_record_writes_a_row(actor):
     assert row.actor == actor
     assert row.target_type == "accounts.User"
     assert row.target_id == actor.pk
-    assert row.changes == {"username": "eva"}
+    assert row.changes == {"fields_set": ["username", "email"]}
     assert row.at is not None
 
 
@@ -348,3 +348,236 @@ def test_an_oversized_payload_is_replaced_by_a_marker(actor):
     assert row.changes["_truncated"] == "...[truncated]"
     assert row.changes["_original_bytes"] > 16 * 1024
     assert len(str(row.changes).encode()) < 16 * 1024
+
+
+# --------------------------------------------------------------------------
+# P-1 - `changes` carries no personal *values*
+#
+# The privacy ruling (docs/superpowers/specs/2026-09-02-privacy-law-058-2021-
+# ruling.md) turns on one guarantee: an audit row must stop identifying anyone
+# the moment the row it points at is anonymized. A row is append-only at the
+# database level, so anything personal that lands in `changes` is un-erasable
+# without a migration. These tests are that guarantee.
+# --------------------------------------------------------------------------
+
+
+def test_the_measured_leak_is_closed(actor):
+    """The exact payload the ruling reproduced by execution. It leaked three values."""
+    row = audit_services.record(
+        "user.created",
+        actor=actor,
+        target=actor,
+        changes={
+            "email": "eva@example.rw",
+            "phone": "250788000001",
+            "password": "S3cret!",
+            "username": "eva",
+        },
+    )
+    row.refresh_from_db()
+
+    assert row.changes == {
+        "email": "[redacted]",
+        "phone": "[redacted]",
+        "password": "[redacted]",
+        "username": "[redacted]",
+    }
+
+
+IDENTIFIER_KEYS = {
+    "email": "eva@example.rw",
+    "user_email": "eva@example.rw",
+    "email_address": "eva@example.rw",
+    "phone": "250788000001",
+    "phone_number": "250788000001",
+    "whatsapp_phone": "250788000001",
+    "username": "eva",
+    "first_name": "Eva",
+    "last_name": "Mukamana",
+    "full_name": "Eva Mukamana",
+    "surname": "Mukamana",
+    "nickname": "Eva",
+    "contact": "250788000001",
+    "contact_email": "eva@example.rw",
+    "address": "KG 7 Ave, Kigali",
+    "billing_address": "KG 7 Ave, Kigali",
+    "customer": "Eva Mukamana",
+    "customer_name": "Eva Mukamana",
+    "investor": "Eva Mukamana",
+    "investor_name": "Eva Mukamana",
+    "logo": "orgs/41/logo.png",
+    "logo_url": "https://example.rw/media/orgs/41/logo.png",
+    "ip": "41.186.0.1",
+    "client_ip": "41.186.0.1",
+    "remote_ip": "41.186.0.1",
+}
+
+
+def test_every_identifier_key_is_redacted(actor):
+    """One row, every identifier key. No value may survive anywhere in the payload."""
+    row = audit_services.record("user.updated", actor=actor, changes=dict(IDENTIFIER_KEYS))
+    row.refresh_from_db()
+
+    assert row.changes == dict.fromkeys(IDENTIFIER_KEYS, "[redacted]")
+    stored = str(row.changes)
+    for value in set(IDENTIFIER_KEYS.values()):
+        assert value not in stored
+
+
+def test_every_credential_key_is_still_redacted(actor):
+    """Built from the constant, so dropping a term from it fails here."""
+    changes = {}
+    for part in audit_services.CREDENTIAL_KEY_PARTS:
+        changes[part] = "leak-me"
+        changes[f"new_{part}_hash"] = "leak-me"
+
+    row = audit_services.record("user.password_changed", actor=actor, changes=changes)
+    row.refresh_from_db()
+
+    assert set(row.changes) == set(changes)
+    assert set(row.changes.values()) == {"[redacted]"}
+    assert audit_services.CREDENTIAL_KEY_PARTS, "the credential denylist may not be emptied"
+
+
+def test_non_personal_values_survive_verbatim(actor):
+    """The trail's whole point. A diff of business facts must stay readable."""
+    changes = {
+        "price_before": "1500.00",
+        "price_after": "1800.00",
+        "currency": "RWF",
+        "permissions_added": ["sale.create", "report.view"],
+        "permissions_removed": [],
+        "store_limit": 5,
+        "stores_used": 5,
+        "reason": "store_limit_reached",
+        "period": "2026-09-01/2026-09-15",
+    }
+
+    row = audit_services.record("plan.limit_hit", actor=actor, changes=changes)
+    row.refresh_from_db()
+
+    assert row.changes == changes
+
+
+#: Keys carrying a `name` segment, and whether the value may be stored.
+#: Substring-matching `name` would redact the whole left column and gut the
+#: trail; matching only person-qualified names keeps it useful. Pinned both
+#: ways on purpose - widening or narrowing this is a policy change, not a tweak.
+NAME_KEYS_KEPT = ("store_name", "role_name", "org_name", "permission_name", "filename")
+NAME_KEYS_REDACTED = ("name", "owner_name", "member_name", "employee_name", "user_name")
+
+
+def test_a_thing_name_survives_and_a_person_name_does_not(actor):
+    changes = {key: f"value-of-{key}" for key in NAME_KEYS_KEPT + NAME_KEYS_REDACTED}
+
+    row = audit_services.record("store.renamed", actor=actor, changes=changes)
+    row.refresh_from_db()
+
+    for key in NAME_KEYS_KEPT:
+        assert row.changes[key] == f"value-of-{key}", f"{key} should stay readable"
+    for key in NAME_KEYS_REDACTED:
+        assert row.changes[key] == "[redacted]", f"{key} names a person"
+
+
+def test_a_reference_to_a_personal_record_survives(actor):
+    """The policy is: field names and IDs for anything personal. IDs are pointers."""
+    changes = {
+        "customer_id": 41,
+        "customer_ids": [41, 42],
+        "investor_id": 7,
+        "contact_id": 9,
+        "fields_cleared": ["username", "email", "phone"],
+    }
+
+    row = audit_services.record("user.erased", actor=actor, changes=changes)
+    row.refresh_from_db()
+
+    assert row.changes == changes
+
+
+def test_a_credential_handle_is_not_exempted_by_its_id_suffix(actor):
+    """The ID carve-out is for identifiers only. A handle to a secret is a secret."""
+    row = audit_services.record(
+        "session.revoked",
+        actor=actor,
+        changes={"session_id": "abc123", "token_id": "def456", "api_key_id": "ghi789"},
+    )
+    row.refresh_from_db()
+
+    assert row.changes == {
+        "session_id": "[redacted]",
+        "token_id": "[redacted]",
+        "api_key_id": "[redacted]",
+    }
+
+
+def test_redaction_reaches_into_nested_structures(actor):
+    row = audit_services.record(
+        "membership.created",
+        actor=actor,
+        changes={
+            "member": {"email": "eva@example.rw", "role_name": "Cashier", "user_id": 41},
+            "invites": [{"contact": "250788000001", "channel": "whatsapp"}],
+        },
+    )
+    row.refresh_from_db()
+
+    assert row.changes == {
+        "member": {"email": "[redacted]", "role_name": "Cashier", "user_id": 41},
+        "invites": [{"contact": "[redacted]", "channel": "whatsapp"}],
+    }
+
+
+#: Keys that must survive because a term on a denylist hides inside them.
+#: The `ip` trap is why `ip` is segment-matched and not substring-matched:
+#: substring `ip` is inside `description`, `membership`, `receipt` and
+#: `relationship`, and redacting those would gut the trail wholesale.
+SUBSTRING_TRAPS = (
+    "description",
+    "membership",
+    "relationship",
+    "receipt",
+    "participants",
+    "equipment",
+    "zip_code",
+    "discount",
+    "bank_account",
+    "note",
+    "reason",
+)
+
+
+def test_a_denylist_term_hiding_inside_an_innocent_key_does_not_redact_it(actor):
+    changes = {key: f"value-of-{key}" for key in SUBSTRING_TRAPS}
+
+    row = audit_services.record("store.updated", actor=actor, changes=changes)
+    row.refresh_from_db()
+
+    assert row.changes == changes
+
+
+def test_an_aggregate_over_personal_records_survives(actor):
+    """A count identifies nobody, and an export row is worthless without it."""
+    row = audit_services.record(
+        "org.exported",
+        actor=actor,
+        changes={"customer_count": 812, "member_counts": {"active": 4}, "customer": "Eva"},
+    )
+    row.refresh_from_db()
+
+    assert row.changes == {
+        "customer_count": 812,
+        "member_counts": {"active": 4},
+        "customer": "[redacted]",
+    }
+
+
+def test_an_ip_is_redacted_however_it_is_spelled(actor):
+    row = audit_services.record(
+        "user.logged_in",
+        actor=actor,
+        changes={"ip": "41.186.0.1", "client_ip": "41.186.0.1", "ipv6": "2c0f:f000::1"},
+    )
+    row.refresh_from_db()
+
+    assert set(row.changes.values()) == {"[redacted]"}

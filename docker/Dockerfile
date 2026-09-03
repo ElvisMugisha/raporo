@@ -36,6 +36,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 # container), README/LICENSE/git metadata. CLAUDE.md, .mcp.json, docs/ and
 # every `.env*` are excluded from the build context by .dockerignore.
 COPY manage.py ./
+# The only thing from scripts/ that belongs in an image. It is phase 2 of the
+# database role split, applied by `manage.py grant_runtime_privileges` after
+# every `migrate` - so it has to exist wherever `migrate` runs, which is this
+# image (a deploy's migration job is the same image with RAPORO_ROLE=tooling).
+# The rest of scripts/ bootstraps a developer's host or needs a superuser
+# credential, and neither belongs here.
+COPY scripts/db/runtime-privileges.sql ./scripts/db/runtime-privileges.sql
 COPY apps/ ./apps/
 COPY common/ ./common/
 COPY config/ ./config/

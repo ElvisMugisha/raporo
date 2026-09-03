@@ -4,6 +4,8 @@ Each rogue model below is a shape a slice-2 author could plausibly write. The
 checks have to reject them at startup, because none of them fails a query.
 """
 
+import uuid
+
 import pytest
 from django.apps import apps as global_apps
 from django.conf import settings as django_settings
@@ -12,12 +14,19 @@ from django.core.management import call_command
 from django.core.management.base import SystemCheckError
 from django.db import connection, models
 from django.db.models import Q
+from django.db.models.functions import Lower
 from django.test.utils import isolate_apps
 
 from common import checks
 from common.checks import audit_store_scoped_models, check_store_scoped_models
 from common.managers import StoreScopedManager
-from common.models import AuditedModel, SoftDeleteModel, StoreScopedModel
+from common.models import (
+    ORG_FIELD,
+    PUBLIC_ID_FIELD,
+    AuditedModel,
+    SoftDeleteModel,
+    StoreScopedModel,
+)
 from tests.testapp.models import (
     Category,
     Product,
@@ -225,8 +234,49 @@ def test_a_reverse_accessor_into_a_store_scoped_model_is_rejected():
 
 
 # --------------------------------------------------------------------------
-# E005 - uniqueness on a store-scoped table is per store, among live rows
+# E005 - uniqueness on a store-scoped table is *kinded*: per store, per
+# organization across its stores, or a composite-FK target. Every other shape
+# is a startup error. These tests walk the decision table in
+# `docs/superpowers/specs/2026-09-02-schema-hardening-plan.md` §B.2 row by row:
+# each row gets a test that fires and, where the row is an "OK", a test that
+# proves a legitimate shape does not fire.
+#
+# About `org`: step 2 of the tenancy-hardening sequence moves the column onto
+# `StoreScopedModel`. Declaring it unconditionally on the throwaway models
+# below would turn that step into a fileful of import-time `FieldError`s (a
+# local field cannot clash with an inherited abstract one), so
+# `scoped_with_org()` declares it only while the base does not. E005 itself
+# never asks the model whether `org` exists - it classifies a constraint by the
+# column names the constraint references - which is what makes the rule correct
+# in both worlds.
 # --------------------------------------------------------------------------
+
+BASE_CARRIES_ORG = any(field.name == ORG_FIELD for field in StoreScopedModel._meta.fields)
+
+
+def scoped_with_org(name: str, *, constraints):
+    """A throwaway concrete store-scoped model that has an `org` column.
+
+    Carries its own premise assertions: exactly one `org` column whichever
+    world we are in, and the constraints under test really reached `Meta`. A
+    constraint test that silently declared nothing would otherwise pass.
+    """
+    attributes = {
+        "__module__": __name__,
+        "code": models.CharField(max_length=20),
+        "number": models.CharField(max_length=20),
+        "Meta": type("Meta", (), {"app_label": "testapp", "constraints": constraints}),
+    }
+    if not BASE_CARRIES_ORG:
+        attributes[ORG_FIELD] = models.ForeignKey(
+            "orgs.Organization", on_delete=models.PROTECT, related_name="+"
+        )
+    model = type(name, (StoreScopedModel,), attributes)
+
+    columns = [field.name for field in model._meta.concrete_fields]
+    assert columns.count(ORG_FIELD) == 1, columns
+    assert [c.name for c in model._meta.constraints] == [c.name for c in constraints]
+    return model
 
 
 @isolate_apps("tests.testapp")
@@ -301,6 +351,369 @@ def test_a_per_store_live_unique_constraint_passes():
             ]
 
     assert audit_store_scoped_models([Proper]) == []
+
+
+# --- the `public_id` surrogate: the one non-pk `unique=True` E005 allows ----
+
+
+@isolate_apps("tests.testapp")
+def test_the_inherited_public_id_surrogate_is_not_an_e005():
+    """Premise first: the field really is `unique=True`, so this is not a test
+    that passes because there was nothing to exempt."""
+
+    class Plain(StoreScopedModel):
+        class Meta:
+            app_label = "testapp"
+
+    assert Plain._meta.get_field(PUBLIC_ID_FIELD).unique is True
+
+    assert audit_store_scoped_models([Plain]) == []
+
+
+@isolate_apps("tests.testapp")
+def test_a_second_unique_uuid_field_is_still_rejected():
+    """The exemption is for `public_id`, not for UUID columns in general.
+
+    Same type, same `editable=False`, same default shape - only the name
+    differs. A globally unique `token` is precisely the cross-tenant existence
+    oracle E005 exists for, and a type-only exemption would wave it through.
+    """
+
+    class Tokened(StoreScopedModel):
+        token = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
+
+        class Meta:
+            app_label = "testapp"
+
+    assert "common.E005" in ids(audit_store_scoped_models([Tokened]))
+
+
+def public_id_shaped(field):
+    """A detached field, named as if `PublicIdModel` had declared it."""
+    field.set_attributes_from_name(PUBLIC_ID_FIELD)
+    return field
+
+
+SURROGATE_LOOKALIKES = {
+    "editable": models.UUIDField(default=uuid.uuid7, unique=True),
+    "no default": models.UUIDField(editable=False, unique=True),
+    "nullable": models.UUIDField(default=uuid.uuid7, editable=False, unique=True, null=True),
+    "not a UUID column": models.CharField(
+        max_length=36, default="", editable=False, unique=True
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "field", SURROGATE_LOOKALIKES.values(), ids=SURROGATE_LOOKALIKES
+)
+def test_only_the_real_surrogate_shape_is_exempt(field):
+    """Each way the exemption could be widened, refused.
+
+    Driven through the predicate rather than through the registry, and that is
+    forced rather than chosen: a store-scoped model *cannot* redeclare
+    `public_id`, because Django raises `FieldError` when a local field clashes
+    with an inherited abstract one. There is no rogue model to write. The
+    positive case below closes the loop by asserting the predicate accepts the
+    field the shipped base actually declares, so weakening `PublicIdModel`
+    breaks this pair too.
+    """
+    assert checks.is_public_id_surrogate(public_id_shaped(field)) is False
+
+
+def test_the_shipped_surrogate_is_what_the_predicate_accepts():
+    assert checks.is_public_id_surrogate(ScopedThing._meta.get_field(PUBLIC_ID_FIELD))
+
+
+@isolate_apps("tests.testapp")
+def test_a_named_unique_constraint_on_the_public_id_is_rejected():
+    """The identifier's uniqueness is declared on the field, in one place.
+
+    A `Meta.constraints` entry for it is a second declaration of the same fact
+    that a subclass declaring its own `Meta` can silently drop - the
+    `ScopedThingOwnMeta` accident - and it references no tenant column, so the
+    generic rule would have to make an exception for it anyway.
+    """
+
+    class Reconstrained(StoreScopedModel):
+        class Meta:
+            app_label = "testapp"
+            constraints = [
+                models.UniqueConstraint(
+                    fields=[PUBLIC_ID_FIELD], name="testapp_reconstrained_public_id_uniq"
+                )
+            ]
+
+    errors = audit_store_scoped_models([Reconstrained])
+
+    assert "common.E005" in ids(errors)
+    assert any("PublicIdModel" in (error.hint or "") for error in errors)
+
+
+# --- shape 2: unique per organization, across its stores -------------------
+
+
+@isolate_apps("tests.testapp")
+def test_a_per_org_across_stores_constraint_passes_when_it_says_so():
+    """An invoice number unique across an organization's five shops - the
+    legitimate shape the old E005 rejected outright."""
+    model = scoped_with_org(
+        "InvoiceNumbered",
+        constraints=[
+            models.UniqueConstraint(
+                fields=[ORG_FIELD, "number"],
+                condition=LIVE,
+                name="testapp_invoicenumbered_unique_live_number_per_org",
+            )
+        ],
+    )
+
+    assert audit_store_scoped_models([model]) == []
+
+
+@isolate_apps("tests.testapp")
+def test_an_expression_based_per_org_constraint_resolves_and_passes():
+    """`_expression_names` already walks `F()`/`Lower()` trees; the kinded rule
+    must keep using it, or a functional org-wide key reads as tenant-less."""
+    model = scoped_with_org(
+        "CaseFolded",
+        constraints=[
+            models.UniqueConstraint(
+                Lower("number"),
+                ORG_FIELD,
+                condition=LIVE,
+                name="testapp_casefolded_unique_live_number_per_org",
+            )
+        ],
+    )
+
+    assert audit_store_scoped_models([model]) == []
+
+
+@isolate_apps("tests.testapp")
+def test_a_per_org_constraint_that_also_includes_store_is_rejected():
+    """The name lies about what the database enforces.
+
+    `_per_org` on a `(org, store, number)` index says "one per organization"
+    while the index permits one per *store* - and the name is what an operator
+    reads out of an `IntegrityError` and out of `psql`.
+    """
+    model = scoped_with_org(
+        "NameLies",
+        constraints=[
+            models.UniqueConstraint(
+                fields=[ORG_FIELD, "store", "number"],
+                condition=LIVE,
+                name="testapp_namelies_unique_live_number_per_org",
+            )
+        ],
+    )
+
+    errors = audit_store_scoped_models([model])
+
+    assert "common.E005" in ids(errors)
+    assert any("_per_org" in error.msg for error in errors)
+
+
+@isolate_apps("tests.testapp")
+def test_a_per_store_key_that_leads_with_org_passes():
+    """The shape slice 2 will type on every table, and it must stay legal.
+
+    Once `org` is on the base, `(org, store, name)` is the index the planner
+    wants under RLS - measured 1.045 ms -> 0.146 ms when the tenant predicate
+    becomes an Index Cond instead of a per-row Filter. It is a *per store* key
+    that happens to lead with the organization, so it needs no `_per_org`
+    declaration: only `org` *without* `store` is organization-wide.
+    """
+    model = scoped_with_org(
+        "OrgLeadingPerStore",
+        constraints=[
+            models.UniqueConstraint(
+                fields=[ORG_FIELD, "store", "code"],
+                condition=LIVE,
+                name="testapp_orgleadingperstore_unique_live_code",
+            )
+        ],
+    )
+
+    assert audit_store_scoped_models([model]) == []
+
+
+@isolate_apps("tests.testapp")
+def test_a_per_store_constraint_that_calls_itself_per_org_is_rejected():
+    """The mirror check in its purest form: no `org` column in sight, and the
+    name still claims organization-wide scope."""
+
+    class MislabelledPerStore(StoreScopedModel):
+        code = models.CharField(max_length=20)
+
+        class Meta:
+            app_label = "testapp"
+            constraints = [
+                models.UniqueConstraint(
+                    fields=["store", "code"],
+                    condition=LIVE,
+                    name="testapp_mislabelled_unique_live_code_per_org",
+                )
+            ]
+
+    assert "common.E005" in ids(audit_store_scoped_models([MislabelledPerStore]))
+
+
+@isolate_apps("tests.testapp")
+def test_an_org_wide_constraint_must_declare_itself_in_its_name():
+    """`UniqueConstraint(fields=["org", "name"])` is what a developer types by
+    habit when they meant per store. Inferring intent from the shape turns that
+    typo into a constraint that rejects a legitimate row in the second shop,
+    in production, months later. The suffix is the declaration."""
+    model = scoped_with_org(
+        "UndeclaredOrgWide",
+        constraints=[
+            models.UniqueConstraint(
+                fields=[ORG_FIELD, "number"],
+                condition=LIVE,
+                name="testapp_undeclaredorgwide_unique_live_number",
+            )
+        ],
+    )
+
+    assert "common.E005" in ids(audit_store_scoped_models([model]))
+
+
+@isolate_apps("tests.testapp")
+def test_an_org_wide_constraint_still_has_to_be_limited_to_live_rows():
+    """The relaxation is the tenant column, not soft delete: a tombstone must
+    not reserve an invoice number for good."""
+    model = scoped_with_org(
+        "OrgWideForever",
+        constraints=[
+            models.UniqueConstraint(
+                fields=[ORG_FIELD, "number"],
+                name="testapp_orgwideforever_unique_number_per_org",
+            )
+        ],
+    )
+
+    assert "common.E005" in ids(audit_store_scoped_models([model]))
+
+
+# --- shape 3: the composite-FK target -------------------------------------
+
+
+@isolate_apps("tests.testapp")
+def test_a_composite_fk_target_on_org_is_exempt_from_the_live_rows_rule():
+    """Two measured reasons, both in the plan: PostgreSQL refuses a partial
+    unique index as a foreign-key target, and `(id, org)` grants no existence
+    oracle the primary key did not already grant."""
+    model = scoped_with_org(
+        "FkTargetOrg",
+        constraints=[
+            models.UniqueConstraint(
+                fields=["id", ORG_FIELD], name="testapp_fktargetorg_id_org_uniq"
+            )
+        ],
+    )
+
+    assert audit_store_scoped_models([model]) == []
+
+
+@isolate_apps("tests.testapp")
+def test_a_composite_fk_target_on_store_is_exempt_too():
+    class FkTargetStore(StoreScopedModel):
+        class Meta:
+            app_label = "testapp"
+            constraints = [
+                models.UniqueConstraint(
+                    fields=["id", "store"], name="testapp_fktargetstore_id_store_uniq"
+                )
+            ]
+
+    assert audit_store_scoped_models([FkTargetStore]) == []
+
+
+@isolate_apps("tests.testapp")
+def test_a_composite_fk_target_with_an_undeclared_name_is_rejected():
+    """The exemption from the live-rows rule is granted to a *declared* FK
+    target, so the declaration has to be on the database object."""
+    model = scoped_with_org(
+        "UnnamedFkTarget",
+        constraints=[
+            models.UniqueConstraint(
+                fields=["id", ORG_FIELD], name="testapp_unnamedfktarget_unique_id_org"
+            )
+        ],
+    )
+
+    assert "common.E005" in ids(audit_store_scoped_models([model]))
+
+
+@isolate_apps("tests.testapp")
+def test_an_id_leading_constraint_over_a_non_tenant_column_is_rejected():
+    """`(id, code)` is a redundant index, not a constraint: every constraint
+    containing the primary key is already implied by the primary key. The name
+    here is deliberately the blessed suffix, so what is refused is the shape."""
+
+    class IdAndCode(StoreScopedModel):
+        code = models.CharField(max_length=20)
+
+        class Meta:
+            app_label = "testapp"
+            constraints = [
+                models.UniqueConstraint(
+                    fields=["id", "code"], name="testapp_idandcode_id_store_uniq"
+                )
+            ]
+
+    errors = audit_store_scoped_models([IdAndCode])
+
+    assert "common.E005" in ids(errors)
+    # The message matters here: with the blessed suffix on the name, a rule
+    # that had lost the shape test would still report *a* naming error and this
+    # test would pass for the wrong reason. Measured - that is what the
+    # mutation run did before this assertion was added.
+    assert any("implied by the primary key" in error.msg for error in errors)
+
+
+@isolate_apps("tests.testapp")
+def test_a_composite_fk_target_may_carry_nothing_but_its_tenant_column():
+    """`(id, store, code)` wears the FK target's name while enforcing a
+    business key that nobody conditioned on live rows."""
+
+    class WideFkTarget(StoreScopedModel):
+        code = models.CharField(max_length=20)
+
+        class Meta:
+            app_label = "testapp"
+            constraints = [
+                models.UniqueConstraint(
+                    fields=["id", "store", "code"],
+                    name="testapp_widefktarget_id_store_uniq",
+                )
+            ]
+
+    assert "common.E005" in ids(audit_store_scoped_models([WideFkTarget]))
+
+
+@isolate_apps("tests.testapp")
+def test_a_conditioned_composite_fk_target_is_rejected():
+    """The one shape whose failure mode is a broken migration rather than a
+    leak: `ADD FOREIGN KEY` against a partial unique index gives "there is no
+    unique constraint matching given keys for referenced table" (measured in
+    the plan, §A.5). Conditioning this constraint disarms its only purpose, so
+    the exemption is refused rather than extended."""
+
+    class ConditionedFkTarget(StoreScopedModel):
+        class Meta:
+            app_label = "testapp"
+            constraints = [
+                models.UniqueConstraint(
+                    fields=["id", "store"],
+                    condition=LIVE,
+                    name="testapp_conditionedfktarget_id_store_uniq",
+                )
+            ]
+
+    assert "common.E005" in ids(audit_store_scoped_models([ConditionedFkTarget]))
 
 
 # --------------------------------------------------------------------------

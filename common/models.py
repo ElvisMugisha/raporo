@@ -4,7 +4,15 @@
 but it declares no concrete models: everything here is abstract, so it owns no
 migrations. The concrete models in `apps/*` inherit these and their own
 migrations carry the columns.
+
+This module is also where the column *names* the system checks reason about
+live (`ORG_FIELD`, `PUBLIC_ID_FIELD`, and the sets built from them). They sit
+next to the bases that declare the columns so that changing the rule in
+`common/checks.py` means changing the base, and not maintaining a second
+spelling of the same fact.
 """
+
+import uuid
 
 from django.conf import settings
 from django.db import models
@@ -20,6 +28,86 @@ from common.managers import (
     require_actor,
     soft_delete_values,
 )
+
+#: The organization pointer. Named here, next to the bases, because
+#: `common.checks` classifies unique constraints by the column names they
+#: reference and must not have its own spelling of the tenant columns. The
+#: column itself arrives on `StoreScopedModel` in step 2 of the
+#: tenancy-hardening sequence; `orgs` and `audit` already carry it.
+ORG_FIELD = "org"
+
+#: The surrogate identifier that crosses the process boundary (ADR 0010).
+PUBLIC_ID_FIELD = "public_id"
+
+#: A unique constraint on a store-scoped table has to name at least one of
+#: these, or it is enforced across every tenant.
+ORG_COLUMNS = frozenset({ORG_FIELD, f"{ORG_FIELD}_id"})
+STORE_COLUMNS = frozenset({STORE_FIELD, f"{STORE_FIELD}_id"})
+TENANT_COLUMNS = ORG_COLUMNS | STORE_COLUMNS
+
+#: The one column whose uniqueness is deliberately global and unconditional.
+IDENTITY_COLUMNS = frozenset({PUBLIC_ID_FIELD})
+
+
+class PublicIdModel(models.Model):
+    """The identifier a URL may name (ADR 0010).
+
+    Every row a user can act on is addressed by a URL in a server-rendered
+    HTMX app. A sequential `BigAutoField` there is an enumeration oracle: the
+    difference between "id 400 is not yours" and "id 4000 does not exist"
+    leaks the size and growth rate of every other tenant on the platform.
+    `public_id` is the only identifier that crosses the process boundary; the
+    primary key stays internal and stays the target of the composite foreign
+    keys.
+
+    Three properties of the declaration below are load-bearing:
+
+    * **A Python default, not `db_default=UUID7()`.** Of Django 6.1's
+      uniqueness paths only `Model.clean_fields()` skips a `DatabaseDefault`
+      sentinel - `validate_unique()`, `_get_unique_checks()`,
+      `validate_constraints()` and `UniqueConstraint.validate()` all read the
+      attribute - so under a database default `full_clean()` on an *unsaved*
+      instance compiles `WHERE public_id = UUIDV7()`, and a template rendering
+      an unsaved object puts an expression object in a DOM id. A Python
+      default means the value is a real UUID from the moment the object
+      exists. PostgreSQL 18 makes `db_default=UUID7()` *available*; it does
+      not make it correct here. It may be added alongside this default once
+      the uniqueness paths handle the sentinel - Django prefers the Python
+      default when both are set - and it would buy only the raw-SQL insert
+      path, which nothing in this codebase uses.
+    * **`unique=True` on the field, not a `UniqueConstraint` in `Meta`.** On
+      PostgreSQL `unique=True` *is* a unique B-tree index, and it is the index
+      the URL lookup uses, so `db_index` stays off: a second index would be
+      pure write cost on every insert into every table. Living on the field
+      also means a subclass that declares its own `Meta` without inheriting
+      this one cannot silently drop it - the accident `common.E002` exists
+      for. `common.E005` carries the matching exemption, and it is the only
+      non-primary-key `unique=True` in the schema.
+    * **Unconditional uniqueness** - the inverse of every other unique
+      constraint here, deliberately. A soft-deleted row keeps its identifier
+      for ever. Conditioned on live rows, a tombstone would release its
+      `public_id`, a later insert could take it, and a bookmarked URL or an
+      audit reference would then resolve to a different row. Reissuing an
+      identifier is worse than reserving one.
+
+    UUIDv7 rather than v4 because it is time-ordered: measured on 300k rows,
+    v7's unique index came out 16% smaller and its inserts 7% faster than v4's.
+
+    This is not an authorization control. It removes *enumeration*; the store
+    pin removes authorization risk. A valid identifier belonging to another
+    tenant must still be a 404, which is a property of the selector that reads
+    it, not of the column.
+    """
+
+    public_id = models.UUIDField(
+        _("public id"),
+        default=uuid.uuid7,
+        editable=False,
+        unique=True,
+    )
+
+    class Meta:
+        abstract = True
 
 
 class AuditedModel(models.Model):
@@ -52,13 +140,22 @@ class AuditedModel(models.Model):
         abstract = True
 
 
-class SoftDeleteModel(models.Model):
+class SoftDeleteModel(PublicIdModel):
     """Rows are retired, never removed.
 
     `objects` sees live rows only; `all_objects` sees everything and exists for
     audits and data migrations. Neither can delete, and `all_objects` is also
     the `base_manager`, so the internal paths Django takes (`refresh_from_db`,
     related descriptors) cannot delete either.
+
+    Inherits `PublicIdModel`, which is how every organization, store, role,
+    membership, store access and store-scoped business row gets its public
+    identifier from one declaration. `PublicIdModel` is mixed in *here* rather
+    than into `AuditedModel` because the two are combined independently
+    (`Organization(SoftDeleteModel, AuditedModel)`): declaring the column on
+    both would hand the same field to a model twice and Django would raise
+    `FieldError`. `accounts.User` and `audit.AuditLog` are neither
+    soft-deletable nor audited, so they mix `PublicIdModel` in directly.
     """
 
     deleted_at = models.DateTimeField(_("deleted at"), null=True, blank=True)
@@ -201,4 +298,15 @@ class StoreScopedModel(SoftDeleteModel, AuditedModel):
                 )
 
 
-__all__ = ["AuditedModel", "SoftDeleteModel", "StoreScopedModel"]
+__all__ = [
+    "IDENTITY_COLUMNS",
+    "ORG_COLUMNS",
+    "ORG_FIELD",
+    "PUBLIC_ID_FIELD",
+    "STORE_COLUMNS",
+    "TENANT_COLUMNS",
+    "AuditedModel",
+    "PublicIdModel",
+    "SoftDeleteModel",
+    "StoreScopedModel",
+]

@@ -68,16 +68,62 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "config.wsgi.application"
 
+# Two database identities, one per connection alias — never one alias with a
+# swappable USER. See docs/adr/0009 and scripts/db/roles.sql.
+#
+#   default    raporo_app    serves every request. Owns nothing, holds
+#                            SELECT/INSERT/UPDATE/DELETE and nothing else, and
+#                            is subject to row-level security.
+#   migrator   raporo_owner  owns the schema; runs `migrate`. Never serves.
+#
+# Why an alias and not `DATABASES["default"]["USER"] = ...`: a mutable key is a
+# variable that one mistake, one settings override or one compromised process
+# can flip, and it leaves the elevated credential inside the serving
+# connection's configuration. An alias makes the elevated identity a *place*
+# instead of a value — `--database=migrator` is the only door, and on a
+# workload where the owner credential is not injected the door is not there at
+# all (see below). "Connect as the owner, then SET ROLE raporo_app" is not an
+# alternative: RESET ROLE climbs straight back out, so SET ROLE is a
+# convenience and not a boundary.
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.postgresql",
         "NAME": os.environ.get("POSTGRES_DB", "raporo"),
-        "USER": os.environ.get("POSTGRES_USER", "raporo"),
+        # The fallback is the least-privileged role on purpose. It used to be
+        # `raporo`, which in the postgres image is the bootstrap *superuser*
+        # and the owner of every table — so a missing POSTGRES_USER silently
+        # served requests with the one credential that can disable every
+        # control in this schema.
+        "USER": os.environ.get("POSTGRES_USER", "raporo_app"),
         "PASSWORD": os.environ["POSTGRES_PASSWORD"],
         "HOST": os.environ.get("POSTGRES_HOST", "db"),
         "PORT": os.environ.get("POSTGRES_PORT", "5432"),
     }
 }
+
+# The migrator alias exists only where the owner credential is injected: the
+# dev container (which migrates on boot), the CI test step, and the deploy's
+# migration job. A serving workload in production gets neither variable, so
+# `migrator` is simply absent from DATABASES there.
+#
+# Absent, and not a copy of `default` with a note attached, because that is
+# what makes the failure loud. MEASURED: `migrate --database=migrator` without
+# the credential exits non-zero on Django's own argument parsing —
+# `error: argument --database: invalid choice: 'migrator' (choose from
+# 'default')` — before it opens a connection. A fallback to `default` would
+# instead migrate as
+# raporo_app, which either fails halfway through with `permission denied` or —
+# if someone ever over-grants that role — quietly recreates the single-role
+# world this split exists to end. Both variables are required together: half a
+# credential is a typo, not a configuration.
+_MIGRATE_USER = os.environ.get("RAPORO_MIGRATE_USER", "")
+_MIGRATE_PASSWORD = os.environ.get("RAPORO_MIGRATE_PASSWORD", "")
+if _MIGRATE_USER and _MIGRATE_PASSWORD:
+    DATABASES["migrator"] = {
+        **DATABASES["default"],
+        "USER": _MIGRATE_USER,
+        "PASSWORD": _MIGRATE_PASSWORD,
+    }
 
 AUTH_PASSWORD_VALIDATORS = [
     {

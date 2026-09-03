@@ -16,6 +16,37 @@ services:
     env_file: .env
     environment:
       DJANGO_SETTINGS_MODULE: config.settings.dev
+
+      # --- database identity (two of them) -------------------------------
+      # `env_file` above injects every key in .env, including the `db`
+      # service's bootstrap superuser credential. The five keys below override
+      # that, because `environment:` wins over `env_file:` for the same key,
+      # and because the whole point of the role split is that the process
+      # serving requests holds the *least* privileged credential in the
+      # system. POSTGRES_USER/POSTGRES_PASSWORD are what
+      # `config/settings/base.py` reads for the `default` connection, so
+      # this is where the serving identity is chosen.
+      #
+      # Role names are literals, not variables: they are not secrets, and a
+      # variable here would be one more place the serving identity could be
+      # flipped to the owner. The passwords are interpolated by compose from
+      # .env, and `:?` makes a missing one abort `up` by name rather than
+      # producing a container that cannot connect.
+      POSTGRES_USER: raporo_app
+      POSTGRES_PASSWORD: ${RAPORO_APP_PASSWORD:?unset. This is raporo_app's database password. Add RAPORO_APP_PASSWORD, RAPORO_MIGRATE_PASSWORD and RAPORO_BACKUP_PASSWORD to .env - any strong values - then re-run. See scripts/db/roles.sql for what each role is.}
+      # The migrator alias, consumed by exactly one command:
+      # `manage.py migrate --database=migrator`. It is here only because dev
+      # migrates on boot (RAPORO_AUTO_MIGRATE below). A deploy injects this
+      # pair into the migration job and nowhere else, so the serving process
+      # has no owner credential to switch to.
+      RAPORO_MIGRATE_USER: raporo_owner
+      RAPORO_MIGRATE_PASSWORD: ${RAPORO_MIGRATE_PASSWORD:?unset. This is raporo_owner's database password - the identity that runs migrate. Add it to .env.}
+      # Blanked deliberately: the backup role's credential belongs to the
+      # backup job. Without this line `env_file` would hand it to the web
+      # container, where BYPASSRLS + .env is exactly the pair an attacker
+      # wants.
+      RAPORO_BACKUP_PASSWORD: ""
+
       # Local dev only: one container, no rolling deploy, so the entrypoint may
       # migrate on boot and a fresh clone's first `up` serves a real schema.
       # Deploys leave this unset — see docker/entrypoint.sh.
@@ -58,6 +89,22 @@ services:
   db:
     image: postgres:18
     env_file: .env
+    environment:
+      # POSTGRES_USER/POSTGRES_PASSWORD (from .env) are this image's bootstrap
+      # superuser and nothing else now: they create the three raporo roles at
+      # initdb and are never used again. The application connects as
+      # `raporo_app`, `migrate` as `raporo_owner` — see the `web` service.
+      #
+      # Restated here with `:?` so a missing password aborts `up` by name,
+      # instead of failing inside initdb where the only symptom is "dependency
+      # failed to start".
+      RAPORO_APP_PASSWORD: ${RAPORO_APP_PASSWORD:?unset. This is raporo_app's database password. Add RAPORO_APP_PASSWORD, RAPORO_MIGRATE_PASSWORD and RAPORO_BACKUP_PASSWORD to .env - any strong values - then re-run. See scripts/db/roles.sql for what each role is.}
+      RAPORO_MIGRATE_PASSWORD: ${RAPORO_MIGRATE_PASSWORD:?unset. This is raporo_owner's database password - the identity that runs migrate. Add it to .env.}
+      RAPORO_BACKUP_PASSWORD: ${RAPORO_BACKUP_PASSWORD:?unset. This is raporo_backup's database password - the read-only identity pg_dump uses. Add it to .env.}
+      # Dev and CI only: grants CREATEDB to raporo_owner, because
+      # `pytest-django` creates and drops `test_raporo`. Production leaves this
+      # unset — nothing there creates a database.
+      RAPORO_DB_DEV_EXTRAS: "1"
     healthcheck:
       # `-h 127.0.0.1` on purpose: during first-time initdb the server listens
       # on the unix socket only, and a socket-based pg_isready reports ready
@@ -95,6 +142,22 @@ services:
       # first-boot, which is why this comment is short on doom and long on the
       # path: get the path right and there is nothing else to know.
       - "pgdata:/var/lib/postgresql"
+
+      # The role split, bootstrapped on a fresh volume. Two mounts and not one
+      # because the postgres entrypoint executes *every* file in
+      # /docker-entrypoint-initdb.d: roles.sql needs psql variables it cannot
+      # get that way, so only the wrapper goes in that directory and the SQL is
+      # mounted beside it.
+      #
+      # `initdb` scripts run once, on an empty data directory. An existing
+      # volume therefore needs one command, which is why bootstrap-roles.sh is
+      # idempotent:
+      #
+      #     docker compose exec db /docker-entrypoint-initdb.d/10-raporo-roles.sh
+      #
+      # Read-only mounts, and nothing is mounted into the `web` service's /app.
+      - "./scripts/db/bootstrap-roles.sh:/docker-entrypoint-initdb.d/10-raporo-roles.sh:ro"
+      - "./scripts/db/roles.sql:/opt/raporo/roles.sql:ro"
 
 volumes:
   pgdata: {}

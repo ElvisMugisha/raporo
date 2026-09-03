@@ -32,7 +32,8 @@ We will enforce **organization** isolation in PostgreSQL with row-level security
 `raporo_current_org_id()`, a `STABLE` helper reading
 `NULLIF(current_setting('raporo.org_id', true), '')::bigint`, so an unset context is `NULL`,
 every predicate is false, and the database fails closed to zero rows. Policies carry both
-`USING` and `WITH CHECK`, cover all commands, and every table is `ENABLE`d **and** `FORCE`d.
+`USING` and `WITH CHECK`, cover all commands, and every table is `ENABLE`d — **not** `FORCE`d
+(amended 2026-09-02, see below).
 ADR 0008's composite foreign key is what stops the row's organization and its store from
 disagreeing, so the two mechanisms cannot diverge.
 
@@ -43,10 +44,28 @@ statement, sets a `ContextVar`, and resets both on exit. The request middleware,
 commands and any future Celery task are *callers* of that one door, not three implementations
 of it. A source-scan test refuses a bare `SET` on a `raporo.*` GUC anywhere else in the tree.
 Second: **the application process must stop connecting as the table owner and as a
-superuser.** `FORCE ROW LEVEL SECURITY` subjects the owner to its own policies but nothing
-subjects a superuser, so without a `raporo_app` (no ownership, no `BYPASSRLS`, no `TRUNCATE`)
-and `raporo_migrator` (owner, `BYPASSRLS`) split, these policies are inert. Until that split
-exists, this ADR is not implemented — it is decoration.
+superuser.** Nothing subjects a superuser to a policy, so without a `raporo_app` role (no
+ownership, no `BYPASSRLS`, no `TRUNCATE`) and a separate owner role that runs migrations,
+these policies are inert. Until that split exists, this ADR is not implemented — it is
+decoration. Three agents reached that conclusion independently, one of them by measuring that
+`POSTGRES_USER=raporo` is the `postgres` image's superuser.
+
+**Amendment, 2026-09-02 — `ENABLE` without `FORCE`, and no `BYPASSRLS` on the migrator.**
+This ADR originally required `FORCE ROW LEVEL SECURITY` on every table plus `BYPASSRLS` on the
+migrator. `security-engineer` measured that pairing to be **self-cancelling**: `BYPASSRLS`
+bypasses `FORCE`, so `FORCE` buys nothing while both are set. Worse, the cleanup a
+least-privilege review would recommend — dropping `BYPASSRLS` — fails *silently*: with the
+owner subject to `FORCE` and no tenant context, `UPDATE` and `DELETE` affect **0 rows without
+error**, so data-migration backfills quietly no-op and the whole test suite returns zero rows.
+Measured, not reasoned.
+
+So: `ENABLE ROW LEVEL SECURITY` only; no `BYPASSRLS` anywhere; and `common.E101` asserts the
+runtime identity at boot instead, which is a check that can actually fail loudly. The
+consequence accepted deliberately: the owner role remains unconstrained by policy, which the
+connection-alias split plus `E101` are what make unreachable at runtime. The original text is
+kept above with a pointer rather than rewritten, because the reasoning that produced the wrong
+answer is worth reading — it was sound about Postgres semantics and wrong about their
+interaction, and the author flagged that it had not verified the behaviour.
 
 Rejected: **store-level RLS as well** — achievable via a second GUC holding the permitted
 store ids as an array, but it relocates an authorization decision into a mechanism that can

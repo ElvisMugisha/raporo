@@ -2,6 +2,8 @@
 
 Date: 2026-09-02 · Owner: `database-engineer` · Branch: `feat/slice-1-foundation`
 Status: plan only. No code, model or migration was changed producing this document.
+Amended the same day: **§J** folds in Elvis's ruling that a user belongs to exactly one
+organization. §A-I are unchanged by it.
 
 Binding inputs: `docs/superpowers/slice-1-workspace/LEDGER.md` (every ruling below that
 says "measured" or "ruled" is recorded there), `docs/PRODUCT.md`,
@@ -1231,12 +1233,433 @@ same shape.
 | F.5 | `test_every_tenant_table_forces_row_level_security` | `pg_class.relrowsecurity` **and** `relforcerowsecurity` true | `ENABLE` without `FORCE` |
 | F.5 | `test_e102_refuses_a_prod_config_using_the_owner_role` | driven **through the check registry**, never by a direct call | register under `Tags.database` — it must go silent, which is the E100 lesson |
 | G | existing four stability tests, plus new pins | unchanged mechanism | add a `RunSQL` and confirm the catch-all names it |
+| J.6 | eight tests, listed in §J.6, plus one tuple added to `LIVE_UNIQUE_CONSTRAINTS` | one live membership per user; a soft-deleted membership releases the user | drop either membership constraint; remove `condition=LIVE` |
+
+---
+
+## J. One organization per user
+
+Folded in 2026-09-02, after §A–I were written. Elvis has ruled: **a user may belong to
+exactly one organization** — not at launch, and not by accident later.
+
+The schema does not enforce that today. `Membership` carries
+`UniqueConstraint(fields=["user", "org"], condition=LIVE,
+name="orgs_membership_unique_live_user_per_org")`, which forbids *two live memberships in
+the same org* and permits a user to hold one live membership in org A **and** another in
+org B. Nothing else in the codebase forbids it either: there is no membership service yet,
+so today the rule exists only in this sentence.
+
+Everything below marked **measured** was run against `postgres:18.6` in an isolated
+compose project (`-p raporo-mem-db`, torn down with `-v`); everything marked **verified**
+was run against the installed `Django==6.1` in `env/` or read out of its source.
+
+### J.1 The constraint
+
+Added to `Membership.Meta.constraints`, **after** the per-org constraint and before the
+`(id, org)` composite-FK target:
+
+```python
+models.UniqueConstraint(
+    fields=["user"],
+    condition=LIVE,
+    name="orgs_membership_unique_live_user",
+    violation_error_message=_(
+        "That account already belongs to an organization. Remove it there first, "
+        "or invite a different email address."
+    ),
+    violation_error_code="unique",
+),
+```
+
+Four things about that declaration are deliberate.
+
+**The name.** `orgs_membership_unique_live_user`, following
+`orgs_<model>_unique_live_<rule>` (`orgs_organization_unique_live_slug` is the closest
+sibling: the rule half names the column the rule is *about*). Thirty-two characters, well
+inside PostgreSQL's 63-byte `NAMEDATALEN`. The thirty-character rule in §D.5 is Django's
+`Index.max_name_length` and applies to `models.Index` only, not to constraints — the
+existing `orgs_membership_unique_live_user_per_org` is forty characters and is fine. Do not
+"fix" this name to fit thirty.
+
+**Declaration position.** After the per-org constraint, on purpose. Index creation order
+decides which error an operator sees (§J.2), and on a fresh database that order comes from
+the migration sequence — but if these migrations are ever squashed, `CreateModel` emits the
+constraints in `Meta` list order. Declaring it second keeps the precedence identical either
+way.
+
+**`violation_error_code="unique"`.** Not cosmetic, and the reason is a Django detail worth
+stating because it is not guessable. `UniqueConstraint.validate()` raises the plain
+`violation_error_message` for any constraint that has a `condition`
+(`django/db/models/constraints.py`, the `else:` branch — verified), and
+`Model.validate_constraints()` only re-files that error onto a field when
+`e.code == "unique"` **and** the constraint names exactly one field
+(`django/db/models/base.py::validate_constraints` — verified). So without the code, the
+message lands in `NON_FIELD_ERRORS` as a form-wide banner; with it, it lands on the `user`
+field, next to the input the operator got wrong. Measured, on the installed Django, with a
+two-constraint model mirroring `Membership`:
+
+| Insert attempt | without `violation_error_code` | with `violation_error_code="unique"` |
+| --- | --- | --- |
+| same user, **same** org | `{'__all__': ['per-org message', 'one-org message']}` | `{'__all__': ['per-org message'], 'user': ['one-org message']}` |
+| same user, **other** org | `{'__all__': ['one-org message']}` | `{'user': ['one-org message']}` |
+
+**The message text.** It says what happened and what to do next, and it does not restate
+the constraint ("a user may have only one membership" tells the reader nothing they can
+act on). It also has to be true in *both* rows of that table, because `full_clean()`
+evaluates every constraint and collects the errors rather than stopping at the first — so
+the wording avoids naming which organization, which the message cannot know.
+
+**One correction to the brief, because it changes who this string is for.**
+`violation_error_message` is **not** what an operator reads out of an `IntegrityError`. A
+conditional `UniqueConstraint` is implemented as a partial unique index (Django's
+`_unique_sql` routes any constraint with a `condition` through `_create_unique_sql` —
+verified), so PostgreSQL raises, measured:
+
+```
+ERROR: duplicate key value violates unique constraint "orgs_membership_unique_live_user"
+DETAIL: Key (user_id)=(1) already exists.
+```
+
+The **name** is the operator's message; `violation_error_message` never appears in an
+`IntegrityError` — it exists only on the `full_clean()` path, for the person filling in the
+invite form. Two artefacts, two audiences. That is why the name has to carry the meaning
+(`live_user`, not `user_uniq`) and why the message is written for an end user.
+
+### J.2 `orgs_membership_unique_live_user_per_org` stays. Reasoning, not a coin flip.
+
+The stricter constraint does imply the looser one, and the objection is real: a constraint
+that can never fire is a thing future readers waste time on. In this case the premise is
+false — measured, the per-org constraint is the one that fires **first** in the more common
+failure mode.
+
+PostgreSQL checks unique indexes in `pg_class` OID order, which on a fresh database is
+creation order, and `orgs_membership_unique_live_user_per_org` is created in
+`orgs/0001_initial` while the new one arrives in a later migration. Measured, both ways
+round to confirm that order — and not index width — is what decides:
+
+| Table | index created first | insert | error names |
+| --- | --- | --- | --- |
+| `m` | per-`(user, org)` | duplicate `(u1, orgA)` | `..._unique_live_user_per_org` |
+| `m` | per-`(user, org)` | `(u1, orgB)` | `..._unique_live_user` |
+| `m2` | per-`user` | duplicate `(u1, orgA)` | `..._unique_live_user` |
+
+So with both constraints in place, the two failures an operator actually has to tell apart
+report different names:
+
+- **`..._unique_live_user_per_org`** — this person was invited to *this* org twice. A
+  double-submit or a race; benign, retry-safe, no human decision needed.
+- **`..._unique_live_user`** — this person works for *another* org. A policy refusal that
+  needs an answer from a human ("whose employee is this?").
+
+Those two incidents get different responses. One constraint name cannot distinguish them,
+and log lines are where an on-call engineer meets this table. That is the whole argument
+for keeping it, and it is the same argument the repo already made once: `accounts.User`
+keeps `unique=True` *and* a functional CI `UniqueConstraint` on the same column, with a
+`Meta` comment saying why (`apps/accounts/models.py:78-85`). Deliberately overlapping
+uniqueness with a written reason is house style here, not an oversight.
+
+Two more reasons, both cheap:
+
+- **Reversal symmetry.** Under multi-org, "you cannot join the same org twice" is *still*
+  correct. Keep it and allowing multi-org is one `DROP` (§J.3). Drop it now and allowing
+  multi-org later means *adding* a uniqueness rule to a populated table — the expensive
+  direction, exactly the cost §J.4 measures.
+- **Cost.** One extra partial index, maintained on the lowest-write table in the product
+  (invites and role changes, not sales). Measured on 180 030 live rows the two-column
+  partial index is 5 568 kB; at Raporo's scale — hundreds of memberships, maybe thousands —
+  it is noise.
+
+**What the implementer must write down in `Meta`, or this ruling decays into the exact dead
+weight the objection warns about:** a comment above the pair stating that the per-org
+constraint is implied by the one-org constraint and is kept because it fires first and
+names the benign case, and that its precedence comes from creation order.
+
+**And one honest caveat on that precedence: it is a convenience, never a contract.**
+Measured — `pg_dump` emits indexes in **alphabetical** order:
+
+```
+CREATE UNIQUE INDEX orgs_membership_unique_live_user ON public.m ...
+CREATE UNIQUE INDEX orgs_membership_unique_live_user_per_org ON public.m ...
+```
+
+`orgs_membership_unique_live_user` sorts first, so on any database rebuilt from a dump
+(staging, a restore rehearsal, a replica seeded by `pg_restore`) it holds the lower OID and
+fires first, and a same-org duplicate then reports the *one-org* name. Nothing may branch
+on which constraint fired: the membership service decides what to tell the user by
+**looking first** (§J.5), and the constraint is the backstop that catches the race.
+
+### J.3 Why the join table stays — record this, or someone will "simplify" it
+
+`Membership` still earns its keep on structure alone: it carries `role` (per-org, so it
+cannot live on `User`), it is the FK target of `StoreAccess.membership`, and it holds
+`orgs_membership_id_org_uniq`, the `(id, org)` target that the composite foreign keys tie
+`StoreAccess` and `AuditLog` to. But the reason worth writing down is different:
+
+> **Structure permits, constraint forbids.** Keeping the table and adding a constraint
+> means allowing multi-org later is `RemoveConstraint("orgs_membership_unique_live_user")`
+> — a metadata-only `DROP INDEX`, instant, reversible, no data migration and no row
+> reshaped. The application work (an org switcher, a request-scoped org instead of a
+> derived one) is real but purely additive.
+
+The refactor this section exists to forbid is `User.org = ForeignKey(Organization)` plus
+`User.role`, "since a user only has one org anyway". Four reasons it is worse, in order of
+how much they cost:
+
+1. **It puts a tenant pointer on the authentication table.** `accounts_user` is the one
+   table that must be readable *before* any org context exists — login resolves the account
+   first and the org afterwards. An `org_id` there makes invariant #1 depend on a column on
+   the auth table, and it makes `accounts_user` a candidate for the RLS policies of §F, at
+   which point authentication itself needs the GUC that authentication is what produces.
+   That is a circular dependency, not a simplification.
+2. **It destroys the history.** The soft-deleted membership rows are what let someone leave
+   org A and join org B (§J.6) and what the audit trail's actor pointers sit beside. A FK on
+   `User` holds one value: "left org A in March" stops existing.
+3. **It breaks the composite-FK chain.** `StoreAccess.membership` and the
+   `(membership, org)` / `(store, org)` pairs of §A.5 have nothing to point at;
+   `StoreAccess` would have to reference `(user, org)` and every same-org key in the schema
+   gets rebuilt.
+4. **It makes the reversal a data migration under a window** — backfilling a join table
+   from a column, on populated tables, instead of dropping one index.
+
+### J.4 The migration
+
+`orgs/0006_membership_one_org_per_user` (§E.5 occupies `0002`–`0005`; if this lands in the
+same round it is simply the ninth row of that table). One operation:
+
+```python
+migrations.AddConstraint(model_name="membership", constraint=<the constraint from §J.1>)
+```
+
+Reverse is `RemoveConstraint`, generated by Django, instant. Docstring label per §E.2:
+**SAFE ONLINE — today only**, with the reason in the docstring, not in this file alone.
+
+**This is free right now, and that is a window that closes.** Every table in every
+environment is empty; there is no production. `AddConstraint` on a conditional unique
+constraint emits `CREATE UNIQUE INDEX ... WHERE deleted_at IS NULL` (verified in Django's
+`_unique_sql`), which against zero rows is instantaneous. Do it now, in an ordinary atomic
+migration, non-concurrently, per §E.1.
+
+On a populated table the same one-line migration costs a project. Measured, on 200 300 rows
+of which 180 030 were live and 270 users held two live memberships:
+
+1. **The index build fails outright, and it names one offender:**
+   `ERROR: could not create unique index "big_unique_live_user" / DETAIL: Key
+   (user_id)=(45) is duplicated.` One key per attempt — you cannot iterate your way out of
+   300 offenders by re-running the migration.
+2. **So it starts with a detection query**, which is the artefact slice 2 would have to
+   write and this round gets for free:
+
+   ```sql
+   SELECT user_id,
+          count(*)                        AS live_memberships,
+          array_agg(org_id ORDER BY id)   AS orgs,
+          array_agg(id     ORDER BY id)   AS membership_ids
+   FROM   orgs_membership
+   WHERE  deleted_at IS NULL
+   GROUP  BY user_id
+   HAVING count(*) > 1;
+   ```
+
+   Measured: 159.8 ms, `GroupAggregate` over an `Index Scan` on the existing per-org
+   partial index — the query is cheap; it is what comes after that is not.
+3. **Then a decision per offender.** Which org keeps this person is a business question with
+   a human on the other end of it, not a data-migration default. "Keep the oldest" is a
+   guess that silently fires someone.
+4. **Then the build, under `ShareLock`.** Django's non-concurrent `CREATE UNIQUE INDEX`
+   blocks writes to `orgs_membership` for the duration — **NEEDS A WINDOW** under §E.2,
+   with the `pg_dump -Fc` backup and the rehearsed rollback that label requires, or
+   `AddIndexConcurrently`-style handling with `atomic = False` and an INVALID-index
+   rollback path.
+
+**Slice 2 should read this paragraph as a deadline.** After the first real tenant, steps
+1–4 are the price of a decision that costs one line today.
+
+### J.5 Does this warrant a startup check? No — and here is the boundary that decides it
+
+**Ruling: no new `common.E0xx`.** (Numbering note: this plan proposes `E007` (§D.3) and
+`E008` (§C.1), plus the security-tagged `E102` (§F.5). There is no `E009` in it; the code
+is free.)
+
+The criterion, which is worth stating once because it will come up again: **a system check
+earns its cost when it enforces a rule over a *class* of models that new code can join
+without noticing** — E004/E005/E006 fire on any store-scoped model anyone adds tomorrow,
+E007 and E008 likewise. "`Membership` declares this one constraint" is a single hard-coded
+fact about a single model. That is a test (§J.6), not a check. And a *data* check — boot-time
+`GROUP BY ... HAVING count(*) > 1` — is worse than useless: startup would run a growing
+query on every container boot and fail in the one way you least want, which is the E100
+lesson pointed the other way.
+
+The question worth taking seriously is the one the brief actually asks: **could anything
+else reintroduce multi-org?** Four vectors, ranked, with what closes each:
+
+1. **A future migration drops the constraint.** Closed by putting
+   `(Membership, "orgs_membership_unique_live_user")` into the existing
+   `LIVE_UNIQUE_CONSTRAINTS` list in `tests/test_orgs_models.py:266` — the parametrized
+   test then asserts both that the constraint exists and that its condition is exactly
+   `Q(deleted_at__isnull=True)`. Deleting the constraint turns the suite red. That is the
+   check, and it costs one tuple.
+2. **`Membership.objects.bulk_create(..., ignore_conflicts=True)`.** This does not create
+   multi-org — it makes the refusal *silent*: no row, no exception, and a caller that
+   reports "invited". Forbid `ignore_conflicts` on `Membership` in review; it converts every
+   constraint on this table into a no-op from the caller's point of view.
+3. **A service that catches `IntegrityError` and "recovers".** Also cannot create multi-org,
+   but it can mask a policy refusal as success. The rule for the membership/invite/signup
+   services: **look first.** Query the live membership, return a domain result the UI can
+   render ("this person already works at another organization"), and treat `IntegrityError`
+   as the race it is — log it, surface it, never branch on it. Signup needs this explicitly:
+   creating an org while already a member of one must refuse with a sentence, not a 500.
+4. **The one the database cannot help with: a read path over `Membership.all_objects` that
+   treats a soft-deleted row as authorization.** The constraint deliberately ignores deleted
+   rows, so a user *can* have a live membership in B and a dead one in A — that is the
+   feature in §J.6. If any resolver reaches for `all_objects` and takes `.first()`, the dead
+   row grants access to org A. Closed by convention plus a test, not by DDL: **one**
+   resolver (`org_for(user)` in the orgs service layer) over the live manager using `.get()`
+   — `MultipleObjectsReturned` is then a free runtime assertion that the constraint held —
+   and `Membership.all_objects` restricted to audit, export and erasure code. The test in
+   §J.6 is the one that matters.
+
+The write side needs nothing further, and this is measured rather than assumed. The partial
+unique index is enforced on `UPDATE` too:
+
+| Attempt (measured) | Result |
+| --- | --- |
+| bulk `UPDATE ... SET deleted_at = NULL` resurrecting two memberships for one user | refused, `..._unique_live_user` |
+| `UPDATE ... SET user_id = <user with a live membership>` (moving a row across users) | refused, `..._unique_live_user` |
+| `INSERT` into org B, then soft-delete org A, in one transaction (wrong order) | refused — the index is **not** deferrable |
+| soft-delete org A, then `INSERT` into org B, same transaction | committed, one live row |
+
+The last two are an implementation note, not a defect: `UniqueConstraint` raises
+`ValueError("UniqueConstraint with conditions cannot be deferred.")` if you try to combine
+`condition` with `deferrable` (verified, `constraints.py:297`), so a transfer must
+soft-delete the old membership **before** inserting the new one. Write that order into the
+service and the test in §J.6 pins it.
+
+`common.E005` is not affected and §B.2 needs no new row: `Membership` is org-level, not a
+`StoreScopedModel`, so `_check_uniqueness` never sees it (`_is_concrete_scoped_model`,
+`common/checks.py:37`). Worth knowing in the other direction — a `fields=["user"]`
+constraint on a *store-scoped* table would be an E005 (it names neither `store` nor `org`),
+which is correct and is one more reason `Membership` must not be moved under that base.
+
+### J.6 Tests
+
+`(Membership, "orgs_membership_unique_live_user")` joins `LIVE_UNIQUE_CONSTRAINTS`
+(§J.5 vector 1). Beyond that, in `tests/test_orgs_models.py`:
+
+| Test | Assertion | Mutation that must turn it red |
+| --- | --- | --- |
+| `test_a_user_may_hold_only_one_live_membership` | `Membership.objects.create()` into a second org raises `IntegrityError` **inside** `transaction.atomic()` (`create()` never calls `clean()`, so this is the database talking) | drop the constraint from `Meta` |
+| `test_a_soft_deleted_membership_releases_the_user` | member of A → `soft_delete(by=actor)` → `create()` into B succeeds; exactly one live membership, two rows in `all_objects` | remove `condition=LIVE` — the join must fail |
+| `test_leaving_and_rejoining_the_first_org_works` | A → leave → B → leave → A again, all live-clean at each step | as above |
+| `test_the_one_org_violation_reports_on_the_user_field` | `Membership(user=..., org=other).full_clean()` puts the message under `"user"`, not `NON_FIELD_ERRORS` | delete `violation_error_code="unique"` |
+| `test_a_same_org_duplicate_still_reports_the_specific_message` | same-org `full_clean()` yields the per-org message under `NON_FIELD_ERRORS` | drop the per-org constraint (this is the test that makes §J.2's ruling load-bearing rather than a comment) |
+| `test_the_one_org_index_is_partial_in_postgres` | `pg_indexes.indexdef` for `orgs_membership_unique_live_user` contains `WHERE (deleted_at IS NULL)` — a conditional constraint is an index, so it is **not** in `pg_constraint` | remove the condition |
+| `test_a_soft_deleted_membership_grants_no_access` | the org resolver over the live manager ignores a dead membership; `all_objects` still sees it | write the resolver against `all_objects` (§J.5 vector 4) |
+| `test_a_transfer_soft_deletes_before_it_inserts` | insert-then-delete order inside one `atomic()` raises; delete-then-insert commits | make the service insert first |
+
+**Confirmed, the same way "a soft-deleted org releases its slug" was confirmed:** the
+`LIVE` condition does deliver the release, at both layers.
+
+- PostgreSQL, measured: with a live membership in org A soft-deleted, `INSERT` into org B
+  succeeds and the table holds one live row and one dead one; the full round trip
+  A → leave → B → leave → A also succeeds. And while the B membership is live, re-inserting
+  A is refused by `..._unique_live_user` — correct: leaving B comes first.
+- Django, measured on the installed 6.1: the same sequence through `full_clean()` returns
+  clean after the soft-delete (`M after soft-delete, other org: clean`). This one is worth
+  checking separately rather than assuming, because `UniqueConstraint.validate()` builds its
+  queryset from `model._default_manager` and then re-applies the condition; on
+  `SoftDeleteModel` the default manager is `objects` (live only) while `base_manager_name`
+  is `all_objects`, and had the validation run through the base manager the ORM would have
+  reported a violation the database would not.
+
+### J.7 Consequence for the privacy ruling — and the correction it needs
+
+`docs/superpowers/specs/2026-09-02-privacy-law-058-2021-ruling.md` §4, `erase_org` step 2,
+currently reads: *"`erase_user()` for every member whose only membership was in this org.
+Members who belong to another org keep their account and lose only this membership — a real
+case and easy to get wrong."* Under this decision **that case cannot arise**: no live
+membership exists outside the org being erased, so step 2 loses its branch and becomes
+unconditional — `erase_user()` for every member of the org, and the org's member list is
+exactly the set of accounts that die with it. `export_user` and `erase_user` get the same
+simplification: one person's activity is one org's worth of activity, with no filtering.
+
+I am not editing that ruling (it is `privacy-compliance`'s document; Elvis routes the
+correction). Two things should go into it with the simplification, because the naive version
+is wrong in both directions:
+
+1. **The test must be over live memberships, not `all_objects`.** A user may still hold
+   *soft-deleted* memberships in other orgs — that is precisely what §J.6 preserves. An
+   `erase_org` that asks "does this user have any other membership?" against `all_objects`
+   would skip erasing anyone who ever left another org, which is a data-subject-rights
+   failure produced *by* the simplification.
+2. **The historical cross-org branch replaces the live one, and is narrower.** Erasing org B
+   anonymises an account whose soft-deleted membership in org A is still referenced by org
+   A's audit trail. Nothing breaks — the trail holds pointers, and `erase_user()` anonymises
+   in place — but the *effect* crosses an org boundary: org A's history for that person goes
+   anonymous because org B was erased. That is defensible (the account belongs to the
+   person, not to either employer, and §2 of the ruling already says so) but it must be
+   written down rather than discovered during the first erasure.
+
+### J.8 Second-order consequences worth recording now
+
+- **The constraint is also the index the hot path wants, which is its one-line reason.**
+  Resolving "which org and role is this logged-in user" runs on every authenticated
+  request. Measured on 180 030 live rows: `Index Scan using ..._unique_live_user`,
+  `Index Cond: (user_id = ...)`, 0.078 ms. §D's count goes up by one partial unique index
+  on `orgs_membership`, and it pays for itself as a lookup index.
+- **No `INCLUDE`, deliberately.** `UniqueConstraint(include=["org", "role"])` would make
+  that lookup an index-only scan. Measured: 0.074 ms with `Heap Fetches: 0`, against
+  0.078 ms — 4 µs — and the index grows from 3 968 kB to 7 144 kB, +80 %. A table this
+  small does not need a covering index; revisit only if membership rows ever reach a scale
+  where the heap fetch is not one cached page.
+- **Org identity becomes derivable from `request.user` alone.** With one live membership per
+  user there is no org selector, no org id in a URL, path or session, and therefore no
+  org-switch parameter to tamper with — an entire class of tenancy attack stops existing,
+  and the RLS GUC of §F.2 (`raporo.org_id`) can be set from the resolved membership at the
+  start of the request. That is a genuine strengthening of the RLS design and it belongs in
+  `security-engineer`'s and `architect`'s hands, not mine.
+- **Support access can no longer be a membership.** A Raporo staff member can hold at most
+  one, so "give support a membership in the customer's org" is now structurally unavailable.
+  Inspecting a tenant needs an out-of-band path (an admin role with a deliberate RLS bypass,
+  or audited impersonation) and that is a `security-engineer` decision. Flagged now, before
+  someone reaches for the easy version and finds the database in the way.
+
+### J.9 What I would push back on
+
+Not on the decision. One organization per user is the right call for launch: it removes the
+org-switch attack surface (§J.8), it deletes a branch from every authorization path, and —
+because the join table stays — it costs one `DROP` to undo. Four things around it, though:
+
+1. **`violation_error_message` is not the operator's message** (§J.1). PostgreSQL names the
+   index; Django's string only ever reaches the `full_clean()` path. The brief asked one
+   string to serve two audiences; the name serves the operator and the message serves the
+   invited person, and they are written separately above.
+2. **"A second constraint that can never fire" is factually wrong here** (§J.2). Measured:
+   creation order decides, and ours puts the per-org constraint first, so it is the one that
+   fires in the common case. The reverse is also measured, and so is the `pg_dump`
+   alphabetical-order flip — which is exactly why nothing may branch on it.
+3. **The interaction nobody has looked at yet is `accounts.User.phone`** (§J.8's missing
+   fifth bullet, and the thing on this page I would most want contradicted). `phone` is
+   mandatory and `unique`, `email` and `username` are unique and additionally CI-unique.
+   Combine that with one-org-per-user and a person who genuinely runs two businesses needs
+   two email addresses **and two phone numbers**. In the Rwandan SME market — a single
+   owner, a single MTN line, two registered trading names — that is a plausible support
+   ticket, and the product answer has to be "two stores in one organization"
+   (`MAX_STORES_PER_ORG = 5` covers it) rather than two orgs. That is a `product-owner`
+   question and it should be answered before the invite and signup copy is written, because
+   the copy is where the customer meets the rule. It is not a reason to change the
+   constraint.
+4. **Precedence must not become a feature.** If anyone proposes parsing constraint names out
+   of an `IntegrityError` to choose a message, that is the point at which the per-org
+   constraint should be dropped instead — the service layer looks first (§J.5 vector 3), and
+   the two names exist for the human reading the log, not for control flow.
 
 ---
 
 ## I. Things in this plan I think are mistakes, or that I would push back on
 
-Stated plainly, because a plan that only agrees with its brief is not a review.
+Stated plainly, because a plan that only agrees with its brief is not a review. The
+items the one-organization-per-user ruling added are in **§J.9**, kept with their own
+section so the numbering here does not shift.
 
 1. **`DEFERRABLE INITIALLY DEFERRED` in the reference checklist is wrong.** Restated at
    length in §A.8. It would make the tests that guard invariant #1 pass vacuously. This is

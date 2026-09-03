@@ -12,6 +12,8 @@ from django.core.validators import RegexValidator
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 
+from common.models import PublicIdModel
+
 #: Dotted, lowercase verb: `user.created`, `sale.below_floor_override`.
 ACTION_REGEX = r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$"
 ACTION_MAX_LENGTH = 80
@@ -66,7 +68,15 @@ class AppendOnlyQuerySet(models.QuerySet):
         )
 
 
-class AuditLog(models.Model):
+class AuditLog(PublicIdModel):
+    """One append-only row per recorded action.
+
+    Carries `PublicIdModel` explicitly: an audit row is neither soft-deletable
+    nor audited, so it inherits nothing that would bring the identifier along,
+    and a future audit screen links to rows by URL. `target_id` staying a raw
+    `BigIntegerField` is fine because it never appears in one.
+    """
+
     org = models.ForeignKey(
         "orgs.Organization",
         verbose_name=_("organization"),

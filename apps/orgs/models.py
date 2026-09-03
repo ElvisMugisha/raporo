@@ -57,6 +57,12 @@ def organization_logo_path(instance, filename: str) -> str:
 
 class Organization(SoftDeleteModel, AuditedModel):
     name = models.CharField(_("name"), max_length=120)
+    # Human-facing text - report filenames, share cards, branding - and
+    # deliberately NOT a routing key. Its unique constraint below is
+    # conditioned on live rows by design (a soft-deleted organization releases
+    # its slug), it is mutable and user-chosen, and it would put the tenant's
+    # name in every URL, referrer and proxy log. `public_id` is the identifier
+    # (ADR 0010); the organization does not appear in a URL at all.
     slug = models.SlugField(_("slug"), max_length=140)
     logo = models.ImageField(
         _("logo"),

@@ -12,6 +12,7 @@ from django.utils.translation import gettext_lazy as _
 
 from apps.accounts.managers import UserManager
 from common.managers import HardDeleteForbidden
+from common.models import PublicIdModel
 from common.validators import (
     PHONE_INPUT_MAX_LENGTH,
     normalize_phone,
@@ -106,7 +107,12 @@ class Language(models.TextChoices):
     FR = "fr", _("Français")
 
 
-class User(AbstractBaseUser, PermissionsMixin):
+class User(PublicIdModel, AbstractBaseUser, PermissionsMixin):
+    """Carries `PublicIdModel` explicitly: it descends from
+    `AbstractBaseUser`, so it inherits none of `common`'s bases, and
+    member-management URLs need a user identifier that is not the username -
+    which is user-chosen, mutable, and a login credential."""
+
     username = models.CharField(
         _("username"),
         max_length=60,

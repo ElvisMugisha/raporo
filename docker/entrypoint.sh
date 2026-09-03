@@ -7,7 +7,11 @@
 #
 #   1. `manage.py check` runs before the application server starts;
 #   2. `manage.py migrate` runs only where migrating on boot is safe — the
-#      environment must opt in *and* the command must be a recognised server;
+#      environment must opt in *and* the command must be a recognised server —
+#      and it runs as the *schema owner* (`--database=migrator`), followed by
+#      `grant_runtime_privileges`, which is part of migrating and not an
+#      extra. The server that follows both runs as the *runtime role*. Two
+#      identities, two connection aliases, no shared variable;
 #   3. one-off developer commands (pytest, ruff, admin commands, a debug
 #      shell) are exec'd untouched, because pytest manages its own database
 #      and a `manage.py shell` must not silently mutate the schema.
@@ -290,13 +294,44 @@ python manage.py check
 # It also takes a `server`: because compose.yaml sets RAPORO_AUTO_MIGRATE in
 # the service `environment:`, every `docker compose run` inherits it, and an
 # unrecognised command must not spend that permission.
+# It migrates as the *schema owner* and then serves as the *runtime role*.
+# `--database=migrator` is the second alias in config/settings/base.py, and it
+# is the only consumer of the owner credential in the whole tree. The serving
+# process that this script `exec`s below keeps the `default` alias, i.e.
+# raporo_app: owns nothing, cannot TRUNCATE, cannot drop a trigger or a policy.
+#
+# The missing-credential branch exits instead of falling back. A fallback to
+# `default` would migrate as raporo_app, and the failure mode is not merely "it
+# does not work": it is a half-applied schema, or — the day anyone over-grants
+# that role to get a deploy moving — a silent return to the single-role world
+# this split exists to end. base.py leaves `migrator` out of DATABASES when the
+# credential is absent, so Django would refuse too; this branch exists so the
+# message names the variable rather than reading `ConnectionDoesNotExist`.
 if [ "${RAPORO_AUTO_MIGRATE:-0}" != "1" ]; then
     log "RAPORO_AUTO_MIGRATE not set — skipping migrate"
 elif [ "${kind}" != "server" ]; then
     log "RAPORO_AUTO_MIGRATE=1 but this is not a recognised server — skipping migrate (RAPORO_ROLE=server forces it)"
+elif [ -z "${RAPORO_MIGRATE_USER:-}" ] || [ -z "${RAPORO_MIGRATE_PASSWORD:-}" ]; then
+    log "RAPORO_AUTO_MIGRATE=1 but RAPORO_MIGRATE_USER/RAPORO_MIGRATE_PASSWORD are not both set."
+    log "Migrations run as the schema owner (raporo_owner), never as the serving role."
+    log "Refusing to migrate rather than falling back to the 'default' connection."
+    exit 78 # EX_CONFIG
 else
-    log "RAPORO_AUTO_MIGRATE=1 — applying migrations"
-    python manage.py migrate --noinput
+    log "RAPORO_AUTO_MIGRATE=1 — applying migrations as '${RAPORO_MIGRATE_USER}' (--database=migrator)"
+    python manage.py migrate --noinput --database=migrator
+
+    # Phase 2 of the role split, and it is part of migrating rather than an
+    # extra: a migration that adds a table leaves the runtime role's
+    # privileges on it decided by ALTER DEFAULT PRIVILEGES, which grants all
+    # four DML privileges. The two tables that must have less than that
+    # (audit_auditlog, django_migrations) can only be named after they exist,
+    # so this re-narrows them on every migrate. Skipping it once leaves the
+    # app able to UPDATE the audit trail and DELETE Django's migration
+    # history — measured, before this step existed.
+    #
+    # Same alias, same identity: the owner grants because it owns.
+    log "re-asserting runtime privileges as '${RAPORO_MIGRATE_USER}'"
+    python manage.py grant_runtime_privileges --database=migrator
 fi
 
 exec "$@"

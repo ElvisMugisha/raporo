@@ -1,7 +1,15 @@
 # Tenancy hardening — design
 
 Date: 2026-09-02 · Author: architect · Status: proposed, awaiting Elvis
-Branch: `feat/slice-1-foundation` · Companion ADRs: 0008 (org column), 0009 (RLS), 0010 (public identifiers)
+Revision 2 (2026-09-02): Elvis's owner-access and one-org-per-user rulings folded in.
+Branch: `feat/slice-1-foundation` · Companion ADRs: 0008 (org column), 0009 (RLS),
+0010 (public identifiers), **0011 (org-wide store access is a permission code)**
+
+> **Read §I first, then §J.** §I is the subject of revision 2: where the permitted store set
+> is resolved and how the org owner's override works. §J lists every statement in §A–§H that
+> revision 2 corrects — three controller arbitrations, two Elvis rulings and the confirmed
+> PostgreSQL 18.6 / Python 3.14.7 platform. Sections A–H were not renumbered, so every
+> cross-reference from the other four design documents still resolves.
 
 Implementers: **database-engineer** owns migrations, index shapes and the SQL bodies;
 **backend-engineer** owns `common/` and `apps/`; **security-engineer** owns the RLS threat
@@ -37,11 +45,17 @@ Constraints I am designing to:
 | A guard is unverified until someone has watched it refuse something | LEDGER, four times |
 | Team size: one human plus agents | CLAUDE.md |
 
-Elvis's five settled decisions are the input, not the subject: denormalised `organization`
+Elvis's five settled decisions are the input, not the subject: denormalised `org`
 on `StoreScopedModel` with a composite FK; RLS in slice 1; UUIDv7 public identifiers;
 tenant-leading indexes + connection config + per-tenant export/delete + a generated denial
-matrix; Python 3.14 + PostgreSQL 18. §G records the two places where I would push back and
-what would change my mind.
+matrix; Python 3.14 + PostgreSQL 18 (**landed and verified: 3.14.7 / 18.6, 369 tests green**).
+§G records the two places where I would push back and what would change my mind.
+
+Two further rulings arrived after revision 1 and are the subject of §I: **a user belongs to
+exactly one organization**, and **a user reaches only the stores they were granted, except the
+org owner, who reaches any store in their org.** The second contradicts a deliberate built
+decision (`StoreAccess`'s docstring rejected exactly this implicit rule), so §I.0 states the
+contradiction before fixing it and §I.4 rules on what `StoreAccess` is for now.
 
 **One assumption, flagged because it changes the shape of §C if wrong:** the application
 process will stop connecting to PostgreSQL as the table owner and as a superuser. RLS is
@@ -132,14 +146,23 @@ Two additions to `resolve_scope`:
         return self._pin(resolve_scope(stores))
 ```
 
-`for_store()` now goes through the resolver. That closes a hole the current code cannot
-see: **`_store_pk` never checks that the store exists or who owns it**, so
-`Model.objects.for_store(<a rival's store id>)` compiles today and returns the rival's
-rows. It is correct-by-design in the sense that authorization is the caller's job — but
-slice 1 has no service layer yet, `store_id` is exactly the kind of value that arrives from
-a URL, and it is the classic IDOR shape. After this change a store id from another
-organization is refused at the pin, by the same `CrossStoreReferenceError` and the same
-message `for_stores([A, RIVAL])` already produces, and independently by RLS (§B).
+`for_store()` now goes through the resolver. **What that buys is a consistent diagnostic,
+not a closed leak** — revision 1 said otherwise and was corrected by execution (§J.1).
+Neither primitive authorizes a store against a caller: `for_stores([<a rival's store id>])`
+returns the rival's rows exactly as `for_store()` does, because `for_stores()` refuses a set
+*spanning* two organizations and refuses *unknown* ids, and a single-store set from one rival
+organization has nothing to be compared against. That is correct for a scoping primitive.
+
+The genuine residue is an **asymmetry in how the two spellings fail**: an unknown store id
+raises `ValueError` from `for_stores()` and returns **silently empty** from `for_store()`. A
+query that looks scoped and returns nothing is how scoping bugs hide — `_store_pk`'s own
+docstring makes that argument about `None`, and it applies one level up. Routing `for_store()`
+through `resolve_scope()` makes both spellings raise on an unknown id, and via §A.4's memo and
+instance fast path it makes the pin cheaper rather than dearer.
+
+Authorization has an owner and it is not the pin: **§I**. `require_store()` turns a URL
+identifier into a `Store` the actor may reach, or a 404, so a store id from request data never
+reaches `for_store()` at all.
 
 Cost, stated as testable numbers:
 
@@ -157,7 +180,7 @@ Cost, stated as testable numbers:
 ```python
     @staticmethod
     def _pin(queryset, pin):
-        queryset = queryset.filter(organization_id=pin.org_pk, store_id__in=pin.store_pks)
+        queryset = queryset.filter(org_id=pin.org_pk, store_id__in=pin.store_pks)
         queryset.query.store_scoped = True
         queryset.query.store_scope_pks = pin.store_pks     # name kept: 6 tests read it
         queryset.query.org_scope_pk = pin.org_pk           # new
@@ -173,7 +196,7 @@ regression asset in the project. `org_scope_pk` is purely additive.
 `queryset_pin(queryset) -> ScopePin | None` beside it for callers that need the org.
 
 Whether the single-store case emits `store_id = %s` or `store_id IN (%s)` is
-database-engineer's call against the index plan; either is safe. The `organization_id = %s`
+database-engineer's call against the index plan; either is safe. The `org_id = %s`
 term must be present in both, because it is what the tenant-leading index (§D.4) and the
 RLS cross-check (§B.4) are built on.
 
@@ -239,19 +262,19 @@ were found.
 
 | Site | Change |
 | --- | --- |
-| `_store_for_write` | also injects `organization_id` from the pin on a single-row create; refuses an explicit `organization`/`organization_id` that disagrees with the pin |
+| `_store_for_write` | also injects `org_id` from the pin on a single-row create; refuses an explicit `organization`/`org_id` that disagrees with the pin |
 | `_given_store_pk` | gains a sibling `_given_org_pk`, same shape |
-| `_check_write_store` | also refuses an out-of-scope `organization`/`organization_id` |
-| `bulk_create` | fills `organization_id` per row from the pin (the pin's org is single-valued even when its store set is not, so this always succeeds where the store fill succeeds) |
-| `_refuse_store_reparenting` | also refuses `organization`/`organization_id` in `update()`, for a strictly stronger reason than store re-parenting: it would break the composite FK, and re-homing an organization is not an operation this product has |
+| `_check_write_store` | also refuses an out-of-scope `organization`/`org_id` |
+| `bulk_create` | fills `org_id` per row from the pin (the pin's org is single-valued even when its store set is not, so this always succeeds where the store fill succeeds) |
+| `_refuse_store_reparenting` | also refuses `organization`/`org_id` in `update()`, for a strictly stronger reason than store re-parenting: it would break the composite FK, and re-homing an organization is not an operation this product has |
 | `_check_update_fk_stores` | unchanged, including the `resolve_expression` refusal and the multi-store refusal |
 | `StoreScopedManager.raw` | unchanged, still refused |
 
 ### A.9 `StoreScopedModel` — derivation, then assertion
 
-The row's `organization_id` is **derived, never asked for**, in the pattern
+The row's `org_id` is **derived, never asked for**, in the pattern
 `StoreAccess._derive_org` established and two gates blessed. New method
-`_derive_organization()`, called from `save()` before `_assert_related_stores_match`, and
+`_derive_org()` (on `StoreScopedModel`), called from `save()` before `_assert_related_stores_match`, and
 from `ScopedQuerySet.bulk_create` for each object — as `_assert_related_stores_match`
 already is, because `bulk_create` never calls `save()`.
 
@@ -260,7 +283,7 @@ Source precedence, first hit wins:
 1. the pin, when the row was created through a pinned queryset — free, and guaranteed
    consistent with `store` because `resolve_scope` derived both from one read;
 2. a cached `store` instance's `org_id` — free;
-3. an explicit `organization_id` the caller passed;
+3. an explicit `org_id` the caller passed;
 4. the active tenant context's org (§C) — free;
 5. one `SELECT org_id FROM orgs_store WHERE id = %s` via `Store.all_objects`.
 
@@ -307,7 +330,7 @@ the permitted store set into a second GUC as a text array and read it through a 
 helper so the planner evaluates it once:
 
 ```sql
-USING (organization_id = raporo_current_org_id()
+USING (org_id = raporo_current_org_id()
        AND (raporo_current_store_ids() IS NULL
             OR store_id = ANY (raporo_current_store_ids())))
 ```
@@ -337,7 +360,7 @@ portal where a store's numbers are confidential *within* the org. Then
 ### B.3 The composite FK is the agreement, not a comment
 
 ```
-<business table> (organization_id, store_id)  ->  orgs_store (id, org_id)
+<business table> (org_id, store_id)  ->  orgs_store (id, org_id)
 ```
 
 `orgs_store` already carries
@@ -349,7 +372,7 @@ live. Requirements I need from database-engineer:
   reason the ledger records: `INITIALLY DEFERRED` violations surface only at COMMIT, which
   never happens inside a test transaction, so tests pass vacuously.
 - Emitted by a **versioned, hash-pinned helper** in `common/db.py`
-  (`store_org_fk_v1(table) -> (forward, reverse)`), mirroring `append_only_triggers_v1`,
+  (`same_org_fk_v1(table) -> (forward, reverse)`), mirroring `append_only_triggers_v1`,
   because slice 2 adds four tables that need it and hand-rolled SQL per table is how the
   append-only guard nearly forked.
 - Naming: `<table>_store_same_org_fk`, matching the existing convention.
@@ -379,13 +402,16 @@ for the app role.
 | --- | --- | --- |
 | `orgs_organization` | `id` | yes, with one carve-out (§C.6) |
 | `orgs_store`, `orgs_role`, `orgs_membership`, `orgs_storeaccess` | `org_id` | yes |
-| every future `StoreScopedModel` table | `organization_id` | yes, from its own initial migration |
+| every future `StoreScopedModel` table | `org_id` | yes, from its own initial migration |
 | `audit_auditlog` | `org_id`, **nullable** | yes — policy text is security-engineer's (§B.6) |
 | `accounts_user`, `accounts_twofactor`, `accounts_recoverycode` | none | **no** |
 
 `accounts_user` is a global namespace by product design: username, email and phone are
-unique across the installation, and one user may hold memberships in several organizations.
-There is nothing to key a policy on. What compensates is already built and gate-verified:
+unique across the installation, and the multi-identifier auth backend must resolve an
+identifier to a user **before any organization is known**, so at that point there is nothing
+to key a policy on. (Revision 1 also gave "one user may hold memberships in several
+organizations" as a reason; that is no longer true — see §J.3 — and the surviving reason is
+sufficient on its own.) What compensates is already built and gate-verified:
 the non-enumerating multi-identifier auth backend, per-identifier and per-IP throttling, and
 uniform error responses. This is written down because "why is there no policy on the user
 table" is the first question a reviewer will ask.
@@ -502,13 +528,17 @@ Org resolution rules — the details are security-engineer's, these are the cons
 - anonymous request → no context. Login, registration, password reset, `/healthz` and
   static all run with no context, and must not need one: `accounts_*` carries no RLS, and
   registration is the sanctioned exception of §C.6.
-- authenticated request → the org comes from `request.session` but is **re-validated against
-  a live `Membership` on every request**, never trusted from the session. A session outlives
-  a revoked membership; that is the whole reason the check is per-request rather than at
-  login. One query, cached on `request.tenant`.
-- a user with exactly one membership needs no session key.
-- **the org never changes within a request.** Switching org is a POST that writes the
-  session; the next request picks it up. No code path re-issues the GUC.
+- authenticated request → `Membership.objects.select_related("role").get(user=request.user)`.
+  One query, cached on `request.tenant`, re-read **every** request so a revoked membership
+  drops the context on the next one. Nothing in the session participates: a user belongs to
+  exactly one organization (§J.3), so there is no current-org selection, no session key and no
+  org switcher. `select_related("role")` is required, not an optimisation — §I.3's query
+  budget for the store resolver depends on it.
+- `DoesNotExist` → no context. `MultipleObjectsReturned` → a violated database constraint,
+  therefore a bug: it surfaces as a 500 with an audit row and is **never** resolved by picking
+  one membership.
+- **the org never changes within a request**, and now cannot change between them either
+  without a membership change. No code path re-issues the GUC.
 
 Consequences of the middleware owning a transaction, for `docs/DEVELOPMENT.md` rather than
 for discovery:
@@ -609,9 +639,12 @@ The RLS denial tests declare `databases = {"default", "app"}` and read through
 pipeline's migration step overrides the user — `compose.prod.yaml`'s business, already on
 devops' list.
 
-Every table `ENABLE`d must also be `FORCE`d, and the acceptance test is not "the policy
-exists in `pg_policies`" but "a read as `raporo_app` with the wrong context returns nothing
-while the same read with the right context returns the row".
+**Tables are `ENABLE`d and deliberately not `FORCE`d** — revision 1 said the opposite and
+was overruled by measurement (§J.4): `FORCE` plus `BYPASSRLS` is self-cancelling, and dropping
+`BYPASSRLS` from the migration role makes data-migration backfills silently no-op. The
+acceptance test is unchanged and is what actually matters: not "the policy exists in
+`pg_policies`" but "a read as `raporo_app` with the wrong context returns nothing while the
+same read with the right context returns the row".
 
 ### C.6 Registration: the one sanctioned no-context write
 
@@ -665,15 +698,22 @@ the set of column names it references — `constraint.fields` plus `_expression_
 `constraint.expressions`, which the current implementation already computes:
 
 ```python
-TENANT_COLUMNS   = {"store", "store_id", "organization", "organization_id"}
-IDENTITY_COLUMNS = {"uuid"}
+TENANT_COLUMNS   = {"store", "store_id", "org", "org_id"}
+IDENTITY_COLUMNS = {"public_id"}
 ```
 
 | Kind | Test | Requirements | On failure |
 | --- | --- | --- | --- |
 | 1 — tenant-rooted business key | `referenced & TENANT_COLUMNS` and not `referenced & IDENTITY_COLUMNS` | `_requires_live_rows(condition)` is true | E005, current message and hint |
 | 2 — public identifier | `referenced == IDENTITY_COLUMNS` | `condition is None`; the field is `editable=False` | E005, new message |
-| 3 — anything else | otherwise | — | E005: "does not include `store` or `organization`" |
+| 3 — anything else | otherwise | — | E005: "does not include `store` or `org`" |
+
+**Revision 2:** the settled shape for `public_id` is field-level `unique=True` rather than a
+named `UniqueConstraint` (§J.2), so kind 2 is reached through the schema plan's own E005
+exemption for a non-editable `UUIDField` carrying a default. The *rule* kind 2 encodes is
+unchanged and is the reason the exemption is safe — the identity index must be global and
+unconditional — so it is argued here and enforced there. The schema plan owns the final E005
+decision table; this sub-section is the argument behind two of its rows.
 
 Kind 2 **inverts** both of E005's current demands, which is exactly why it must be a named
 kind and not an `if` buried in the old code path:
@@ -681,14 +721,16 @@ kind and not an `if` buried in the old code path:
 - it must be **global**: a public identifier that is unique only per tenant is not an
   identifier. Adding `store` to it would let two rows in two stores share a URL.
 - it must be **unconditional**: a soft-deleted row keeps its identifier for ever. Conditioned
-  on live rows, a tombstone would release its uuid, a later insert could take it, and a
+  on live rows, a tombstone would release its `public_id`, a later insert could take it, and a
   stale URL or an audit reference would resolve to a different row. Reissuing an identifier
   is worse than reserving one.
 
-Unchanged: field-level `unique=True` is still an error — including on `uuid`, because the
-identity constraint must be a named `UniqueConstraint` in `Meta.constraints` so that E008
-can find it, so that it can carry a `violation_error_message`, and so that the rule inspects
-one uniform structure. `unique_together` is still an error. `_requires_live_rows`'s AND-level
+Unchanged: field-level `unique=True` is still an error **except** on a non-editable
+`UUIDField` carrying a default — i.e. `public_id`, and nothing else. Revision 1 demanded a
+named `UniqueConstraint` here so it could carry a `violation_error_message`; that argument
+fails on its own terms, because `public_id` is `editable=False`, never appears in a form and
+can only collide through a UUIDv7 birthday event, so there is no user-facing message to
+localise. `unique_together` is still an error. `_requires_live_rows`'s AND-level
 handling of nested `Q` is still correct and still needed for kind 1.
 
 Deliberately **not** adjudicated by E005: whether a given business key should be per store
@@ -703,16 +745,29 @@ the rule is to change the base.
 
 ### D.2 Three new startup errors, in the E005 family's style
 
+**Numbering is the schema plan's** (it owns `common/checks.py` this round): `common.E007` is
+the org-leading index rule and `common.E008` is "every first-party model has a `public_id`".
+`E100` is taken. So revision 1's three proposals reduce to one survivor plus one new check, at
+the next free ids:
+
 | id | Subject | Rule |
 | --- | --- | --- |
-| `common.E007` | the `uuid` field on any concrete `IdentifiedModel` subclass | `UUIDField`, `null=False`, `editable=False`, has a callable default, `db_index` **not** set |
-| `common.E008` | the identity constraint | exactly one kind-2 `UniqueConstraint` on the concrete model. Catches the `ScopedThingOwnMeta` accident: a subclass declaring its own `Meta` without inheriting the base's loses the base's constraints, the same trap `common.E002` exists for |
-| `common.E009` | `organization` on a store-scoped model | non-nullable FK to `orgs.Organization` with `related_name="+"` — mirroring `_check_store_field`/E003 exactly, including its tolerance for a string target in isolated registries |
+| `common.E009` | `org` on a store-scoped model | non-nullable FK to `orgs.Organization` with `related_name="+"` — mirroring `_check_store_field`/E003 exactly, including its tolerance for a string target in isolated registries |
+| `common.E010` | `PRESETS` exhaustiveness (§I.9) | every code in `PERMISSIONS` appears in at least one preset or in a declared `UNASSIGNED` set, so a new code cannot enter the catalog without an explicit per-preset decision |
 
-All three are startup errors, not conventions, and all three need the coverage standard the
-E100 incident set: driven through `django.core.checks.run_checks()`, never by calling the
-function directly, and each with a deliberately-broken model under `isolate_apps` so the
-test fails when the check is removed.
+**Withdrawn from revision 1.** Its `E007` (the `public_id` field's shape) and `E008` (exactly
+one kind-2 `UniqueConstraint` on the concrete model) are subsumed: with field-level
+`unique=True` there is no separate constraint object to find, and the schema plan's own E008
+covers the field's presence. The `ScopedThingOwnMeta` accident that motivated revision 1's E008
+— a subclass declaring its own `Meta` and silently losing the base's constraints — cannot
+happen to a field-level `unique=True`, because it lives on the field and not in `Meta`. That is
+an incidental benefit of the schema plan's shape, and worth recording because it was one of my
+five arguments against it.
+
+Both surviving checks are startup errors, not conventions, and both need the coverage standard
+the E100 incident set: driven through `django.core.checks.run_checks()`, never by calling the
+function directly, and each with a deliberately-broken model under `isolate_apps` so the test
+fails when the check is removed.
 
 ### D.3 Connection and timeout configuration — devops-engineer's file, my constraints
 
@@ -735,14 +790,15 @@ In `config/settings/base.py`, `DATABASES["default"]`:
 - The export command (§D.5) needs `SET LOCAL statement_timeout = 0` — a per-command override
   inside `tenant()`, never a global relaxation.
 
-### D.4 Tenant-leading indexes, and `common.E010`
+### D.4 Tenant-leading indexes, and `common.E007`
 
 Rule: **every `Index` on a store-scoped model leads with `organization` or `store`.** After
-§A.5 every scoped query emits `organization_id = %s AND store_id IN (...)`, so a
+§A.5 every scoped query emits `org_id = %s AND store_id IN (...)`, so a
 tenant-leading composite is the shape the planner wants and a non-leading index is a promise
 the query shape cannot keep.
 
-`common.E010` enforces it as a startup error with no escape hatch. The one case that looks
+`common.E007` enforces it as a startup error with no escape hatch (renumbered in
+revision 2 to the schema plan's id — same rule, one owner). The one case that looks
 like a counter-example — the architecture spec's partial index on
 `expiry_date WHERE expiry_date IS NOT NULL` — is not one: the real query is "what expires
 soon *in this store*", so `Index(fields=["store", "expiry_date"], condition=...)` is both
@@ -750,7 +806,7 @@ compliant and better. If a genuinely global index is ever needed on a store-scop
 that is an argument to have in review, not a flag to set in `Meta`.
 
 Naming convention for database-engineer: `<table>_org_store_<col>_idx`. Unique constraints
-are not `Index` objects, so E010 does not see them and the global `uuid` unique index is
+are not `Index` objects, so E007 does not see them and the global `public_id` unique index is
 untouched — the correct outcome, and worth a comment because it will look like an
 inconsistency.
 
@@ -760,7 +816,7 @@ inconsistency.
 `TenantCommand` subclass, `--org <uuid>`. Iterates a declared table order and writes NDJSON
 per model with `.iterator()`; includes soft-deleted rows, which are part of the record, and
 the organization's audit rows. Two content rules make the output re-importable and id-free:
-emit `uuid`, never the bigint `id`; represent every FK by the target's `uuid`. It runs
+emit `public_id`, never the bigint `id`; represent every FK by the target's `public_id`. It runs
 inside `tenant()`, so RLS is what proves it cannot over-read — and a denial test asserts an
 export produced under org A's context contains no row belonging to org B.
 
@@ -798,7 +854,7 @@ the point is that **a model added in slice 2 acquires coverage without anyone re
   which is the RLS layer.
 - **Contexts:** correct org, rival org, no context.
 - **Assertion discipline, from this slice's most expensive lesson:** every result is
-  materialised (`sorted(r.uuid for r in qs)`), and every "returns nothing" assertion is
+  materialised (`sorted(r.public_id for r in qs)`), and every "returns nothing" assertion is
   preceded by proving the row *is* returned under the correct context. An empty result and a
   working guard are otherwise indistinguishable.
 - **The anti-rot mechanism:** a `TENANCY_FACTORIES` registry maps each model to a callable
@@ -820,100 +876,93 @@ the point is that **a model added in slice 2 acquires coverage without anyone re
 New abstract base in `common/models.py`, above `AuditedModel`:
 
 ```python
-class IdentifiedModel(models.Model):
-    uuid = models.UUIDField(_("public id"), default=uuid7, editable=False)
+class PublicIdModel(models.Model):
+    public_id = models.UUIDField(_("public id"), db_default=UUID7(),
+                                 editable=False, unique=True)
 
     class Meta:
         abstract = True
-        constraints = [UniqueConstraint(fields=["uuid"],
-                                        name="%(app_label)s_%(class)s_uuid_uniq")]
+        # `unique=True` above is the index; see §J.2
 ```
 
 Mixed in at three points, which covers everything:
 
-- `SoftDeleteModel(IdentifiedModel)` → `Organization`, `Store`, `Role`, `Membership`,
+- `SoftDeleteModel(PublicIdModel)` → `Organization`, `Store`, `Role`, `Membership`,
   `StoreAccess`, and every `StoreScopedModel` by inheritance;
-- `AuditLog(IdentifiedModel, models.Model)` → explicitly, because a future audit screen
+- `AuditLog(PublicIdModel, models.Model)` → explicitly, because a future audit screen
   links to rows by URL and `AuditLog` is not soft-deletable;
 - `accounts.User` → explicitly, because it descends from `AbstractBaseUser`, and because
   member-management URLs (Task 10) need a user identifier that is not the username.
 
-The `%(app_label)s_%(class)s` placeholders are what make a constraint declarable on an
-abstract base at all. `common.E008` then asserts the constraint is present on the
-**concrete** model, which catches the `ScopedThingOwnMeta` accident: a subclass declaring its
-own `Meta` without inheriting the base's silently loses it, exactly as it silently loses the
-default manager, which is what `common.E002` already exists for.
+`unique=True` lives on the field, so unlike a `Meta.constraints` entry it cannot be lost by a
+subclass that declares its own `Meta` — the `ScopedThingOwnMeta` accident `common.E002` exists
+for does not reach it. The schema plan's `common.E008` still asserts every first-party concrete
+model carries the base, because inheriting the base is the part a new model can forget.
 
-### E.2 `db_default=UUID7()` or a Python default? Python default.
+### E.2 `db_default=UUID7()` or a Python default? ~~Python default.~~ **Withdrawn — see §J.2**
 
-`default=uuid.uuid7` (stdlib, Python 3.14 — verified in this repo's interpreter: `3.14.6`,
-`uuid.uuid7()` returns `01a061ef-…-7177-…`). Five reasons, heaviest first:
+> **Revision 2: this sub-section is withdrawn.** PostgreSQL 18.6 is confirmed in this stack, so
+> its heaviest argument (decoupling the identifier from an unverified platform bump) no longer
+> exists, and the database-engineer measured the alternative directly. The settled shape is
+> `public_id = UUIDField(db_default=UUID7(), editable=False, unique=True)` on `PublicIdModel`.
+> §J.2 gives the full rename table and keeps the one residual that still matters (an unsaved
+> instance's `public_id` is a `DatabaseDefault` sentinel — never render one). The reasoning
+> below is kept only as the record of a decision that was reversed on evidence.
 
-1. **It decouples the identity scheme from the platform bump.** `UUID7()` compiles to
-   `uuidv7()`, and Django raises
-   `NotSupportedError("UUID7 requires PostgreSQL version 18 or later.")` below PG18. A
-   devops agent is still verifying PG18 feasibility. With a Python default, §F step 1 lands
-   whatever that verification concludes.
-2. **`db_default` and `full_clean()` interact badly, and measurably.** A field with
-   `db_default` has `db_returning = True`, and `Field.get_default()` returns a
-   `DatabaseDefault` sentinel. `Model.clean_fields()` skips it (`django/db/models/base.py`,
-   the `isinstance(raw_value, DatabaseDefault)` branch), but `Model.validate_unique()` and
-   `UniqueConstraint.validate()` do **not** — both read `getattr(instance, attname)` and
-   build a lookup from it, so the pre-insert uniqueness check compiles
-   `WHERE uuid = UUIDV7()`: a wasted query with a nonsense predicate on PG18, and a
-   `NotSupportedError` on anything older.
-3. **An unsaved instance has a real identifier.** With `db_default`, `obj.uuid` on an
-   unsaved object is a `DatabaseDefault` expression object. In a template-rendered app that
-   builds fragments for not-yet-saved objects and puts the uuid in DOM ids and `hx-*`
-   attributes, that is a papercut waiting in the one place nobody tests.
-4. It works on any backend, which keeps a future fast local test path open.
-5. The gap it leaves is small and already governed: the only non-Django writers this project
-   permits are `RunSQL` migrations, and the stability contract already forces every one of
-   those through a hash pin and a review.
+The reversed argument, in one paragraph rather than five, because the branch it protected is
+dead. Revision 1 chose `default=uuid.uuid7` chiefly to decouple the identifier from a PG18 bump
+that was still unverified — Django raises
+`NotSupportedError("UUID7 requires PostgreSQL version 18 or later.")` below 18, so a
+`db_default=UUID7()` would have blocked step 1 on step 9. PostgreSQL 18.6 is now confirmed in
+this stack, so that reason is gone, and the schema plan measured the rest: the write cost is
+lower than UUIDv4's, and `Field.db_returning` (which is `has_db_default()`) makes the value
+available after `create()` on the same `INSERT ... RETURNING`. Adopt `db_default=UUID7()`.
 
-`default=` rather than `db_default=` also means the column carries **no** database default,
-so a raw `INSERT` that omits `uuid` fails on `NOT NULL` — loud, which is the right failure.
-
-Revisit trigger for the ADR: PG18 confirmed everywhere **and** a bulk `COPY` loader or an
-external writer appears. Then add `db_default=UUID7()` *alongside* the Python default —
-`Field._get_default` checks `has_default()` first, so the Python default keeps winning on the
-ORM path and the database default covers only the paths that bypass it. Additive migration,
-not a redesign.
+**The one residual, kept as a rule with a test.** A field with `db_default` returns a
+`DatabaseDefault` sentinel from `get_default()`, so an **unsaved** instance's `public_id` is an
+expression object rather than a UUID. `Model.clean_fields()` skips it, but
+`Model.validate_unique()` and `UniqueConstraint.validate()` read `getattr(instance, attname)`
+and would build `WHERE public_id = UUIDV7()` — on PG18 a wasted query with a nonsense
+predicate, reachable only from a hand-written `full_clean()` on an unsaved object, since
+`public_id` is `editable=False` and appears in no `ModelForm`. The visible face of the same
+fact matters more in a template-rendered HTMX app: **never put an unsaved object's `public_id`
+in a template**, or a `DatabaseDefault` renders into a DOM id. `create()` populates it, so the
+window is narrow, and one test on a fragment rendered from an unsaved instance pins it.
 
 ### E.3 Indexed separately? No.
 
-`db_index` is not set. On PostgreSQL a `UniqueConstraint` is backed by a unique B-tree index
-on `uuid`, which serves every lookup this identifier has (`get(uuid=...)`). A second index
-would be redundant and would cost a write on every insert. `common.E007` enforces its
-absence, so nobody adds it "for lookups".
+`db_index` is not set. On PostgreSQL `unique=True` **is** a unique B-tree index, and it is the
+index the URL lookup uses — the schema plan measured
+`Index Scan using sale_public_id_uniq on sale`. A second index would be redundant and would
+cost a write on every insert.
 
 This looks inconsistent with the deliberately redundant plain index on `accounts_user`, so
 the reason is worth recording: that one exists because an **expression-only**
 `UniqueConstraint` raises a `NON_FIELD_ERRORS` `ValidationError`, so the field-level unique
-was what produced per-field form errors. The uuid constraint is field-based, and the field is
-`editable=False` and never appears in a form. The exception does not generalise.
+was what produced per-field form errors. `public_id` is `editable=False` and never appears in
+a form, so it has no form errors to shape. The exception does not generalise.
 
 ### E.4 What it means for URL design in an HTMX app
 
 - **The bigint pk never leaves the process.** Not in a URL, not in HTML, not in an `HX-*`
-  header, not in a DOM id. The uuid is the only identifier that crosses the boundary:
-  `id="sale-{{ sale.uuid }}"`, `hx-target="#sale-{{ sale.uuid }}"`,
-  `{% url 'sales:detail' sale.uuid %}`.
-- **Routes use Django's built-in converter**: `<uuid:sale_uuid>`. It accepts only the
+  header, not in a DOM id. The `public_id` is the only identifier that crosses the boundary:
+  `id="sale-{{ sale.public_id }}"`, `hx-target="#sale-{{ sale.public_id }}"`,
+  `{% url 'sales:detail' sale.public_id %}`.
+- **Routes use Django's built-in converter**: `<uuid:sale_public_id>`. It accepts only the
   canonical hyphenated lowercase form, so a malformed identifier is a 404 from the resolver
   and never reaches a view.
 - **No organization in the URL.** The active org comes from the tenant context, so paths are
-  `/stores/<store_uuid>/sales/<sale_uuid>/` and there is no org-shaped enumeration surface at
+  `/stores/<store_public_id>/sales/<sale_public_id>/` and there is no org-shaped enumeration surface at
   all. Rejected alternative: `/o/<org-slug>/…` — readable, but it puts a mutable, user-chosen
   value in every URL and gives multi-org users a way to address an org they are not currently
   in, which then needs its own authorization check on every route.
-- **`uuid` is not an authorization control.** Three layers, three jobs: the uuid removes
+- **`public_id` is not an authorization control.** Three layers, three jobs: the `public_id` removes
   *enumeration*, the pin removes *authorization risk*, RLS removes both when the app forgets.
-  Concretely, views never call `.get(uuid=…)`; they call one selector,
-  `common/selectors.py::get_scoped(model, uuid, *, store)`, which is
-  `model.objects.for_store(store).get(uuid=…)` — so a valid uuid belonging to another tenant
+  Concretely, views never call `.get(public_id=…)`; they call one selector,
+  `common/selectors.py::get_scoped(model, public_id, *, store)`, which is
+  `model.objects.for_store(store).get(public_id=…)` — so a valid identifier belonging to another tenant
   raises `DoesNotExist` and renders a 404, with no oracle in the difference between "wrong id"
-  and "not yours".
+  and "not yours" — the same 404 rule §I.7 states for the store dimension.
 - **HTMX-specific:** a lost tenant context on a fragment request must respond with
   `HX-Redirect`, not an HTML redirect — an HTML redirect gets swapped into the fragment target
   and the user sees a login page inside a table cell. Every fragment endpoint also answers a
@@ -922,8 +971,8 @@ was what produced per-field form errors. The uuid constraint is field-based, and
 - **Enforcement:** "no pk in the DOM" is a Task-8 acceptance criterion owned by
   frontend-engineer and code-reviewer, per the tech-lead's rule that a control in a handoff
   note is how E100 shipped inert. Each screen lands with an integration test asserting its
-  rendered fragment contains the uuid and not the pk.
-- **`audit.record`** gains `target_uuid` alongside `target_type`/`target_id`, so an audit
+  rendered fragment contains the `public_id` and not the pk.
+- **`audit.record`** gains `target_public_id` alongside `target_type`/`target_id`, so an audit
   screen can link to a row without a join. A new nullable column on an append-only table is a
   plain `AddField`; no existing row is rewritten.
 
@@ -947,7 +996,7 @@ demotion with no replacement cost.
 `BigAutoField` remains the primary key. The `(id, org_id)` composite-FK targets are already
 built on it, every FK stays 8 bytes rather than 16, index locality on joins is better, and
 `_store_pk` / `ScopePin` / `AuditLog.target_id` are integer-typed throughout. The cost is two
-identifiers per row and one rule to hold: **the pk never leaves the process; the uuid never
+identifiers per row and one rule to hold: **the pk never leaves the process; the `public_id` never
 enters a `WHERE` clause without a pin.**
 
 ---
@@ -967,12 +1016,12 @@ needs **no production migration at all**. This is the last moment that will be t
 | # | Step | Touches | Independently verified by | Revert |
 | --- | --- | --- | --- | --- |
 | 0 | Prerequisites already on the list: the 14 `origin/dev` add/add conflicts, and the `privacy-compliance` ruling | docs | `git merge-tree` rc=0 | n/a |
-| 1 | **Public identifier.** `IdentifiedModel`; `uuid` on `SoftDeleteModel`, `AuditLog`, `User`; `common.E007`/`E008`; **the E005 rewrite (§D.1)** | `common/models.py`, `common/checks.py`, `accounts/0002`, `orgs/0002`, `audit/0003`, `testapp/0002` | `manage.py check` green; a uuid on every row; E005 accepts a kind-2 and an org-rooted kind-1 constraint and still refuses a bare one | drop 4 columns |
-| 2 | **`organization` on `StoreScopedModel`** + `store_org_fk_v1()` in `common/db.py` + `_derive_organization` + the write-path fills | `common/models.py`, `common/managers.py`, `common/db.py`, `testapp/0003` | `pg_constraint` shows the key; a cross-org write is refused by the database; a store's org cannot be updated while it has rows | drop 1 column + 1 constraint |
+| 1 | **Public identifier.** `PublicIdModel`; `public_id` on `SoftDeleteModel`, `AuditLog`, `User`; the schema plan's `common.E008`; **the E005 rewrite (§D.1)** | `common/models.py`, `common/checks.py`, `accounts/0002`, `orgs/0002`, `audit/0003`, `testapp/0002` | `manage.py check` green; a public_id on every row; E005 accepts a kind-2 and an org-rooted kind-1 constraint and still refuses a bare one | drop 4 columns |
+| 2 | **`org` on `StoreScopedModel`** + `same_org_fk_v1()` in `common/db.py` + `_derive_org` + the write-path fills | `common/models.py`, `common/managers.py`, `common/db.py`, `testapp/0003` | `pg_constraint` shows the key; a cross-org write is refused by the database; a store's org cannot be updated while it has rows | drop 1 column + 1 constraint |
 | 3 | **The pin becomes `(org, stores)`** (§A) | `common/managers.py` only | the 45-case matrix before/after with mutation output; the query-count table of §A.5 | pure Python revert |
 | 4 | **Tenant context** (§C) — `common/tenancy.py`, `TenantMiddleware`, `TenantCommand`, connection settings | `common/tenancy.py`, `common/middleware.py`, `config/settings/*` | the GUC is set inside and absent outside the transaction; the two-requests-one-connection test; the `SET ` source scan | remove middleware |
 | 5 | **RLS** — roles, `ENABLE` + `FORCE`, `raporo_current_org_id()`, policies, the `app` alias | `common/db.py`, `orgs/0003`, `audit/0004`, `config/settings/*` | a read as `raporo_app` with the wrong context returns nothing while the right context returns the row | `DISABLE ROW LEVEL SECURITY` |
-| 6 | **Tenant-leading indexes + `common.E010`** | `common/checks.py`, migrations | `EXPLAIN` on a pinned read uses the leading index | drop indexes |
+| 6 | **Tenant-leading indexes + `common.E007`** | `common/checks.py`, migrations | `EXPLAIN` on a pinned read uses the leading index | drop indexes |
 | 7 | **The generated denial matrix** (§D.6) | `tests/` only | it goes red when any guard from steps 2–5 is mutated | delete tests |
 | 8 | **Per-tenant export** (§D.5); `PII_FIELDS` + its check | `apps/orgs/management/`, `common/checks.py` | an export under org A contains no org-B row | delete command |
 | 9 | **Platform bump** (Python 3.14 + PostgreSQL 18) — devops, already in the working tree | `docker/`, `compose.yaml` | suite green on both | revert images |
@@ -988,12 +1037,12 @@ Notes on the order that matter:
 - **Step 3 after step 2**, because the pin's org predicate needs a column to filter on. Step 3
   is otherwise pure Python and reverts cleanly, which matters because it edits the most-tested
   file in the project.
-- **Step 9 gates nothing.** Nothing in steps 1–8 needs PostgreSQL 18: RLS is ancient, the
-  composite FK is ordinary SQL, and §E.2 chose a Python default precisely so the identifier
-  does not depend on `uuidv7()`. `nulls_distinct=False` on a nullable business key (PG15+) is
-  the only other version-sensitive item and it has no consumer yet. If the devops verification
-  concludes against PG18, **nothing in this design changes.**
-- **Slice 2's precondition, not slice 1's:** `store_org_fk_v1()` and the RLS install helper
+- **Step 9 is done.** The platform bump landed and was verified by execution: Python 3.14.7,
+  Django 6.1, PostgreSQL 18.0006, `supports_uuid7_function = True`,
+  `supports_virtual_generated_columns = True`, 369 tests green. So `UUID7()` is available to
+  step 1 and there is no fallback branch to carry (§J.2). Steps 1–8 did not depend on it
+  anyway: RLS is ancient and the composite FK is ordinary SQL.
+- **Slice 2's precondition, not slice 1's:** `same_org_fk_v1()` and the RLS install helper
   must exist as versioned, hash-pinned helpers before the four ledger tables land, or each of
   them hand-rolls its own SQL. Same lesson `append_only_triggers_v1` already taught, at the
   cost of a fix round.
@@ -1034,11 +1083,13 @@ implementers have overruled a brief on this project and all three were right.
    far the most consequential, because the whole team would then believe organization isolation
    was a database fact.
 
-2. **Decision 3 (UUIDv7), one detail:** not `db_default=UUID7()` in this round, for the five
-   reasons in §E.2 — chiefly that it couples the identifier to an unverified PG18 bump, and
-   that `DatabaseDefault` misbehaves in `validate_unique()` / `UniqueConstraint.validate()`.
-   A Python default gets the same identifier with none of the coupling, and `db_default` can be
-   added later as a purely additive backstop.
+2. ~~**Decision 3 (UUIDv7), one detail:** not `db_default=UUID7()` in this round.~~
+   **Withdrawn in revision 2.** The push-back's main premise — an unverified PG18 bump — was
+   resolved by verification, and the database-engineer measured `db_default=UUID7()`'s write
+   cost and confirmed `db_returning` populates the value with no extra round trip. Adopt
+   `db_default=UUID7()` (§J.2). I record the reversal rather than deleting it: the argument was
+   sound on the information available, and it was evidence that changed it, which is the
+   standard this project holds itself to in both directions.
 
 Two smaller notes, not disagreements:
 
@@ -1053,7 +1104,7 @@ Two smaller notes, not disagreements:
 
 ---
 
-## H. Self-review
+## H. Self-review (revision 1 — see §J.7 for revision 2)
 
 - **Placeholders:** none. Every file and symbol named above is either an existing path or a
   new one specified with its module, name and signature.
@@ -1074,3 +1125,710 @@ Two smaller notes, not disagreements:
   reasoned from PostgreSQL semantics and from the security gate's measurement that the app
   role is owner and superuser. Per this slice's own standard, reasoning is not evidence — the
   first thing step 5 must produce is a watched refusal.
+
+---
+
+## I. The permitted store set — Elvis's owner ruling (revision 2, 2026-09-02)
+
+> *"A user may access more than one store, and only if they were given access to both of
+> them. But the owner of the org can access any store under their org."*
+
+This section is the subject of revision 2 and it is the only place the owner override exists.
+It is recorded as **ADR 0011**. §J lists every earlier statement in this document that
+revision 2 corrects, including the one this ruling contradicts outright.
+
+### I.0 What this contradicts, stated before it is fixed
+
+`StoreAccess`'s docstring reads *"Which stores a membership may work in. Materialised even for
+owners: explicit rows beat an implicit 'owners see everything' rule."* The implicit rule it
+rejected is the one Elvis has now asked for. That sentence must not survive the change: as
+written it states a design rule the system will no longer follow, and a future reader would
+trust it. §I.4 gives the replacement text verbatim.
+
+### I.1 The resolver
+
+**One function. Its name and signature:**
+
+```python
+# apps/orgs/services/access.py
+
+def permitted_stores(membership: Membership) -> StoreSet:
+    """Every live store this membership may reach, and how it got them.
+
+    The only place the org-wide override exists. Nothing else in the codebase
+    reads `StoreAccess` or decides which stores an actor may reach.
+    """
+```
+
+```python
+@dataclasses.dataclass(frozen=True, slots=True)
+class StoreSet:
+    org_pk: int
+    stores: tuple[Store, ...]      # live, in Store.Meta.ordering (name) order
+    via: str                       # "access_all" | "store_access" — messages and audit, never control
+
+    def __bool__(self) -> bool: ...                       # False when the set is empty
+    def __contains__(self, store: Store | int) -> bool: ...
+    @property
+    def store_pks(self) -> tuple[int, ...]: ...
+    def by_public_id(self, public_id: uuid.UUID) -> Store | None: ...
+```
+
+Two derived gates live in the same module, are the only callers of the resolver that views
+ever touch, and contain no policy of their own:
+
+```python
+def require_store(membership: Membership, public_id: uuid.UUID) -> Store:
+    """The store behind a URL identifier, or `StoreNotPermitted` (rendered 404)."""
+
+def require_store_permission(
+    membership: Membership, public_id: uuid.UUID, code: str
+) -> Store:
+    """`require_store` + `Role.has(code)`. Both gates, one call, so neither is forgotten."""
+```
+
+**Why it takes a `Membership` and not a `User`.** The membership *is* the actor in this
+domain: it carries the user, the organization and the role, which are the three inputs the
+answer depends on. A `User` argument would make the function resolve the membership as a side
+job and re-query what every caller already holds. After the one-org-per-user ruling (§I.6) the
+membership is a total function of the user, so nothing is expressible with a `User` that is not
+expressible with a `Membership`.
+
+**It refuses rather than guessing.** A soft-deleted membership, or a membership whose `org_id`
+disagrees with the active tenant context, raises `TenantContextMismatch` (§B.4's type, reused).
+The org disagreement check is cheap and loud, and it is what stops a resolver call made under
+the wrong context from returning a plausible-looking wrong set.
+
+**An empty set is a legitimate answer, not an error.** A member whose only store was
+soft-deleted, or whose access was revoked, has zero reachable stores. That is a 200 with an
+empty state ("you have no stores; ask your administrator"), not a 404 and not an exception.
+`StoreSet` is falsy so the view layer can branch on it. What *is* refused is trying to *pin* an
+empty set: `for_stores(())` would raise `ValueError` naming a function the caller never called
+— the exact failure `merge_scope_pks`'s docstring already records — and a pin of no stores
+reads as "unpinned" downstream, which is worse than an error. So `StoreSet.pin()` raises
+`NoPermittedStores` on an empty set, and the empty case is handled before any query is built.
+
+**The bodies, both branches:**
+
+```python
+    if membership.role.has(STORE_ACCESS_ALL):
+        stores = Store.objects.filter(org=membership.org_id)
+        via = "access_all"
+    else:
+        stores = Store.objects.filter(
+            org=membership.org_id,
+            access__membership=membership,
+            access__deleted_at__isnull=True,
+        )
+        via = "store_access"
+```
+
+Three things in there are load-bearing:
+
+- `Store.objects` is the `SoftDeleteManager`, so both branches are live-rows-only for free.
+  `Store` is org-level, not store-scoped, so no pin is needed to read it — this is the one
+  table the resolver may query without already knowing the answer.
+- `access__deleted_at__isnull=True` is the **revocation path**. Without it a soft-deleted
+  `StoreAccess` row still resolves, and revocation silently does nothing. It gets its own
+  test, and the test asserts the store *is* present before the revocation, so an empty result
+  is not mistaken for a working guard.
+- `org=membership.org_id` appears in **both** branches although the member branch does not
+  need it (the composite FK already guarantees a `StoreAccess` row cannot mix organizations).
+  It is there so the two branches emit the same predicate shape and both use the org-leading
+  index the schema plan's `common.E007` requires. A free predicate that makes two plans
+  identical is worth writing.
+
+### I.2 Who calls it, and how a command or a task gets one
+
+**Not the middleware.** `TenantMiddleware` (§C.3) resolves the *organization*, because the org
+is one value for the whole request and it has to be known before the first statement runs.
+The permitted store set is not that: it is consulted zero times on a login page and three times
+on a sales screen, and resolving it eagerly on every request would cost a query on paths that
+never look at a store. The middleware's job stops at putting the resolved `Membership` on
+`request.tenant`.
+
+**The service layer calls it, and the view layer calls only the gates.** Concretely:
+
+| Caller | Gets its `Membership` from | Calls |
+| --- | --- | --- |
+| A view addressing one store (every detail page and HTMX fragment) | `request.tenant.membership` | `require_store_permission(membership, store_uuid, code)` |
+| A view listing across stores (the consolidated report, the store picker) | same | `permitted_stores(membership)` |
+| A service that must not trust its caller (`record_sale`, `restock`) | its `actor` argument | `require_store_permission(...)`, again — the gate is idempotent and cheap, and a service that trusts the view is a service that is unsafe from a future DRF endpoint |
+| `TenantCommand` (§C.3) | `--as-member <user public id>`, optional | `permitted_stores(membership)` |
+| A future `@tenant_task` (§C.3) | `membership_public_id` in the task signature, re-resolved at execution time | `permitted_stores(membership)` |
+
+A management command that operates on the *whole* organization does not get a membership and
+does not call the resolver: it runs under `tenant(org_pk, source="command")` and pins with
+`for_stores(Store.objects.filter(org=org_pk))` explicitly. That is the honest shape — the
+command is not acting as a person, so there is no permitted set to resolve, and writing
+`--as-member` would invite someone to fake an actor to widen a scope. `export_org` (§D.5) is
+in this category.
+
+For a task the rule from §C.3 carries over unchanged and matters more here: the membership and
+its store set are **re-resolved at execution time, never inherited from the enqueuing
+request**. A task queued while someone was an owner must not run as one after the demotion.
+
+### I.3 How the override composes with `for_stores()`
+
+`for_stores()` pins a set and refuses one spanning two organizations. For an owner the set is
+"every live store in the org", and the question is whether that arrives as a list of ids or as
+a subquery.
+
+**Materialised list of ids. A subquery is not a close second, it is unimplementable.**
+
+1. **`merge_pins` is set algebra over integers** (§A.6): union, intersection, and an
+   `org_pk` equality test. A subquery pin cannot be unioned with another pin, cannot be
+   intersected, cannot be compared for the `left == right` case, and cannot be printed in the
+   error message that names both organizations. The 45-case operator matrix reads
+   `query.store_scope_pks` as a tuple. Making the pin a subquery would mean redesigning the
+   merge algebra to buy nothing.
+2. **The cap is five.** `MAX_STORES_PER_ORG = 5`, enforced under a row lock by `create_store`.
+   `store_id IN (1,2,3,4,5)` against an `(org_id, store_id, …)` leading index is the plan the
+   planner wants. A subquery adds a hash semi-join per statement and hides the cardinality.
+3. **A materialised list is a snapshot with a known age** — this call, this transaction. A
+   subquery re-evaluates per statement, so an owner's set could change *between two statements
+   of one request*. That is the same hazard §B.2 rejects one layer down when it refuses a GUC
+   that changes mid-request, and it would make a report's totals disagree with its own row
+   list.
+
+**Query cost, which is the specific question asked.** `_store_pks()` issues one query today to
+resolve ownership. The owner path does **not** add a second, because the resolver returns
+`Store` *instances* and §A.4's instance fast path then builds the pin with no query at all:
+
+| Step | Member | Owner |
+| --- | --- | --- |
+| resolve the membership + role | 0 (shared with `TenantMiddleware`, see below) | 0 |
+| `permitted_stores()` own query | 1 (`Store` ⋈ `StoreAccess`) | 1 (`Store` by org) |
+| `for_stores(store_set.stores)` | **0** (instances carry `org_id`) | **0** |
+| total, per request | 1 | 1 |
+
+Two conditions make the zeros real, and both are constraints on other sections:
+
+- `TenantMiddleware`'s per-request membership re-validation (§C.3) must
+  `select_related("role")`. It fetches that row anyway; without `role` the resolver fetches it
+  again and the table above gains a query in both columns.
+- §A.4's instance fast path must be built, and its premise — a `Store` instance loaded from the
+  database carries a correct `org_id` — is what §B.3's composite FK makes a database fact. If
+  that key is ever dropped, this row of the table goes with it.
+
+`for_stores()` still refuses unknown ids and still refuses a cross-org set. The resolver never
+hands it either, which is the point: **ids the resolver produced have already been proven live
+and in-org, and ids from a URL never reach `for_stores()` at all** — they reach
+`require_store()`, which resolves them against the permitted set.
+
+**If the cap ever rises.** The list stays the right answer to roughly one hundred stores. Past
+that, `IN` lists of hundreds of literals start to cost plan-cache churn and statement size, and
+the answer is still not a subquery: for an `access_all` actor, `org_id = %s` **alone** selects
+exactly the enumerated set, so the store predicate can be dropped. That means
+`ScopePin(org_pk, store_pks=None)` as an explicit "org-wide" value and `merge_pins` treating
+`None` as the top of the lattice — a real change to the merge algebra with its own tests, not a
+flag. Recorded as a designed revisit trigger with its condition, not built.
+
+### I.4 What `StoreAccess` is for now
+
+**Ruling: owner memberships get no `StoreAccess` rows, and the docstring's argument does not
+survive.**
+
+The argument was auditability: an explicit row is a reviewable grant. It fails on its own
+terms once the resolver ignores those rows for `access_all` roles, because then the row is not
+the grant — it is a **decoy**. Someone auditing "who can reach store A2" would read
+`orgs_storeaccess`, find no row for the owner, and conclude correctly today; find a row and
+conclude nothing, because the row neither grants nor withholds. A reviewable artefact that does
+not control the thing it appears to control is worse than its absence.
+
+Two further costs settle it. Materialised owner rows must be *maintained*: `create_store` fans
+out one row per owner membership, `soft_delete_store` retracts them, and a role edit that adds
+or removes `store.access_all` rewrites them. That is a denormalisation with an invalidation
+problem, which is precisely what the override was chosen to avoid. And when the two disagree —
+and they will — the resolver wins, so the rows were never authoritative.
+
+**What replaces the audit story, and why it is better.** The grant is now the role, and role
+edits already go through a service that requires `role.manage` and writes an `audit.record`
+row. So "who can reach every store, and who gave them that" is answered by the audit trail of
+role edits plus the membership's current role. That records the *decision* ("grant
+`store.access_all` to the role named X") rather than its consequences ("five rows appeared"),
+which is the artefact a reviewer actually wants.
+
+**`StoreAccess`'s job, stated positively:** it is the complete and exclusive record of
+store access for every membership whose role does **not** hold `store.access_all`. It is no
+longer a complete record of who can reach a store.
+
+**Replacement docstring** — this is the text, because the current one states a rule the system
+will not follow:
+
+```python
+class StoreAccess(SoftDeleteModel, AuditedModel):
+    """Which stores a membership may work in — for every membership whose role does
+    *not* hold `store.access_all`.
+
+    A role holding that code reaches every live store in its organization and gets no
+    rows here (ADR 0011): a row that does not control access would be a decoy for
+    anyone auditing who can reach a store. The grant for such a role is the role
+    itself, and role edits are audited, so the reviewable artefact is the decision
+    rather than its fan-out. `apps/orgs/services/access.py::permitted_stores()` is the
+    only reader of this table and the only place the two branches meet.
+
+    `org` is denormalized so the database can hold `(membership, org)` and
+    `(store, org)` together and refuse a row that mixes two organizations.
+    """
+```
+
+**The demotion hazard, closed by construction.** A membership promoted from Manager to Owner
+may still carry `StoreAccess` rows from before. They are inert while the role holds
+`store.access_all` — and they become that membership's entire store set the instant it is
+demoted, silently, to whatever it happened to hold months earlier. No database constraint can
+express "no rows for a membership whose role's JSONB permission list contains this string", so
+this is a service invariant with a test:
+
+```python
+def set_membership_role(
+    membership: Membership, role: Role, actor, *, stores: Sequence[Store] | None = None
+) -> Membership:
+```
+
+Moving *to* a role holding `store.access_all` soft-deletes the membership's `StoreAccess` rows
+in the same transaction. Moving *away* from one requires `stores` and refuses `None`, so the
+new store set is stated rather than inherited from stale rows. Both directions land with a
+denial test.
+
+### I.5 Revocation and the stale-set problem
+
+The reference checklist is explicit that the permitted-store list must not live in a token,
+because revoking access must take effect immediately. We use session auth, not JWT, but a
+Django session is a token by that standard the moment the application trusts it without
+re-reading the source of truth. So:
+
+**Where the set may be cached: nowhere. The resolver queries on every call.**
+
+| Location | Ruling |
+| --- | --- |
+| `request.session` | **Never.** This is the token the checklist forbids. A session outlives a revoked `StoreAccess` row, a demotion, and a soft-deleted store. |
+| A signed cookie or any client-held value | **Never**, same reason, plus the client can replay an old one. |
+| Redis / `django.core.cache` | **Not in slice 1**, and there is no async infrastructure to invalidate it with. Adding one would mean designing an invalidation protocol for a saving of roughly one millisecond. |
+| The `TenantContext` (per request, per transaction) | **Permitted but deliberately not used** — see below. |
+| A module-level or class-level dict | **Never.** A WSGI worker thread reuses its context; this is the application-layer twin of the `CONN_MAX_AGE` leak §C.2 exists to prevent. |
+
+**Why not even the per-request memo, which is free.** A memo on `TenantContext` would be
+correct across requests and wrong *within* one, in a way that bites the primary user. An
+owner's set changes whenever a store is created or soft-deleted, and `create_store` runs inside
+a request: memoised, the owner would create a store and then be unable to see it until the next
+page load, because the memo was warmed before the insert. Closing that means an
+`invalidate_permitted_stores()` hook and two call sites (`create_store`, `soft_delete_store`)
+that a third mutation path in slice 2 will forget. Two indexed queries returning at most five
+rows do not buy that. So: **no memo, and therefore no invalidation triggers to enumerate, for
+either kind of actor.**
+
+That is also the honest reading of "immediately": revocation takes effect at the *next check*,
+not at the next request. Every gate is a check.
+
+**The two invalidation triggers, recorded because they are what a memo would have to handle**
+and because the difference is the thing Elvis asked about. A member's set changes on a
+`StoreAccess` grant or revoke, or a role change. An owner's set changes on **`create_store` and
+`soft_delete_store`** — mutations of the *store roster*, which touch no row belonging to that
+membership at all. That asymmetry is exactly why a memo is a bad trade: the owner's
+invalidation trigger lives in a service that has no reason to know the resolver exists. If a
+profile ever justifies a memo, it must be keyed on the org's store roster and not on the
+membership, and it needs both hooks and both tests before it is worth anything.
+
+**What §A.4's `store_org_cache` may still hold.** That memo maps `store_pk -> org_pk` and is
+sound for the reason §B.3 gives: a store cannot change organization while it has any business
+row. It says nothing about whether a store is *live* or *reachable*, and it must never be used
+to answer either. Liveness is the resolver's query; reachability is the resolver's branch.
+Keeping those three facts in three places, with the cache holding only the immutable one, is
+what makes the cache safe while the store set is not cached at all.
+
+### I.6 One organization per user — what it removes from this document
+
+A database-engineer is landing Elvis's other ruling (a user belongs to exactly one
+organization) as a live-conditioned unique constraint on `Membership.user`. The structural
+consequence for this design is that **an authenticated user has exactly one organization, so
+there is no current-org selection and no org switcher.** §J.3 lists the specific edits. The two
+that matter:
+
+- `TenantMiddleware` resolves the org with
+  `Membership.objects.select_related("role").get(user=request.user)` — `.get()`, not a session
+  key and not a `.filter().first()`. `MultipleObjectsReturned` from that call is a violated
+  database constraint, so it must surface as a 500 and an audit row, never be quietly resolved
+  by picking one. `DoesNotExist` means no context, which is the anonymous path.
+- The `/o/<org-slug>/…` alternative §E.4 rejects loses one of its two arguments (a multi-org
+  user could address an org they were not currently in). The surviving argument — the slug is
+  mutable and user-chosen and would leak the org name into referrers — is sufficient on its
+  own, and the org still does not appear in URLs.
+
+### I.7 The denial matrix and its canonical fixture
+
+The matrix Elvis is working from encodes this ruling exactly, so it becomes the canonical
+fixture for the generated matrix of §D.6. Every future endpoint is tested against it.
+
+**Fixture — `tests/conftest.py::tenancy_matrix`, function-scoped:**
+
+| | |
+| --- | --- |
+| Organizations | **A**, **B** |
+| Stores | **A1**, **A2** in org A; **B1** in org B |
+| Roles in A | `Nyiricyubahiro` — holds `store.access_all` (the *real* owner role, deliberately not named "Owner") · `Manager` — no `store.access_all` · `Owner` — a **decoy**, `permissions=[sale.record]` only |
+| Roles in B | `Owner` — holds `store.access_all` |
+| Rows | one row of every registered store-scoped model in each of A1, A2, B1 |
+
+**Actors:**
+
+| Actor | Membership | Role | `StoreAccess` |
+| --- | --- | --- | --- |
+| `a_owner` | org A | `Nyiricyubahiro` (has `store.access_all`) | **none** (§I.4) |
+| `a1_manager` | org A | `Manager` | A1 only |
+| `a_decoy` | org A | `Owner` (name only, no code) | A1 only |
+| `b_owner` | org B | `Owner` (has `store.access_all`) | none |
+| *anonymous* | — | — | — |
+
+**The matrix:**
+
+| Actor | Target | Expected | Which layer refuses |
+| --- | --- | --- | --- |
+| `a_owner` | A1 row | 200 | resolver: `access_all` branch includes A1 |
+| `a_owner` | A2 row | **200** | resolver: `access_all` branch includes A2 — *this row is the ruling* |
+| `a1_manager` | A1 row | 200 | resolver: live `StoreAccess` row |
+| `a1_manager` | A2 row | 404 | `require_store` → `StoreNotPermitted` |
+| `a1_manager` | write to A2 | 404 | the same gate, before the write is built |
+| `a_decoy` | A1 row | 200 | resolver: live `StoreAccess` row |
+| `a_decoy` | A2 row | **404** | resolver: the role is *named* "Owner" and holds no code |
+| `b_owner` | A1 row | 404 | resolver (A1 is not in org B) **and** independently RLS |
+| *anonymous* | any | 401 | authentication, before any resolver runs |
+
+Elvis's matrix has four actors. **`a_decoy` is my one addition and it is not optional:** it is
+the only row that proves the check is not name-based, which is the specific vulnerability the
+constraint was issued against. Naming the real owner role `Nyiricyubahiro` costs nothing and
+makes the same point from the other side — the name is arbitrary, and a matrix that names the
+powerful role "Owner" would pass under a name-based implementation.
+
+Deliberately **not** in the fixture: a Seller. Manager and Seller differ on the *permission*
+axis, which `require_permission` owns and which has its own tests. Adding one here would
+dilute a matrix whose subject is the store axis. Say so in the fixture's docstring, or someone
+will add it as thoroughness.
+
+**404, never 403 — and the two ways to get that wrong.**
+
+1. `StoreNotPermitted` **must not** subclass `django.core.exceptions.PermissionDenied`.
+   Django's default handler renders that as 403, and a 403 confirms the row exists, which turns
+   the override's complement into an existence oracle across sibling stores. It is a plain
+   `Exception` in the service layer — the service layer must not import HTTP concerns
+   (ADR 0007 keeps a DRF path open), so the translation lives in exactly one place, a
+   `process_exception` hook in `common/middleware.py`.
+2. The 404 must be **byte-identical** to a 404 for a row that does not exist. Same template,
+   same headers. For an HTMX fragment it is a genuine 404 and not an `HX-Redirect` — the row
+   really is not there, so there is nothing to redirect to.
+
+**Denials are audited, under the actor's own organization.** `b_owner` reaching for A1 is a
+security event worth recording, and it is recorded under org **B**. Recording it under A would
+be one tenant writing into another's audit trail — a cross-tenant write, which RLS refuses
+anyway, so the code would fail loudly at the worst moment.
+
+### I.8 What this does to `security-engineer`'s central finding
+
+The threat model's conclusion is *"Inside an organization, RLS is blind and the
+application-layer guards are the entire defence."* The owner override is an in-org
+authorization decision, so it sits entirely inside that blind spot. Plainly:
+
+> **If `permitted_stores()` has a bug, every store in that one organization becomes readable
+> and writable by every member of it, and nothing below the Python layer will stop it.** RLS
+> checks the organization and the organization is correct. The composite foreign key checks
+> the organization and the organization is correct. The store predicate the query carries is
+> the one the buggy function produced, and the query layer's job is to enforce that predicate,
+> not to second-guess it. The blast radius is one organization, entirely — every store, reads
+> and writes — and the only thing that can detect it is a test.
+
+Three bounds on that sentence, so it is not read as worse or better than it is:
+
+- **It is not cross-tenant.** A bug here cannot show org A's rows to org B. The org predicate
+  comes from `tenant()` and from RLS, never from this function, and `permitted_stores()`
+  refuses a membership whose org disagrees with the active context (§I.1).
+- **It is one function, in one module, with one branch.** That is the whole argument for
+  putting it there: the override cannot be partially implemented, and a diff touching it is
+  visible in review. Compare the rejected alternative, where the answer is spread across
+  `create_store`'s fan-out, `soft_delete_store`'s retraction and every reader of
+  `orgs_storeaccess`.
+- **It changes the severity of an existing finding.** `PRESETS["Manager"]` holds
+  `member.manage` without `role.manage`, so a Manager can move a member — including themselves
+  — into the owner role. That role now carries `store.access_all`, so the escalation's payoff
+  rises from "reshape roles within my own store set" to "read and write every store in the
+  organization". ADR 0011's rule 3 (exhaustive presets + `common.E009`) stops the *code* from
+  reaching Manager by accident; it does **not** close this path. Routed to
+  `security-engineer` as a separate ruling, and named here so nobody assumes it was handled.
+
+**What I owe the threat model in return:** the sentence above, verbatim, belongs in its §7
+beside the finding it extends, because §7 currently describes the store dimension as "a manager
+seeing another branch of their own company — serious, a denial test, not a breach". With the
+override in place the reachable set for a *single* resolver bug is the whole organization rather
+than one sibling branch, so the severity of that row rises even though its classification
+(intra-tenant) does not.
+
+### I.9 The catalog change, and the trap in `PRESETS`
+
+```python
+STORE_ACCESS_ALL = "store.access_all"
+
+PERMISSION_LABELS = {
+    ...,
+    STORE_ACCESS_ALL: _("Access every store in the organization"),
+}
+```
+
+**Then stop, because adding it to the catalog grants it to Manager.** Today:
+
+```python
+PRESETS = {
+    "Owner": PERMISSIONS,
+    "Manager": PERMISSIONS - {ROLE_MANAGE, STORE_MANAGE},
+    "Seller": frozenset({SALE_RECORD}),
+}
+```
+
+Manager is defined **subtractively**, so `store.access_all` lands in it automatically and the
+matrix row `a1_manager → A2 → 404` fails on the day the code is introduced. This is the same
+shape as the recorded `PRESETS["Manager"]` self-promotion hazard: a subtractive definition
+nobody re-reads when the catalog grows.
+
+**Fix the cause, not the instance.** Every preset becomes an explicit `frozenset` with its
+codes written out, and `common.E010` fails startup unless every code in `PERMISSIONS` appears
+in at least one preset or in a declared `UNASSIGNED: frozenset[str]`. Adding a code then cannot
+be committed green without someone deciding, per preset, in writing. `Owner` may stay
+`PERMISSIONS` — Owner genuinely is everything, and the check confirms it rather than assuming
+it. Numbering: the schema plan takes `common.E007` and `E008`, `E100` is taken, and §D.2's
+surviving `org`-FK check takes `E009`, so this is `E010`.
+
+`Role.has()` needs **no change** — it already tests catalog membership, so an unknown or
+removed code is `False`, which is the correct failure direction for an override.
+
+`store.access_all` is granted by editing a role, which requires `role.manage`. It appears in
+the role editor as an ordinary checkbox, which is the point of choosing a code: it is
+data-driven, revocable, and visible where every other permission is.
+
+**And the axis rule, because it is worth more than the code itself:** `store.access_all` widens
+**reach** and grants no **rights**. An owner reaching store A2 still needs `sale.record` to
+record a sale there. Which stores (this resolver) and which actions (`Role.has`) are orthogonal,
+which is why `require_store_permission()` exists as one call — a view that passes one gate and
+not the other is a bug, and the combined helper makes that bug hard to write.
+
+### I.10 How this is tested
+
+- The generated matrix of §D.6 gains the fixture and rows of §I.7. It is **generated from the
+  model registry**, so a model added in slice 2 acquires the owner-override rows without
+  anyone remembering.
+- **Mutation evidence is required, not optional**, to the standard §A.6 sets: delete the
+  `access_all` branch and show `a_owner → A2` go from 200 to 404; invert it to a
+  `role.name == "Owner"` check and show `a_decoy → A2` go from 404 to 200 and
+  `a_owner → A2` from 200 to 404. That second pair is the evidence that the name-based
+  implementation is a vulnerability, measured rather than asserted.
+- Every "returns nothing" assertion is preceded by proving the row *is* returned under the
+  correct actor, per this slice's most expensive lesson. `a_decoy → A2 → 404` is worthless
+  without `a_decoy → A1 → 200` beside it.
+- The revocation test soft-deletes a `StoreAccess` row **mid-request** and asserts the next
+  gate call in the same request refuses. That is the test that would fail if anyone adds a
+  memo, which is how §I.5's ruling stays enforced rather than remembered.
+- Query counts from §I.3's table are asserted with `assertNumQueries`, both branches. They are
+  the acceptance criterion for "the owner path adds no query", and they go red if
+  `TenantMiddleware` loses its `select_related("role")`.
+
+---
+
+## J. Revision 2 — corrections to §A–§H
+
+Revision 1 was written before three controller arbitrations, two Elvis rulings and the platform
+bump landed. Every statement it now gets wrong is listed here with its replacement, because a
+64 KB document with a stale paragraph in the middle is how a documented control that does not
+exist gets believed. Where the correction is short, it has been applied in place and is
+recorded here as well.
+
+### J.1 §A.5 — the `for_store()` "leak" was overstated (controller arbitration 4)
+
+Revision 1 said `for_store(<a rival's store id>)` "compiles today and returns the rival's
+rows", framed as a hole `for_stores()` did not have. **That framing is wrong and was corrected
+by execution.** `for_stores([rival_pk])` returns the rival's rows too. Neither primitive
+authorizes a store against a caller, and neither is supposed to: `for_stores()` refuses a set
+*spanning* two organizations and refuses *unknown* ids, and a single-store set from one rival
+organization has nothing to be compared against. That is correct behaviour for a scoping
+primitive. An implementer chasing a leak here would find nothing, which is the worst kind of
+task.
+
+**The genuine residue is a diagnostic asymmetry.** An unknown store id raises `ValueError`
+from `for_stores()` and returns **silently empty** from `for_store()`. A query that looks
+scoped and returns nothing is exactly how scoping bugs hide — which is `_store_pk`'s own
+docstring's argument about `None`, applied one level up. Routing `for_store()` through
+`resolve_scope()` makes both spellings raise on an unknown id. Keep the change; change its
+justification. It buys a consistent diagnostic and, via §A.4's memo and instance fast path, a
+cheaper pin — not a closed leak.
+
+And the authorization question revision 1 had no answer for now has one: **§I owns it.**
+`require_store()` turns a URL identifier into a `Store` the actor may reach, or a 404. Store
+ids from request data never reach `for_store()`. The pin's job is to enforce a scope, not to
+decide one.
+
+### J.2 §E — PostgreSQL 18.6 is confirmed, so the fallback branch is dead; and `public_id` wins
+
+Verified in this stack: Python 3.14.7, Django 6.1, PostgreSQL 18.0006,
+`supports_uuid7_function = True`, `supports_virtual_generated_columns = True`, 369 tests green.
+
+**§E.2 is withdrawn.** Its case for a Python default rested chiefly on decoupling the
+identifier from an unverified PG18 bump (reason 1) and on `db_default`'s interaction with
+`validate_unique()` (reason 2). Reason 1 no longer exists. Reason 2 is real but small: the field
+is `editable=False` and appears in no `ModelForm`, so the wasted `WHERE public_id = UUIDV7()`
+lookup is reachable only from a hand-written `full_clean()`, and on PG18 it is a wasted query
+rather than an error. Against that, the database-engineer's schema plan measured the write cost
+of `db_default=UUID7()` directly and established that `Field.db_returning` makes the value
+available after `create()` on the same `INSERT ... RETURNING` — no extra round trip. Measured
+evidence beats my reasoning.
+
+**Adopt the schema plan's shape**, which is also the reason to name it once and stop:
+
+| Revision 1 (§E, ADR 0010) | Revision 2 — settled |
+| --- | --- |
+| field `uuid` | field **`public_id`**, base **`PublicIdModel`** |
+| `default=uuid.uuid7` (Python) | **`db_default=UUID7()`** |
+| named `UniqueConstraint` in `Meta` | **`unique=True`**, with the matching E005 exemption |
+| revision 1's `common.E007` = field shape, `E008` = constraint present | **both withdrawn** (§D.2). The schema plan's numbering stands: **`E007`** = org-leading index rule, **`E008`** = every first-party model has a `public_id`. Free ids go to **`E009`** (`org` FK on store-scoped models) and **`E010`** (`PRESETS` exhaustiveness, §I.9) |
+| the org column is `organization` / `organization_id` | **`org` / `org_id`** (controller arbitration 2 — four already-pinned `RunSQL` statements contain `REFERENCES orgs_store (id, org_id)`) |
+| `store_org_fk_v1(table)` | **`same_org_fk_v1(table)`** |
+| §D.4's index check `common.E010` | **`common.E007`**, same rule |
+
+**These renames were applied in place**, not left to a lookup table 1400 lines away — a rename
+table is not a mechanism, and a spec that names the wrong field produces code that names the
+wrong field. The table above is the record of what changed and why, so a reader holding
+revision 1 can reconcile it. Two paragraphs that revision 1 wrote *against* the schema plan's
+shape are kept under a withdrawal banner rather than deleted (§E.2, §G item 2): the arguments
+were sound on the information available and it was evidence that reversed them, which is worth
+more on the record than a clean-looking document.
+
+**The one residual worth keeping from §E.2, as a rule with a test:** with `db_default`, an
+**unsaved** instance's `public_id` is a `DatabaseDefault` sentinel, not a UUID. In a
+template-rendered HTMX app that builds fragments for not-yet-saved objects, that would render
+as an expression object into a DOM id. Rule: never put an unsaved object's `public_id` in a
+template. `create()` populates it, so the reachable window is narrow and a single test on a
+fragment rendered from an unsaved instance pins it.
+
+**§F step 9 changes from a gate to a fact.** It said "step 9 gates nothing" and "if the devops
+verification concludes against PG18, nothing in this design changes". The verification
+concluded *for* PG18 and has already landed, so step 9 is done and `UUID7()` is available to
+step 1. There is no fallback branch to carry.
+
+**ADR 0010 needs a one-paragraph amendment** and I have not made it, because the `uuid` versus
+`public_id` choice is a controller arbitration between two proposed documents rather than mine
+to settle unilaterally. Exactly what changes: the field name to `public_id`, the base to
+`PublicIdModel`, `UUIDField(default=uuid.uuid7, editable=False)` to
+`UUIDField(db_default=UUID7(), editable=False, unique=True)`, the `UniqueConstraint`/no-index
+paragraph to the `unique=True` paragraph, and `common.E007`/`E008` to the schema plan's
+numbering. The ADR's *decision* — a time-ordered public identifier separate from the bigint pk,
+the pk never leaving the process, no org in URLs — is unaffected.
+
+### J.3 §C.3 and §B.5 — one organization per user
+
+Elvis's ruling (a user belongs to exactly one organization), landing as
+`orgs_membership_unique_live_user` — a live-conditioned unique constraint on `Membership.user`
+alone, with the existing `orgs_membership_unique_live_user_per_org` retained for its distinct
+error message — removes work from §C rather than adding it. The join table stays, so allowing
+multi-org later is a `RemoveConstraint` rather than a data migration; that reversal path is the
+database-engineer's and it is why nothing below turns the org into a field on `User`.
+
+**§C.3, request path — replace the org-resolution rules with:**
+
+- anonymous request → no context, unchanged.
+- authenticated request → `Membership.objects.select_related("role").get(user=request.user)`.
+  One query, cached on `request.tenant`, re-read every request so a revoked membership drops
+  the context on the next one. `select_related("role")` is now **required**, not an
+  optimisation: §I.3's query budget depends on it.
+- `DoesNotExist` → no context (an authenticated user with no live membership; the registration
+  and invite-acceptance flows are where that state is legitimate).
+- `MultipleObjectsReturned` → a **violated database constraint**, therefore a bug. It must
+  surface as a 500 with an audit row, never be resolved by picking one membership. A
+  `.filter().first()` here would convert a constraint violation into a silent arbitrary choice
+  of tenant, which is the worst available failure.
+- **Delete:** "the org comes from `request.session`", "a user with exactly one membership needs
+  no session key" (now the only case), and "switching org is a POST that writes the session".
+  There is no current-org selection, no session key and no org switcher. Nothing in the session
+  participates in tenant resolution.
+
+**§B.5 — the stated reason `accounts_user` gets no RLS policy is now wrong.** Revision 1 said
+"one user may hold memberships in several organizations". That is no longer true. The real and
+surviving reason: **username, email and phone are unique installation-wide, and the
+multi-identifier auth backend must resolve an identifier to a user *before* any organization is
+known.** At that point there is no tenant key to write a policy on. The compensating controls
+are unchanged and already built: the non-enumerating backend, per-identifier and per-IP
+throttling, uniform error responses.
+
+**§E.4 — the rejected `/o/<org-slug>/…` alternative** loses its second argument (a multi-org
+user could address an org they were not currently in). The first — the slug is mutable,
+user-chosen, and leaks the organization's name into referrers, proxy logs and shared links —
+stands alone. The org still does not appear in URLs, and the conclusion is unchanged.
+
+**One consequence outside this document, flagged for its owner:** the privacy ruling's §4 case
+*"members who belong to another org keep their account and lose only this membership"* cannot
+arise, which simplifies `erase_org`. That is `privacy-compliance`'s document, not mine.
+
+### J.4 §C.5 and ADR 0009 — `ENABLE` without `FORCE` (controller arbitration 1)
+
+Revision 1 ended §C.5 with *"Every table `ENABLE`d must also be `FORCE`d"*, and reasoned from
+PostgreSQL semantics while flagging that it had not verified. **The security-engineer measured
+the opposite and the controller arbitrated for the measurement:** `FORCE ROW LEVEL SECURITY`
+combined with `BYPASSRLS` is self-cancelling, and removing `BYPASSRLS` from the migration role
+makes data-migration backfills silently no-op — a much more expensive failure than the one
+`FORCE` was meant to prevent. **Adopt `ENABLE` without `FORCE`.**
+
+The acceptance test is unchanged and is what actually matters: not "the policy exists in
+`pg_policies`", but "a read as `raporo_app` with the wrong context returns nothing while the
+same read with the right context returns the row". The role split remains a hard prerequisite
+(§G item 1 stands, and three agents arrived at it independently).
+
+**ADR 0009 contains the same error** — *"every table is `ENABLE`d **and** `FORCE`d"* in its
+Decision section — and I have not edited it here, because my file scope for this revision is
+this document and ADR 0011. The replacement clause is: *"every table is `ENABLE`d; `FORCE` is
+deliberately not used, because `FORCE` plus `BYPASSRLS` is self-cancelling and dropping
+`BYPASSRLS` from the migration role makes backfills silently no-op."* One clause, one file.
+
+### J.5 §D.6 — the matrix now has a canonical fixture
+
+§D.6's design (generated from the registry, `TENANCY_FACTORIES` premise test, allowed cases
+listed alongside refusals, every emptiness assertion preceded by a positive one) is unchanged
+and needed. What it lacked was a fixture. **§I.7 is that fixture and it is canonical** — two
+organizations, three stores, five actors including the decoy — and every future endpoint is
+tested against it. Add to §D.6's shapes list: the owner-override rows, and the two mutations of
+§I.10.
+
+### J.6 What revision 2 does **not** change
+
+Stated so the diff is not read as wider than it is. §A.1–A.4 and A.6–A.10 (the `ScopePin`
+value object, the resolver, the merge algebra, the write-path fills, `_derive_org`, the
+not-removed list); §B.1–B.4 and B.6 (the RLS/application split, the argument against
+store-level RLS — which §I.3 now reinforces from the pin's side, the composite FK, the
+`get_compiler` cross-check, the security-engineer handoffs); §C.1, C.2, C.4, C.6, C.7
+(`tenant()` as the single door, `SET LOCAL` and its source-scan test, fail-closed in two
+layers, the registration carve-out, the GUC namespace rules); §D.1–D.5; §E.1 and E.3–E.6
+modulo the renames of J.2; §F's ordering; §G's two push-backs, of which item 1 (the role split
+is a prerequisite) has since been confirmed by three independent arrivals.
+
+### J.7 Self-review of revision 2
+
+- **Placeholders:** none. `permitted_stores`, `StoreSet`, `require_store`,
+  `require_store_permission`, `set_membership_role`, `STORE_ACCESS_ALL`, `common.E010`,
+  `StoreNotPermitted`, `NoPermittedStores` and `tests/conftest.py::tenancy_matrix` are each
+  specified with their module, name and signature.
+- **Contradictions hunted deliberately**, since the point of §J is that revision 1 acquired
+  some: the `StoreAccess` docstring (§I.0, §I.4), the `for_store()` framing (§J.1), the `uuid`
+  versus `public_id` names (§J.2), multi-org in §C.3 and §B.5 (§J.3), `FORCE` in §C.5 and
+  ADR 0009 (§J.4). §I.5's "no cache" and §A.4's `store_org_cache` are not a contradiction and
+  §I.5 says why in its last paragraph: the cache holds the one immutable fact, and liveness and
+  reachability are never read from it.
+- **One addition beyond what was asked, flagged as such:** `a_decoy` in the canonical fixture
+  (§I.7). Elvis specified four actors; the fifth is the only row that proves the check is not
+  name-based, which is the vulnerability the constraint was issued against.
+- **One thing I am changing that nobody asked me to, flagged for the tech-lead:** `PRESETS`
+  must stop being defined subtractively (§I.9). This is not tidiness — with the catalog
+  addition and `PRESETS` as written, `a1_manager → A2 → 404` fails on day one, so the
+  exhaustive presets and `common.E010` are part of this change's minimum, not a follow-up.
+- **Left to other roles, with the constraint stated:** the `Membership.user` constraint and its
+  interaction with the now-implied per-org one (database-engineer); the raised severity of the
+  `member.manage`-without-`role.manage` escalation path and the §7 amendment of the threat model
+  (security-engineer); the ADR 0009 `FORCE` clause and the ADR 0010 naming amendment
+  (controller arbitration); the `erase_org` simplification (privacy-compliance).
+- **Not verified by me, and it should be before this ships:** that `Role.has()` returns `False`
+  for `store.access_all` when the code is absent from `PERMISSIONS` — i.e. that the catalog
+  gate in `has()` fails in the safe direction for an *override* code and not just for a
+  *grant* code. It reads correct (`code in PERMISSIONS and code in set(self.permissions)`), but
+  per this slice's own standard, reading is not evidence.

@@ -55,6 +55,60 @@ secret to manage and rotate, and a decoding step in every request, to obtain wha
 for free. **Routing on `Organization.slug`** — mutable, released on soft delete, and it puts the
 tenant's name in every URL.
 
+## Amendment, 2026-09-02 — the field is `public_id`, and the Python default stands
+
+Two documents disagreed. This ADR proposed `uuid` on `IdentifiedModel` with a Python default;
+`docs/superpowers/specs/2026-09-02-schema-hardening-plan.md` independently proposed `public_id`
+on `PublicIdModel` with `db_default=UUID7()`. Both were Proposed, and an architect reconciling
+them adopted the schema plan wholesale. The controller split the question instead, because the
+two halves have different answers:
+
+**Naming — the schema plan wins. The field is `public_id`, the base is `PublicIdModel`.**
+`public_id` says what the column is *for*; `uuid` says what type it happens to be, and a model
+attribute named `uuid` shadows the standard-library module inside every method that would want
+to call `uuid.uuid7()`. Rename applied wherever this ADR said `uuid`.
+
+**Mechanism — this ADR wins. The Python default stands; `db_default=UUID7()` stays rejected.**
+The rejection reasoning above was traced rather than measured, so the controller verified it
+against the installed Django 6.1:
+
+```
+Model.clean_fields               skips DatabaseDefault: True
+Model.validate_unique            skips DatabaseDefault: False
+Model._get_unique_checks         skips DatabaseDefault: False
+Model._perform_unique_checks     skips DatabaseDefault: False
+Model.validate_constraints       skips DatabaseDefault: False
+UniqueConstraint.validate        skips DatabaseDefault: False
+```
+
+Only `clean_fields` skips the sentinel. Every uniqueness path does not — so on an unsaved
+instance `full_clean()` would put a `DatabaseDefault` into a `WHERE` clause rather than a
+value. That is the defect this ADR predicted, and it is real on the version we run. PostgreSQL
+18 landing (it has: `supports_uuid7_function` is `True`) removes the *availability* objection
+and leaves this one untouched.
+
+**Uniqueness shape — `unique=True` on the field, not a named `UniqueConstraint`.** The
+arbitration above split naming from mechanism and left a third question untouched, which the
+implementer surfaced: this ADR specified
+`UniqueConstraint(fields=["public_id"], name="%(app_label)s_%(class)s_public_id_uniq")` while the
+schema plan specified `unique=True`. The ADR's stated reason for the named constraint was that an
+operator reads the name out of an error — and that reason is answered, because PostgreSQL names the
+implicit index itself. Measured on a deliberately-populated table:
+
+```
+django.db.utils.IntegrityError: could not create unique index "orgs_organization_public_id_key"
+DETAIL:  Key (public_id)=(01a06292-4ca6-719d-a88d-9a92eefd427b) is duplicated.
+```
+
+`<table>_public_id_key` is a perfectly readable name, so the named constraint buys nothing and costs
+a second valid shape for the same rule. `common.E005` now treats a `Meta` constraint on `public_id`
+as an error, so there is exactly one way to declare the surrogate.
+
+The revisit condition in Consequences stands unchanged: `db_default=UUID7()` may be added
+*alongside* the Python default once the uniqueness paths handle the sentinel, since Django
+prefers the Python default when both are set. Additive, and it buys only the raw-SQL insert
+path — which nothing in this codebase uses.
+
 ## Consequences
 
 Easier: no enumeration surface in any URL; a stable identifier that survives soft delete, so a

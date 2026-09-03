@@ -227,6 +227,12 @@ CLAUDE.local.md
 .claude/projects/
 .claude/todos/
 .claude/statsig/
+# Per-agent git worktrees. The standing rule is that no two parallel agents
+# share a checkout, so a parallel round creates linked worktrees in here. They
+# are scratch: a linked worktree holds a `.git` *file*, so `git add -A` will
+# happily stage its contents into the very commit the isolation existed to keep
+# clean. Two stray-file incidents in slice 1 came in through this shape.
+.claude/worktrees/
 
 # Uploaded files. MEDIA_ROOT now lives outside the repo (settings/base.py);
 # this stays as a backstop in case someone points it back in here.

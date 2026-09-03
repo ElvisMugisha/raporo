@@ -774,3 +774,100 @@ Task 5 dependency recorded: the multi-identifier auth backend must run the *logi
 `POSTGRES_USER` and `POSTGRES_PASSWORD` stay exactly as they are — they are now only the postgres image's bootstrap superuser, and renaming them would break every existing volume.
 
 **Routed forward from Track B:** widen `common.E101` to assert `raporo_app` holds no UPDATE/DELETE on `audit_auditlog` and no INSERT/UPDATE/DELETE/TRUNCATE on `django_migrations` (phase 2 is a step, and steps get skipped — this is what makes a skipped one loud at boot rather than at the tampering incident) · `grant_runtime_privileges` has **no test**, deliberately, because adding one would have moved a pinned suite count; the RLS task owes it four assertions · **`test_raporo` gets no grants** — phase 2 runs against the `migrator` alias, harmless today because the suite is the owner, but the moment an `as_tenant` fixture does `SET LOCAL ROLE raporo_app` it will hit `permission denied for table` rather than a policy · `GRANT raporo_app TO raporo_owner` deliberately deferred to whoever writes that fixture, with the test that proves the fixture changes `current_user` · docs owe the three variables, the two-phase model and the existing-volume upgrade command · residual, dev only: the `.:/app` bind mount puts `.env` (including the superuser password) inside the web container — pre-existing, absent from any deployed image.
+
+## Session 7 — finishing slice 1: orientation, document alignment, question round (2026-09-03)
+
+Controller re-verified the claimed state by execution rather than reading it. **First run: 162 passed, 412 errors**, every one `FATAL: password authentication failed for user "raporo_owner"` — the default project's `pgdata` volume predates the role split, exactly the case Session 6 documented. Ran the documented upgrade path rather than wiping, which also re-verifies the path Elvis needs on another machine:
+
+    docker compose exec db /docker-entrypoint-initdb.d/10-raporo-roles.sh   # phase 1
+    docker compose up -d --wait                                            # migrate + phase 2 as owner
+
+Then, all by execution: **574 passed in 25.47s** · ruff clean · `manage.py check` no issues (0 silenced) · `makemigrations --check --dry-run` clean under **both** dev and test · `python -m pytest --version | grep -c entrypoint:` → 0 · `/healthz` 200 · Python 3.14.7 / Django 6.1 / PostgreSQL 18.0006.
+
+**Backup and restore rehearsed for the first time** — it is in the definition of production-grade and the ledger had never recorded it. `pg_dump` as `raporo_backup` → rc=0, 90 kB. As `raporo_app` → refused (`failed to get data for sequence …; user may lack SELECT privilege`), re-confirming the threat model's measurement from the other side. `pg_restore` into a **fresh** database as `raporo_owner` → rc=0 clean: 16 tables, 26 migrations, both triggers, `raporo_append_only()`, and all four composite keys back with `condeferrable=t, condeferred=f`. **Then watched the restored guard refuse:** `UPDATE` → `relation public.audit_auditlog is append-only: UPDATE is not permitted`, `DELETE` → same, row byte-intact after both. Restore-over-an-existing-database re-confirmed unsupported (by accident — a first attempt restored twice and produced "already exists" for every object).
+
+### Disagreements between the documents and the machine. The machine wins.
+
+- **`9a697c3`'s subject claims "RLS scaffolding" and it does not exist.** Measured: `pg_policies` → **0 rows**, no table has `relrowsecurity`, `raporo_current_org_id()` absent, the only `raporo*` function is `raporo_append_only`. The `org` column on `StoreScopedModel` is absent (fields are exactly `public_id, created_at, updated_at, created_by, updated_by, deleted_at, deleted_by, store`). Session 5b flagged this in prose; now confirmed by execution. Only the identifiers were real.
+- ROADMAP 📍NOW said 369 tests; it is 574. It also omits phone canonicalisation, `public_id`, the role split and the platform bump — all landed.
+- `docs/DEVELOPMENT.md:245` "python:3.13-slim". Slice-1 plan `:9`, `:126`, `:149` and **`:595`/`:607`** — the latter prescribe the unwritten CI workflow against `postgres:17`, so whoever writes it silently un-tests `UUID7()`.
+- **`StoreScopedModel` still has zero concrete subclasses in the production apps** (measured). §0's scheduling gift is intact; the `org` column is still free.
+
+### Three findings no document names
+
+1. **`Store` has no `timezone` field** — only `Organization` has one. So "a store whose timezone differs from its org's" is unrepresentable and the prescribed test cannot be written.
+2. **`GRANT raporo_app TO raporo_owner` is absent** (zero `raporo*` rows in `pg_auth_members`), so `SET ROLE raporo_app` cannot work and the first RLS fixture hits *permission denied for table* rather than a policy — a vacuous pass in the other direction.
+3. **`PRESETS["Manager"]` already grants two codes nobody decided.** Measured: Manager holds 10 of 12 including `audit.view` and `sale.below_floor_override`, both arriving by subtraction. ADR 0011's hazard is not hypothetical — it is already realised, before `store.access_all` is even added.
+
+Ruling: `.claude/worktrees/` added to `.gitignore`. A linked worktree holds a `.git` *file*, so `git add -A` stages its contents into the very commit the isolation existed to keep clean; two stray-file incidents in this slice came in through that shape. Cost if wrong: none.
+
+Ruling: run Phase 1's document authors and Phase 2's question-gatherers **concurrently**, so Elvis gets one approval stop rather than two. The gate ("no code before approval") is unaffected — none of the six writes code. Cost if wrong: the question batch is assembled against documents still being written; mitigated because the questions come from the code and the specs, not from the new documents.
+
+Ruling: only the `architect` gets a `git worktree`; it is the sole writer this round (two brand-new files nothing else touches). The other five were dispatched read-only into the main checkout with per-role scratchpad subdirectories. The standing rule's purpose is met by disjoint ownership plus a single writer. Cost if wrong: one agent's edits collide; nothing else can write. **Held.** Three agents independently reported `git status --porcelain` at start and finish and every diff was accounted for — `data-reporting-engineer` correctly attributed `docs/PRD.md` to a sibling by mtime and `.gitignore` to the controller.
+
+### Documents produced
+
+`docs/PRD.md` — 664 lines, `product-owner`. Every relative link resolves; verified. It found **ten places where `docs/PRODUCT.md` contradicts a later ruling** — three of which (the floor rule, whether `base_currency` is editable, whether org-mandated 2FA is v1) are Elvis's to decide rather than corrections to make silently, so the `PRODUCT.md` reconciliation is held pending his answers.
+
+### The question round: 46 questions from five gates, and one arbitration
+
+**Controller error, recorded:** the partitioning arbitration was first sent to `data-reporting-engineer` instead of `privacy-compliance`. It **refused it correctly** — *"an overrule acknowledged by a gate that never prescribed the mechanism"* is what the standing rule exists to prevent — and then contributed an eighth independent argument from its own lane. The misroute produced value; that is luck, not process.
+
+**Arbitration: `database-engineer` overruled `privacy-compliance`'s range-partitioning prescription. Overrule upheld, and acknowledged by the prescribing gate.** Controller independently reproduced the two load-bearing measurements in a throwaway PG 18.6 database:
+
+    UNIQUE (public_id)     -> ERROR: unique constraint on partitioned table must include
+                                     all partitioning columns / lacks column "at"
+    UNIQUE (public_id, at) -> accepted, NOT global: the same UUID inserted into the 2026
+                              and 2027 partitions, copies=2
+    t_row   (tgtype 27)    -> propagates to parent AND every partition
+    t_trunc (tgtype 34)    -> parent ONLY
+    TRUNCATE p_audit       -> refused ; TRUNCATE p_audit_2026 -> TRUNCATE TABLE, 0 rows left
+
+So partitioning would break ADR 0010's "immutable, never reissued" for `AuditLog` and punch a per-partition TRUNCATE hole closable only by a yearly manual step — the phase-1-silent-no-op failure mode again. `data-reporting-engineer` added that the partition boundary's timezone is set by a **session GUC at migration-apply time** (identical DDL gave `+00` and `+02` in two sessions), that a Rwandan year does not fit a UTC partition so `DROP` would destroy records **early**, and that pruning does not occur when the period key is `business_date` and the partition key is `at` (`Append` over 4 partitions vs `Index Scan` on 1).
+
+`privacy-compliance` **accepted without reservation**, stating its prescription was "reasoned, not measured" and naming this the fourth such overrule this slice. It weighted two measurements above the ORM ones, both in its own lane: the per-partition RLS gap is *a cross-tenant disclosure manufactured by a control whose entire purpose was data protection*, and it observed that its retention mechanism would have destabilised its own erasure mechanism, since erasure-by-referent depends on the pointer stability partitioning removes.
+
+**And the loop produced a better answer than either gate alone.** `database-engineer`'s replacement (`CREATE_APPEND_ONLY_FUNCTION_V2`, `DELETE` permitted only under a GUC and past a ten-year floor) carried a defect privacy caught: `at < now() - interval '10 years'` is **wrong in the dangerous direction**, because Rwanda's ten years runs from 1 January following the fiscal year — a March 2026 row is protected to 31 December 2036, and that floor would license deleting it nine months inside the statutory window. Corrected property: `extract(year from at) <= extract(year from now()) - 11`. Standing rule attached: **the direction of error is over-retention** — over-retaining by under twelve months is de minimis, under-retaining destroys a customer's tax evidence during an audit window. Ten-year figure graded Medium-High, to be confirmed with a Rwandan tax adviser before it is hard-coded; the formula assumes a calendar fiscal year.
+
+**Constraint loosened:** privacy's R3 deadline ("before slice 2's four ledger tables") **evaporates** — it existed only because partition cost multiplied across five tables. V2 is one reusable trigger plus one migration, so sequencing becomes `database-engineer`'s convenience.
+
+Ruling: `common.E0xx` codes allocated once, by `database-engineer`, because three documents had claimed overlapping numbers (`E007`/`E008` twice, `E009`/`E010` differently again) and someone would have implemented two of the same rule. `E007` org column · `E008` org-leading index · `E009` `public_id` · `E101` runtime identity (settings-only) · `E200` erasure plan. `E102` withdrawn as E101 renamed.
+
+Ruling routed for arbitration, not yet settled: **ADR 0008's derivation rule is wrong for reads.** `database-engineer`'s R2 measured that if `org_id` is derived *from the store*, the org predicate is tautological and a store id belonging to another organization quietly re-scopes the query to the attacker's target. The org must come from the tenant context on reads and from the store only on writes, where the composite FK then proves it. One-org-per-user makes that free. ADR 0008 states one rule and uses it for both paths; the controller owes it an amendment.
+
+### Live defects measured this session, none previously recorded
+
+- **A user can hold live memberships in two organizations.** Watched it happen: a second `Membership.objects.create()` in another org was **accepted**, `count() == 2`. One-org-per-user is prose only, and Tasks 4 and 7 are about to be written against the opposite assumption.
+- **`SECURE_SSL_REDIRECT = True` with `SECURE_PROXY_SSL_HEADER = None`** in prod settings — behind a TLS-terminating proxy that is an infinite redirect loop, i.e. a total outage on the first deploy, not a degradation.
+- **`CACHES` is Django's unconfigured `LocMemCache`** — per-process, so any cache-backed throttle multiplies every limit by the worker count and a lockout is bypassable by landing on another worker.
+- **`AuditLog.ip` cannot hold the value OD1 prescribes.** `GenericIPAddressField` rejects `196.12.34.0/24` (*Enter a valid IPv4 or IPv6 address*), so the only storable value is a masked address with the mask width discarded — indistinguishable from a host address. `security-engineer` and `privacy-compliance` reached this independently, by different routes; in this ledger independent convergence has been the best predictor that a finding is real. Free to reshape today at zero rows.
+- **`validate_timezone` accepts non-deterministic zones.** Measured: `localtime` ACCEPTED (resolves to the host's `/etc/localtime`), `Factory` ACCEPTED, `Etc/GMT+5` ACCEPTED with utcoffset **−05:00**, while `Africa/Asmera` and `US/Pacific` — real aliases — are rejected. And the accepted set is scanned from the filesystem: **486 keys in the container against 498 on another read**, so validation is not deterministic across environments.
+- **`Organization.timezone` has zero readers** in `apps/`, `common/` or `config/` — the only references anywhere are three assertions in `tests/test_orgs_models.py`. With `TIME_ZONE = "UTC"`, Django compiles UTC into every date query: measured, `filter(at__date=...)` returned 300 where Kigali truth was 500. **8.33% of every day falls on a different UTC date than its Kigali date**, and at the 15th→16th transition those minutes land in the wrong biweekly half.
+- **`django.contrib.admin` is routed and reachable** — `config/urls.py:11`, `admin:index` → `/admin/`, and there is only one URLconf, so it would serve in production. Exposure is narrow today (the registry holds exactly `auth.Group`; no `admin.py` exists anywhere) but `LogEntry.object_repr` is `str(obj)` = the username, in a table covered by no erasure plan and by no `audit.record`. `django_admin_log` exists, 0 rows.
+- **The `_id` suffix carve-out in audit redaction launders identity documents.** Measured against the shipped `_redact`: `national_id` (the Rwandan *Indangamuntu*), `nid`, `passport_number`, `iban`, `card_number`, `msisdn`, `momo_number`, `whatsapp` and `photo` all stored **verbatim**, while `email` and `password` correctly redact and `customer_id` is correctly kept. Not reachable in slice 1 — no such field exists — and must close before `Invite` (Task 7) or `Customer` (slice 2).
+
+### Elvis's four rulings (2026-09-03) — the forks the gates could not default
+
+**Ruling 1 — a row's period comes from a user-settable business date.** `at` stays the recording instant, `timestamptz`, never user-settable, kept for audit and the sales list. **`business_date`** is a plain `DATE` in the org's timezone, defaulting to the local date of `at`, settable within a bounded window (current period plus the previous until close, then behind a permission). **Every period query filters on `business_date`.** This was the one decision on the list that could not be fixed cheaply later, and it resolves a contradiction that was invisible because neither side existed: `PRODUCT.md` promises end-of-day batch entry *and* "import of historical sales, any age", both of which contradict "period = recording time".
+
+Consequences, all of which land on work not yet done:
+- **The schema plan's six §D.5 indexes are wrong as specified.** They lead on `at DESC`; they must lead on `business_date`. Measured by `data-reporting-engineer`: a half-open predicate on the indexed column is `Index Scan`, 30 buffers; the same period computed from a *different* column is `Bitmap Heap Scan`, 1,700 buffers with 65,639 rows discarded — ~57x the I/O for the identical answer. Correctness and performance point the same way. Routed to `database-engineer`.
+- A new permission code (`sale.backdate`) and a bounded window are part of the same change, and **a future business date is refused always** — it silently inflates a period that has not happened.
+- Reserved but not yet needed: which rate applies to a backdated foreign payment. Answered by Ruling 1's shape — the rate is entered at record time and frozen, because v1 has no historical rate table. The question becomes live only when auto-fetch lands.
+
+**Ruling 2 — one timezone per organization, enforced. `Store.timezone` is NOT added.** This settles the only inter-gate conflict of the round: `database-engineer` wanted a nullable `Store.timezone` meaning inherit; `data-reporting-engineer` wanted the constraint enforced. Elvis took the constraint.
+
+The deciding measurement, `data-reporting-engineer`, two stores at Kigali +02:00 and Nairobi +03:00:
+
+    H1  org-in-one-tz  700.00    sum-of-store-tz   300.00
+    H2  org-in-one-tz  800.00    sum-of-store-tz  1200.00
+
+Neither column is arithmetically wrong, and there is no third answer: with per-store zones a consolidated report either picks one zone (making the store rows wrong) or sums store-local periods (making the total not a period). `PRODUCT.md` promises a consolidated cross-store report, and a report whose parts do not sum to its own total is not a report.
+
+Consequence, and it retires an item in the controller's brief. The brief asked for a test of "a store whose timezone differs from its org's". Under this ruling that divergence is **unrepresentable, and the absence of the column is the enforcement** — there is no validation to write and nothing to watch refuse, and saying otherwise would be a control that sounds like a mechanism and is not one. What the ruling does earn is a **structural test**, in the shape of the existing "no store-scoped model declares `org`" test: assert `Store` declares no timezone field, with the 700/300 measurement recorded as the reason, so a future author who adds one has to read why first. Separately, `Organization.timezone` must acquire its first real reader — measured today, it has **zero** in `apps/`, `common/` and `config/`.
+
+Cost if wrong: adding `Store.timezone` later is one nullable column plus a documented consolidation footnote. Cheap, and deliberately kept cheap.
+
+**Ruling 3 — production hosts in Rwanda.** Removes Law 058/2021 Arts 48 and 50 from the critical path for the database and the media directory, which together hold 100% of the personal data. **Does not remove:** the NCSA registration, the named DPO and the DPA annex (still a launch blocker, still a 6–10 week clock, and the 2021 law's transition expired 15 October 2023 so no grace period remains); a written processor contract with the host; and an email provider abroad, which remains its own Art 48 transfer to declare. `privacy-compliance` had corrected its own earlier position here — its original "document the route and apply" understated the law, because **Art 50 requires a registration certificate that expressly authorises offshore storage**, not a generic one.
+
+**Ruling 4 — the report carries `Sales` and `Received` as two numbers, never added.** `Sales` = sum of sale line values, dated by the sale. `Received` = sum of payments in, dated by the payment. This resolves a live contradiction between two committed documents: `PRODUCT.md` says *"revenue = money actually received"* while `PROJECT-DESCRIPTION.md` says a deposit *"counts in the day's sales"*. Both are now true of different, differently-named lines. The sample reports already keep a `SALES` section and a `PAYMENT` section apart, so the app stops merging what the paper separates, and the credit book stays reconcilable against period revenue. Cost if wrong: two report lines where one was expected; the alternative was two screens showing two different totals both labelled "sales", which is the defect class that makes an owner stop trusting the tool.

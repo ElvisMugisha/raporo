@@ -19,9 +19,14 @@ Product code plus a fully portable AI-team setup. Everything the team needs — 
 **Advisory on demand:** `tech-writer` (docs, runbooks) · `craft-editor` (de-AI-ifies all prose) · `localization-engineer` (i18n) · `privacy-compliance` (Rwanda Law 058/2021).
 Design-skill lanes are routed inside each agent (see `.claude/skills/VENDORED.md`).
 
-## Where are we? (read first)
+## Where are we? (read first, in this order)
 
-`docs/ROADMAP.md` is the living tracker — phases, slices, statuses, and the 📍NOW line. Read it before starting work; update statuses in the same change that lands the work.
+1. `docs/ROADMAP.md` — the living tracker: phases, slices, statuses, the 📍NOW line. Update statuses in the same change that lands the work.
+2. `docs/ARCHITECTURE-ESSENTIALS.md` — **under 150 lines, read it in full before writing code.** An index of the load-bearing decisions with verdicts. Every claim is marked BUILT or DESIGNED; **DESIGNED means no code exists — do not rely on it.**
+3. `docs/PRD.md` — what we are building, for whom, the acceptance criteria, and what v1 explicitly does not do.
+4. Then, only as needed: `docs/ARCHITECTURE.md` (the full picture, ~1200 lines), `docs/adr/` (eleven ADRs — **0008–0011 and every Amendment section correct earlier text**), `docs/superpowers/specs/` (five design documents), and `docs/superpowers/slice-1-workspace/LEDGER.md` (every ruling with its cost-if-wrong).
+
+**A claim in a document is a hypothesis. Verify by execution.** Four controls in slice 1 were present, correctly named, documented, and never executed. A guard is unverified until you have watched it refuse something, and a grep is a presence check, not verification.
 
 ## Workflows (skills in `.claude/skills/`)
 
@@ -54,8 +59,12 @@ Built-in `/code-review` and `/security-review` cover review — no extra plugins
 - Headroom (token-compression proxy) is installed per-machine by `scripts/setup.sh`; see `docs/SETUP.md`.
 - Machine-local overrides go in `.claude/settings.local.json` and `CLAUDE.local.md` (both gitignored) — never in the shared files.
 
-## Stack (ADR 0006)
+## Stack (ADR 0006; versions measured 2026-09-03)
 
+- **Python 3.14.7 · Django 6.1 · PostgreSQL 18.** `uuid.uuid7()` and virtual `GeneratedField` are both available and confirmed.
+- **The database has three roles, and this is load-bearing.** `raporo_app` serves requests (owns nothing, no `TRUNCATE`, no write on the audit trail or on `django_migrations`); `raporo_owner` runs `migrate` via the `migrator` alias; `raporo_backup` is the `pg_dump` identity (`pg_dump` as `raporo_app` fails). Identity is chosen by **connection alias**, never by a mutable setting. `dbshell` connects as `raporo_app` deliberately — a plan taken as the owner is not the plan production runs.
+- **`.env` needs three secrets agents cannot write** (`Read(./.env*)` is denied): `RAPORO_APP_PASSWORD`, `RAPORO_MIGRATE_PASSWORD`, `RAPORO_BACKUP_PASSWORD`. If compose refuses to interpolate, that is why. On a database volume that predates the role split: `docker compose exec db /docker-entrypoint-initdb.d/10-raporo-roles.sh` then `docker compose up -d --wait`.
+- **Never edit a `_V1` SQL constant** — add `_V2` plus a new migration. `tests/test_db_stability.py` hashes every `RunSQL` statement in every migration, so a guard migration cannot be committed green.
 - Backend: Python, **Django 6.1 (non-negotiable)**. Use 6.1's new features deliberately; every package must support it; otherwise latest stable. DRF only when a real API consumer (mobile/integration) exists — see ADR 0007.
 - Data: PostgreSQL. Redis + Celery/beat only once a real async/scheduled need exists.
 - Frontend: **Django templates + HTMX** (ADR 0007 — supersedes the earlier React choice; React/DRF-SPA references anywhere are stale). Server-rendered pages, HTMX fragment swaps, no JS framework, no Node build. Business logic lives in a **service layer** (views thin) so DRF endpoints can be added when a mobile app/API consumer becomes real. Explain anything new to Elvis in plain language.

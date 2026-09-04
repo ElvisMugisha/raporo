@@ -271,12 +271,19 @@ does ([ADR 0010](adr/0010-uuidv7-public-identifiers.md)).
 These are the words the business already uses. They are the report's vocabulary, not a
 translation of ours.
 
-| Term | Meaning | Raporo concept |
-| --- | --- | --- |
-| **Igishoro** | Capital; the money that bought the goods. | Cost basis / cost of goods |
-| **Igishoro cy'ibyacurujwe** | The cost of what was sold. | Cost of goods sold (COGS) |
-| **Inyungu** | Profit. | Gross profit |
-| **Inyungu y'ibyacurujwe** | The profit on what was sold. | Profit for the period or cycle |
+**The disambiguation rule, and it is load-bearing.** Bare `igishoro` and bare `inyungu` mean the
+whole-of-business or whole-of-cycle sense. The **qualified** forms — `igishoro cy'ibyacurujwe`,
+`inyungu y'ibyacurujwe`, literally "…of what was sold" — mean the period-scoped sense. This is
+already how the sample reports write it, and it is the only thing standing between an owner and
+two documents showing different `inyungu` for the same money in the same week. **A report never
+prints a bare form for a period figure, and never prints a qualified form for a cycle figure.**
+
+| Term | Meaning (Elvis, 2026-09-03) | English | French | Raporo concept |
+| --- | --- | --- | --- | --- |
+| **Igishoro** | The money or assets you start a business with — the initial investment used to generate more wealth. | Capital / Investment / Seed money | Capital / Fonds de commerce | Capital contributed; a cycle's invested amount |
+| **Igishoro cy'ibyacurujwe** | The igishoro of what was sold. | Cost of goods sold | Coût des marchandises vendues | COGS for the period |
+| **Inyungu** | The financial gain after selling a product or running a business — revenue minus expenses. | Profit / Benefit | Profit / Bénéfice | Profit, cycle-to-date |
+| **Inyungu y'ibyacurujwe** | The inyungu on what was sold. | Profit on goods sold | Bénéfice sur les ventes | Profit for the period |
 | **Amafaranga yarangujwe** | Money invested. | Capital contributed to a cycle |
 | **Amafaranga yacurujwe** | Money taken from goods sold. | Revenue |
 | **REST** | What is still in stock — capital still working. | Closing stock and its value |
@@ -643,7 +650,10 @@ Each has a recommended default. Work proceeds on the default until Elvis says ot
 10. **Are investors data subjects in their own right?** They become so the moment they get a
     login (privacy ruling OD3). *Recommend:* records inside the organization for v1, read-only
     investor login deferred, and the investor's own report delivered by the owner.
-11. **Do target users need RRA electronic billing (EBM) receipts?** Nobody has decided, and it
+11. ~~**What do `igishoro` and `inyungu` mean, and how are the two senses kept apart?**~~
+    **Answered (Elvis, 2026-09-03)** — see the glossary above. Bare form = cycle sense,
+    `…cy'/y'ibyacurujwe` = period sense.
+12. **Do target users need RRA electronic billing (EBM) receipts?** Nobody has decided, and it
     is the kind of obligation a VAT-registered trader will ask about on day one. *Recommend:*
     out of v1, and ask two real traders whether they issue EBM receipts today before deciding
     whether it belongs in the roadmap at all.

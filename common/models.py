@@ -6,10 +6,12 @@ migrations. The concrete models in `apps/*` inherit these and their own
 migrations carry the columns.
 
 This module is also where the column *names* the system checks reason about
-live (`ORG_FIELD`, `PUBLIC_ID_FIELD`, and the sets built from them). They sit
-next to the bases that declare the columns so that changing the rule in
-`common/checks.py` means changing the base, and not maintaining a second
-spelling of the same fact.
+are published (`ORG_FIELD`, `PUBLIC_ID_FIELD`, and the sets built from them).
+They sit next to the bases that declare the columns so that changing the rule
+in `common/checks.py` means changing the base, and not maintaining a second
+spelling of the same fact. `ORG_FIELD` itself is defined one module earlier, in
+`common/managers.py`, because the write guards there stamp the same column and
+the import direction is `managers <- models <- checks`.
 """
 
 import uuid
@@ -19,6 +21,10 @@ from django.db import models
 from django.utils.translation import gettext_lazy as _
 
 from common.managers import (
+    ORG_ATTNAME,
+    ORG_FIELD,
+    ORG_LABEL,
+    STORE_ATTNAME,
     STORE_FIELD,
     AllObjectsManager,
     CrossStoreReferenceError,
@@ -29,20 +35,19 @@ from common.managers import (
     soft_delete_values,
 )
 
-#: The organization pointer. Named here, next to the bases, because
-#: `common.checks` classifies unique constraints by the column names they
-#: reference and must not have its own spelling of the tenant columns. The
-#: column itself arrives on `StoreScopedModel` in step 2 of the
-#: tenancy-hardening sequence; `orgs` and `audit` already carry it.
-ORG_FIELD = "org"
+#: The organization pointer, re-exported here because `common.checks` reads the
+#: tenant column names from this module and must not keep a second spelling of
+#: them. The definition itself lives in `common/managers.py`, one step earlier
+#: in the import order (`managers <- models <- checks`), because the write
+#: guards there reason about the same column.
 
 #: The surrogate identifier that crosses the process boundary (ADR 0010).
 PUBLIC_ID_FIELD = "public_id"
 
 #: A unique constraint on a store-scoped table has to name at least one of
 #: these, or it is enforced across every tenant.
-ORG_COLUMNS = frozenset({ORG_FIELD, f"{ORG_FIELD}_id"})
-STORE_COLUMNS = frozenset({STORE_FIELD, f"{STORE_FIELD}_id"})
+ORG_COLUMNS = frozenset({ORG_FIELD, ORG_ATTNAME})
+STORE_COLUMNS = frozenset({STORE_FIELD, STORE_ATTNAME})
 TENANT_COLUMNS = ORG_COLUMNS | STORE_COLUMNS
 
 #: The one column whose uniqueness is deliberately global and unconditional.
@@ -224,8 +229,24 @@ class StoreScopedModel(SoftDeleteModel, AuditedModel):
     `save()` refuses a row whose store-scoped foreign keys point into another
     store, so a form that accepts a raw `<related>_id` cannot be walked into
     someone else's data.
+
+    `org` is denormalised alongside `store` so that PostgreSQL itself can refuse
+    a row whose two tenant columns disagree, through the composite key
+    `(store_id, org_id) -> orgs_store (id, org_id)` that every concrete table's
+    migration installs (`common.db.same_org_fk_v1`). It is derived from `store`,
+    never asked for, and `common.E007` fails startup for a subclass that loses
+    the column or re-declares it in a weaker shape.
     """
 
+    org = models.ForeignKey(
+        ORG_LABEL,
+        verbose_name=_("organization"),
+        on_delete=models.PROTECT,
+        related_name="+",
+        editable=False,
+        db_index=False,
+        db_constraint=False,
+    )
     store = models.ForeignKey(
         "orgs.Store",
         verbose_name=_("store"),
@@ -242,8 +263,81 @@ class StoreScopedModel(SoftDeleteModel, AuditedModel):
         default_manager_name = "all_objects"
 
     def save(self, **kwargs):
+        self._derive_org()
         self._assert_related_stores_match(kwargs.get("update_fields"))
         return super().save(**kwargs)
+
+    def clean_fields(self, exclude=None):
+        """Derive `org` before per-field validation.
+
+        Measured on Django 6.1: `Model.clean_fields()` does *not* skip
+        `editable=False` fields, so without this `full_clean()` reports a
+        non-null `org` as missing on a perfectly valid store + name pair. The
+        same bug was found and fixed once already, on `StoreAccess`.
+        """
+        self._derive_org()
+        super().clean_fields(exclude=exclude)
+
+    def _derive_org(self) -> None:
+        """`org` follows `store`. It is never asked for, and never guessed.
+
+        Three sources, and the order is the point:
+
+        1. **already set** - by `ScopedQuerySet._org_for_write` from the pin, or
+           by `bulk_create`. Free, and consistent by construction: the pin's org
+           and its stores came out of one read.
+        2. **a cached `store` instance** - free, because the instance carries
+           `org_id`. `Model(store=<store>)` and `obj.store = <store>` both leave
+           one cached, which is every ordinary create.
+        3. **one `SELECT org_id FROM orgs_store WHERE id = %s`** - and only when
+           `org_id` is still unknown, so an ordinary `save()` of an existing row
+           costs nothing.
+
+        Where two sources are both known and disagree, this raises rather than
+        picking one: `obj.store = <another organization's store>; obj.save()` is
+        an attempt to move a business row between tenants, and it should say so
+        in Python, not arrive as a foreign-key violation.
+
+        Where the value is only *asserted* - `org_id` set with no cached store,
+        which no sanctioned write path produces - the composite foreign key is
+        the backstop, and a wrong value surfaces as an `IntegrityError` naming
+        `<table>_store_same_org_fk`. Verifying it here instead would put a query
+        on every single save to catch a case only hand-written code can reach.
+        """
+        if self.store_id is None:
+            # No store to derive from; the NOT NULL constraint will speak.
+            return
+        store_field = self._meta.get_field(STORE_FIELD)
+        cached = store_field.get_cached_value(self, default=None)
+        from_store = None
+        if (
+            cached is not None
+            and cached.pk == self.store_id
+            and ORG_ATTNAME not in cached.get_deferred_fields()
+        ):
+            from_store = getattr(cached, ORG_ATTNAME, None)
+        if from_store is None and self.org_id is None:
+            from_store = (
+                store_field.related_model.all_objects.filter(pk=self.store_id)
+                # `Store.Meta.ordering` would otherwise add an ORDER BY that
+                # this single-row lookup never consumes.
+                .order_by()
+                .values_list(ORG_ATTNAME, flat=True)
+                .first()
+            )
+        if from_store is None:
+            # Unknown store, or a deferred/absent org on the cached instance.
+            # The foreign key on `store_id` will refuse a row that does not
+            # exist; there is nothing to derive from either way.
+            return
+        if self.org_id is not None and self.org_id != from_store:
+            raise CrossStoreReferenceError(
+                f"{type(self).__name__}: store {self.store_id} belongs to "
+                f"organization {from_store}, but this row carries organization "
+                f"{self.org_id}. `{ORG_FIELD}` is derived from `{STORE_FIELD}`; "
+                f"moving a row between organizations is not an operation."
+            )
+        self.org_id = from_store
 
     def _assert_related_stores_match(self, only_fields=None):
         """Every store-scoped row this one points at must live in its store.
@@ -300,10 +394,14 @@ class StoreScopedModel(SoftDeleteModel, AuditedModel):
 
 __all__ = [
     "IDENTITY_COLUMNS",
+    "ORG_ATTNAME",
     "ORG_COLUMNS",
     "ORG_FIELD",
+    "ORG_LABEL",
     "PUBLIC_ID_FIELD",
+    "STORE_ATTNAME",
     "STORE_COLUMNS",
+    "STORE_FIELD",
     "TENANT_COLUMNS",
     "AuditedModel",
     "PublicIdModel",

@@ -7,9 +7,10 @@ weakened, not merely if a helper is renamed.
 import pytest
 from django.apps import apps
 from django.core.exceptions import FieldError, ValidationError
-from django.db import models
+from django.db import connection, models
+from django.test.utils import CaptureQueriesContext
 
-from apps.orgs.models import Store
+from apps.orgs.models import Organization, Store
 from common.managers import (
     CrossStoreReferenceError,
     HardDeleteForbidden,
@@ -124,19 +125,53 @@ def test_audited_actor_fields_are_optional_but_protected(db, actor):
 # --------------------------------------------------------------------------
 
 
-def test_no_store_scoped_model_carries_its_own_org_pointer(db):
-    """Business data reaches its org through Store.org and nowhere else.
+def test_every_store_scoped_model_carries_its_org_pointer(db):
+    """The inverse of what this test used to assert, and the inversion is the
+    change: business data now carries `org` *as well as* `store`, so PostgreSQL
+    itself can refuse a row whose two tenant columns disagree.
 
-    A second path (an `org` column on a store-scoped table) is a second thing to
-    keep in step, and the one that will drift.
+    A second column is a second thing to keep in step, and this is what keeps
+    it in step: the column is declared once on the base, derived from `store`
+    and never asked for, and the composite key
+    `(store_id, org_id) -> orgs_store (id, org_id)` refuses any row where the
+    two disagree - including from `psql`. `common.E007` fails startup for a
+    subclass that weakens the shape; this asserts the shape itself.
     """
-    offenders = []
-    for model in apps.get_models():
-        if not issubclass(model, StoreScopedModel) or model._meta.abstract:
-            continue
-        for field in model._meta.concrete_fields:
-            if field.name in {"org", "organization"}:
-                offenders.append(f"{model._meta.label}.{field.name}")
+    scoped = [
+        model
+        for model in apps.get_models()
+        if issubclass(model, StoreScopedModel) and not model._meta.abstract
+    ]
+
+    # Premise: an enumeration that found nothing must fail, not pass.
+    assert len(scoped) >= 5, [model._meta.label for model in scoped]
+
+    for model in scoped:
+        field = model._meta.get_field("org")
+        assert field.related_model is Organization, model._meta.label
+        assert field.null is False, model._meta.label
+        assert field.editable is False, model._meta.label
+        assert field.remote_field.hidden is True, model._meta.label
+        assert field.db_constraint is False, model._meta.label
+        assert field.db_index is False, model._meta.label
+        # Not "declared by the base": Django copies an abstract base's fields
+        # into every child's `local_fields`, so there is nothing here to tell
+        # inheritance from a re-declaration - and nothing that needs telling.
+        # `common.E007` enforces the *shape*, which is the invariant; a
+        # re-declaration that matches it byte for byte harms nothing.
+
+
+def test_no_model_anywhere_spells_the_tenancy_column_organization(db):
+    """One spelling, because four shipped SHA-256-pinned `RunSQL` statements
+    contain the literal `REFERENCES orgs_store (id, org_id)` and cannot be
+    edited. Two spellings would mean composite keys whose two sides name the
+    same concept differently."""
+    offenders = [
+        f"{model._meta.label}.{field.name}"
+        for model in apps.get_models()
+        for field in model._meta.local_fields
+        if field.name == "organization"
+    ]
 
     assert offenders == []
 
@@ -636,6 +671,33 @@ def test_the_base_manager_cannot_hard_delete_either(db, actor, store):
     assert Thing.all_objects.count() == 1
 
 
+def test_raw_delete_is_forbidden_too(db, actor, store, org):
+    """The third deletion seam, which had no test at all.
+
+    `QuerySet._raw_delete` is not an internal Django calls on our behalf and
+    nothing else: it is a public-in-practice method that issues one real
+    `DELETE` with no collector, no signals and no cascade. MEASURED with the
+    refusal replaced by `super()._raw_delete(using)`: the whole suite still
+    reported 1538 passed while the call hard-deleted a store-scoped row
+    (`all_objects.count()` went to 0) and an `Organization` row. The module
+    docstring promises "`delete()` is refused on instances and on every
+    queryset"; its two siblings are tested and this one was the way past both.
+
+    Both a store-scoped model and `Organization` (org-level, and the row every
+    tenant guard resolves against) because they reach the queryset class by
+    different managers.
+    """
+    ScopedThing.objects.create(store=store, name="a")
+
+    with pytest.raises(HardDeleteForbidden):
+        ScopedThing.all_objects.all()._raw_delete("default")
+    with pytest.raises(HardDeleteForbidden):
+        Organization.all_objects.filter(pk=org.pk)._raw_delete("default")
+
+    assert ScopedThing.all_objects.count() == 1
+    assert Organization.all_objects.filter(pk=org.pk).exists()
+
+
 def test_all_objects_still_sees_retired_rows(db, actor):
     thing = Thing.objects.create(name="a", created_by=actor)
     thing.soft_delete(by=actor)
@@ -987,28 +1049,92 @@ def test_the_union_override_still_passes_djangos_keyword_through(
 def test_merging_a_pin_with_itself_costs_no_query(
     one_row_per_store, store, django_assert_num_queries
 ):
-    """Building a queryset must not hit the database.
-
-    Every merge re-resolves ownership against `orgs_store`, which is what makes
-    `for_store(A) | for_store(RIVAL)` a synonym for the `for_stores([A, RIVAL])`
-    that is refused - but a merge of one store set with itself adds no store, so
-    there is nothing to resolve and `qs = a | a` stays lazy.
-    """
+    """Building a queryset must not hit the database."""
     with django_assert_num_queries(0):
         ScopedThing.objects.for_store(store) | ScopedThing.objects.for_store(store)
 
 
-def test_widening_a_pin_still_resolves_ownership(
+def test_no_combinator_costs_a_query(
     one_row_per_store, store, other_store, django_assert_num_queries
 ):
-    """The counterpart: a merge that adds a store pays for the check that keeps
-    the two stores in one organization."""
-    with django_assert_num_queries(1):
-        merged = ScopedThing.objects.for_store(store) | ScopedThing.objects.for_store(
-            other_store
-        )
+    """The acceptance criterion for the `ScopePin` refactor.
 
-    assert set(merged.query.store_scope_pks) == {store.pk, other_store.pk}
+    A *widening* merge used to re-resolve ownership against `orgs_store`, which
+    is what made `for_store(A) | for_store(RIVAL)` refuse like the
+    `for_stores([A, RIVAL])` it is a synonym for. It still refuses - the pin now
+    carries the organization each leg was proven to be inside, so the merge
+    compares two integers instead of asking the database again. Nothing is
+    weakened: the union of two sets each inside one organization is inside one
+    organization, and each leg's "unknown store id" check already ran when that
+    leg was pinned.
+
+    Measured before this change: widening `|` 1 query, narrowing `&` 1 query,
+    `for_stores([a, b])` 1 query. All three are 0 below.
+    """
+    left = ScopedThing.objects.for_store(store)
+    right = ScopedThing.objects.for_store(other_store)
+    both = ScopedThing.objects.for_stores([store, other_store])
+
+    for name, build in {
+        "widening |": lambda: left | right,
+        "widening ^": lambda: left ^ right,
+        "narrowing &": lambda: both & right,
+        "union()": lambda: left.union(right),
+        "intersection()": lambda: both.intersection(right),
+        "difference()": lambda: both.difference(right),
+    }.items():
+        with django_assert_num_queries(0, info=name):
+            build()
+
+
+def test_a_pin_built_from_store_instances_costs_no_query(
+    db, store, other_store, django_assert_num_queries
+):
+    """A `Store` that came out of the database already had its ownership
+    resolved by the query that produced it. `for_stores()` used to re-read
+    `orgs_store` anyway - one query per pin, on every request."""
+    with django_assert_num_queries(0):
+        ScopedThing.objects.for_store(store)
+    with django_assert_num_queries(0):
+        ScopedThing.objects.for_stores([store, other_store])
+
+
+def test_a_pin_built_from_bare_primary_keys_resolves_ownership(
+    db, store, other_store, django_assert_num_queries
+):
+    """The deliberate cost, and what it buys.
+
+    A bare integer carries no organization, so the pin has to read one - and
+    that read is also what makes an unknown store id *raise* from `for_store()`
+    instead of returning a queryset that looks scoped and quietly matches
+    nothing. `for_store(<int>)` was 0 queries and silently empty before; it is 1
+    query and a `ValueError` now. Production callers hold a `Store` from
+    `require_store()`, so the hot path is the test above.
+    """
+    with django_assert_num_queries(1):
+        ScopedThing.objects.for_store(store.pk)
+    with django_assert_num_queries(1):
+        ScopedThing.objects.for_stores([store.pk, other_store.pk])
+
+
+def test_for_store_refuses_an_unknown_store_id_instead_of_matching_nothing(db, store):
+    """The asymmetry this refactor removes: the two spellings now fail alike."""
+    with pytest.raises(ValueError) as exc:
+        ScopedThing.objects.for_store(store.pk + 10_000)
+
+    # And it names the function the author actually called.
+    assert "for_store()" in str(exc.value)
+
+
+def test_pin_resolution_does_not_drag_in_stores_default_ordering(db, store, other_store):
+    """A measured papercut: `Store.Meta.ordering` leaked into a `values_list`
+    that never consumes order, so every pin resolution asked PostgreSQL to sort
+    `orgs_store` by name."""
+    with CaptureQueriesContext(connection) as captured:
+        ScopedThing.objects.for_stores([store.pk, other_store.pk])
+
+    assert len(captured) == 1  # premise: the resolving query really ran
+    assert "ORDER BY" not in captured.captured_queries[0]["sql"]
 
 
 def test_intersection_narrows_its_pin_exactly_like_and(
@@ -1059,6 +1185,29 @@ def test_union_and_difference_keep_the_wider_pin(one_row_per_store, store, other
 def test_for_stores_refuses_a_mixed_organization_set(db, store, foreign_store):
     with pytest.raises(CrossStoreReferenceError):
         ScopedThing.objects.for_stores([store, foreign_store])
+
+
+@pytest.mark.parametrize("spelling", ["instances", "ids", "mixed"])
+def test_for_stores_refuses_a_mixed_set_however_it_is_spelled(
+    db, store, foreign_store, spelling
+):
+    """Two code paths since the `ScopePin` refactor, and both must refuse.
+
+    A set of saved `Store` instances is resolved from the instances themselves
+    (no query); anything with a bare id in it goes to the database. A guard on
+    only one of those is a guard on whichever spelling the author happened not
+    to use.
+    """
+    stores = {
+        "instances": [store, foreign_store],
+        "ids": [store.pk, foreign_store.pk],
+        "mixed": [store, foreign_store.pk],
+    }[spelling]
+
+    with pytest.raises(CrossStoreReferenceError) as exc:
+        ScopedThing.objects.for_stores(stores)
+
+    assert "may never span organizations" in str(exc.value)
 
 
 def test_for_stores_refuses_unknown_store_ids(db, store):

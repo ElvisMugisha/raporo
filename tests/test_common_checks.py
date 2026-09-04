@@ -4,12 +4,14 @@ Each rogue model below is a shape a slice-2 author could plausibly write. The
 checks have to reject them at startup, because none of them fails a query.
 """
 
+import importlib
 import uuid
 
 import pytest
 from django.apps import apps as global_apps
 from django.conf import settings as django_settings
 from django.core.checks import Error, Tags, run_checks
+from django.core.exceptions import ImproperlyConfigured
 from django.core.management import call_command
 from django.core.management.base import SystemCheckError
 from django.db import connection, models
@@ -741,6 +743,326 @@ def test_an_org_level_model_pointing_at_a_store_scoped_model_is_rejected():
 
 
 # --------------------------------------------------------------------------
+# E007 - the denormalised `org` pointer, and the one spelling of it
+#
+# The column is what the composite key `(store_id, org_id) -> orgs_store (id,
+# org_id)` references, so every way of weakening it disarms the only guard a
+# data migration or a psql session cannot forget. Each rogue below is a change
+# a slice-2 author could plausibly make for a good-sounding local reason.
+# --------------------------------------------------------------------------
+
+
+@isolate_apps("tests.testapp")
+def test_a_model_that_removes_the_org_column_is_rejected():
+    """The most direct disarm, and Django permits it: a field inherited from an
+    *abstract* base can be removed by setting the name to None. Measured -
+    `org = None` is not a FieldError, it is a table with no organization
+    pointer and therefore no composite key."""
+
+    class NoOrg(StoreScopedModel):
+        org = None
+
+        class Meta:
+            app_label = "testapp"
+
+    errors = audit_store_scoped_models([NoOrg])
+
+    assert "common.E007" in ids(errors)
+    assert any("same_org_fk" in error.msg for error in errors)
+
+
+@isolate_apps("tests.testapp")
+def test_a_model_that_makes_the_org_optional_is_rejected():
+    """Nullable is not a weaker guarantee, it is *no* guarantee: PostgreSQL
+    MATCH SIMPLE skips a composite foreign key entirely when either column is
+    NULL."""
+
+    class OptionalOrg(StoreScopedModel):
+        org = models.ForeignKey(
+            "orgs.Organization",
+            null=True,
+            on_delete=models.PROTECT,
+            related_name="+",
+            editable=False,
+            db_index=False,
+            db_constraint=False,
+        )
+
+        class Meta:
+            app_label = "testapp"
+
+    errors = audit_store_scoped_models([OptionalOrg])
+
+    assert "common.E007" in ids(errors)
+    assert any("MATCH SIMPLE" in error.msg for error in errors)
+
+
+@isolate_apps("tests.testapp")
+def test_a_model_that_makes_the_org_editable_is_rejected():
+    class EditableOrg(StoreScopedModel):
+        org = models.ForeignKey(
+            "orgs.Organization",
+            on_delete=models.PROTECT,
+            related_name="+",
+            db_index=False,
+            db_constraint=False,
+        )
+
+        class Meta:
+            app_label = "testapp"
+
+    assert "common.E007" in ids(audit_store_scoped_models([EditableOrg]))
+
+
+@isolate_apps("tests.testapp")
+def test_a_model_that_adds_a_real_foreign_key_on_org_is_rejected():
+    """`db_constraint=True` guarantees nothing the composite key does not, and
+    takes `FOR KEY SHARE` on the organization row for every insert into every
+    store-scoped table - so `create_store`'s row lock would block every sale in
+    the organization."""
+
+    class RealFkOrg(StoreScopedModel):
+        org = models.ForeignKey(
+            "orgs.Organization",
+            on_delete=models.PROTECT,
+            related_name="+",
+            editable=False,
+            db_index=False,
+        )
+
+        class Meta:
+            app_label = "testapp"
+
+    errors = audit_store_scoped_models([RealFkOrg])
+
+    assert "common.E007" in ids(errors)
+    assert any("db_constraint=True" in error.msg for error in errors)
+
+
+@isolate_apps("tests.testapp")
+def test_a_model_that_indexes_org_on_its_own_is_rejected():
+    """The plausible one: "add an index for the planner". Every index that
+    serves a tenant predicate leads with `org`, so a single-column one is a
+    redundant prefix of all of them and pure write cost."""
+
+    class IndexedOrg(StoreScopedModel):
+        org = models.ForeignKey(
+            "orgs.Organization",
+            on_delete=models.PROTECT,
+            related_name="+",
+            editable=False,
+            db_constraint=False,
+            db_index=True,
+        )
+
+        class Meta:
+            app_label = "testapp"
+
+    assert "common.E007" in ids(audit_store_scoped_models([IndexedOrg]))
+
+
+@isolate_apps("tests.testapp")
+def test_a_model_that_exposes_a_reverse_accessor_from_the_org_is_rejected():
+    """E004 fires here too; E007 repeats it where the column is described,
+    because E004's message is about accessors and this one is about the
+    column."""
+
+    class AccessibleOrg(StoreScopedModel):
+        org = models.ForeignKey(
+            "orgs.Organization",
+            on_delete=models.PROTECT,
+            related_name="things",
+            editable=False,
+            db_index=False,
+            db_constraint=False,
+        )
+
+        class Meta:
+            app_label = "testapp"
+
+    errors = audit_store_scoped_models([AccessibleOrg])
+
+    assert "common.E007" in ids(errors)
+    assert "common.E004" in ids(errors)
+
+
+@isolate_apps("tests.testapp")
+def test_a_model_that_repoints_the_org_fk_is_rejected():
+    class WrongTarget(StoreScopedModel):
+        org = models.ForeignKey(
+            "orgs.Store",
+            on_delete=models.PROTECT,
+            related_name="+",
+            editable=False,
+            db_index=False,
+            db_constraint=False,
+        )
+
+        class Meta:
+            app_label = "testapp"
+
+    assert "common.E007" in ids(audit_store_scoped_models([WrongTarget]))
+
+
+@isolate_apps("tests.testapp")
+def test_a_model_that_spells_the_column_organization_is_rejected():
+    """Not a store-scoped-model rule: `organization` is refused on *any* model,
+    because two spellings mean composite keys whose two sides name the same
+    concept differently - and the short one is frozen inside four shipped,
+    SHA-256-pinned statements."""
+
+    class LongSpelling(SoftDeleteModel, AuditedModel):
+        organization = models.ForeignKey(
+            "orgs.Organization", on_delete=models.PROTECT, related_name="+"
+        )
+
+        class Meta:
+            app_label = "testapp"
+
+    errors = audit_store_scoped_models([LongSpelling])
+
+    # Premise: this model is not store-scoped, so nothing else here looks at it.
+    assert not issubclass(LongSpelling, StoreScopedModel)
+    assert ids(errors) == {"common.E007"}
+
+
+def test_the_real_models_carry_the_org_column_in_the_required_shape():
+    """The other direction, on the models that actually ship: E007 must not
+    fire on the shape `StoreScopedModel` declares, or nobody could boot."""
+    assert [
+        error
+        for error in check_store_scoped_models(None)
+        if error.id == "common.E007"
+    ] == []
+
+
+# --------------------------------------------------------------------------
+# E005, re-verified now that the `org` column exists
+#
+# E005 was built as a *kinded* rule whose classification is purely over the
+# column names a constraint references, so two of its three shapes - the
+# org-rooted `_per_org` key and the `(id, org)` composite-FK target - were
+# unreachable while no store-scoped model had an `org` column: Django's own
+# `models.E012` rejected the constraint first, for naming a field that does not
+# exist. They are reachable now, with no change to `common/checks.py`. That was
+# the claim; these execute it.
+# --------------------------------------------------------------------------
+
+
+@isolate_apps("tests.testapp")
+def test_the_org_column_is_now_inherited_rather_than_declared_per_test():
+    """Premise for everything below: `scoped_with_org()` declares nothing of its
+    own any more, so the shapes it builds are the shapes real models will have.
+    """
+    assert BASE_CARRIES_ORG is True
+
+    model = scoped_with_org(
+        "InheritsOrg",
+        constraints=[
+            models.UniqueConstraint(
+                fields=[ORG_FIELD, "number"],
+                condition=LIVE,
+                name="testapp_inheritsorg_unique_live_number_per_org",
+            )
+        ],
+    )
+    field = model._meta.get_field(ORG_FIELD)
+
+    assert field.editable is False
+    assert field.db_constraint is False
+    assert audit_store_scoped_models([model]) == []
+
+
+@isolate_apps("tests.testapp")
+def test_an_org_rooted_key_over_the_real_column_is_accepted():
+    """Shape 2, now over the inherited column: an invoice number unique across
+    an organization's five shops."""
+
+    class RealInvoice(StoreScopedModel):
+        number = models.CharField(max_length=20)
+
+        class Meta:
+            app_label = "testapp"
+            constraints = [
+                models.UniqueConstraint(
+                    fields=[ORG_FIELD, "number"],
+                    condition=LIVE,
+                    name="testapp_realinvoice_unique_live_number_per_org",
+                )
+            ]
+
+    # Premise: the column is the inherited one, not a local declaration.
+    assert RealInvoice._meta.get_field(ORG_FIELD).db_constraint is False
+    assert audit_store_scoped_models([RealInvoice]) == []
+
+
+@isolate_apps("tests.testapp")
+def test_an_id_org_composite_fk_target_over_the_real_column_is_accepted():
+    """Shape 3, now over the inherited column - and still exempt from the
+    live-rows rule, because PostgreSQL refuses a partial unique index as a
+    foreign-key target."""
+
+    class RealParent(StoreScopedModel):
+        class Meta:
+            app_label = "testapp"
+            constraints = [
+                models.UniqueConstraint(
+                    fields=["id", ORG_FIELD], name="testapp_realparent_id_org_uniq"
+                )
+            ]
+
+    assert audit_store_scoped_models([RealParent]) == []
+
+
+@isolate_apps("tests.testapp")
+def test_a_bare_key_is_still_refused_now_that_the_column_exists():
+    """The relaxation above must not have widened into "anything goes": a
+    constraint naming neither tenant column is still enforced across every
+    tenant, and `full_clean()` would report another tenant's value as taken."""
+
+    class StillGlobal(StoreScopedModel):
+        number = models.CharField(max_length=20)
+
+        class Meta:
+            app_label = "testapp"
+            constraints = [
+                models.UniqueConstraint(
+                    fields=["number"],
+                    condition=LIVE,
+                    name="testapp_stillglobal_unique_live_number",
+                )
+            ]
+
+    errors = audit_store_scoped_models([StillGlobal])
+
+    assert "common.E005" in ids(errors)
+    assert any("every tenant" in error.msg for error in errors)
+
+
+@isolate_apps("tests.testapp")
+def test_an_org_rooted_key_that_does_not_declare_itself_is_still_refused():
+    """The half of shape 2 that is easy to lose in a relaxation: `org` without
+    `store` is organization-wide, and that has to be *declared* in the name,
+    because it is also what a per-store key looks like when `org` was typed by
+    habit."""
+
+    class UndeclaredOrgWide(StoreScopedModel):
+        number = models.CharField(max_length=20)
+
+        class Meta:
+            app_label = "testapp"
+            constraints = [
+                models.UniqueConstraint(
+                    fields=[ORG_FIELD, "number"],
+                    condition=LIVE,
+                    name="testapp_undeclaredorgwide_unique_live_number",
+                )
+            ]
+
+    assert "common.E005" in ids(audit_store_scoped_models([UndeclaredOrgWide]))
+
+
+# --------------------------------------------------------------------------
 # E100 - the pre-boot refusal to run against a `test_`-named database
 #
 # Every test here drives the check *registry*, never the function. That is the
@@ -761,14 +1083,32 @@ def e100_errors(**kwargs) -> list[Error]:
 
 def test_e100_fires_through_the_registry_on_a_test_named_database(db, settings):
     """The suite runs against a database Django named `test_raporo`, so turning
-    the production flag on here *is* the production misconfiguration."""
+    the production flag on here *is* the production misconfiguration.
+
+    One error per offending alias, rather than "exactly one error": how many
+    aliases the test runner has renamed to `test_raporo` depends on which
+    aliases the session has touched (`settings.DATABASES[alias]` and
+    `connections[alias].settings_dict` are the same dict, so setting up the
+    `migrator` alias for a multi-connection test renames it here too). Pinning
+    the count made this test fail because an unrelated test elsewhere in the
+    suite opened a second connection.
+    """
     assert connection.settings_dict["NAME"].startswith("test_")  # premise
+    test_named = [
+        alias
+        for alias, config in settings.DATABASES.items()
+        if str(config.get("NAME") or "").startswith("test_")
+    ]
+    assert test_named  # premise: there is something to report
     settings.ENFORCE_NON_TEST_DATABASE = True
 
     errors = e100_errors()
 
-    assert [error.id for error in errors] == [E100]
-    assert "test_" in errors[0].msg
+    assert [error.id for error in errors] == [E100] * len(test_named)
+    assert all("test_" in error.msg for error in errors)
+    assert {alias for alias in test_named if any(alias in e.msg for e in errors)} == set(
+        test_named
+    )
 
 
 def test_manage_py_check_refuses_to_pass_on_a_test_named_database(db, settings):
@@ -826,3 +1166,177 @@ def test_e100_names_the_offending_alias_and_stays_actionable(db, settings):
     assert "default" in error.msg
     assert connection.settings_dict["NAME"] in error.msg
     assert error.hint
+
+
+# --------------------------------------------------------------------------
+# E101 - SECURE_SSL_REDIRECT with no SECURE_PROXY_SSL_HEADER is a redirect loop
+#
+# Behind a TLS-terminating proxy Django sees `http`, redirects to `https`, and
+# the proxy forwards the retry as `http` again: an infinite loop and a total
+# outage on the first deploy. The production hostname is undecided, so the
+# header's *value* cannot be written down here - the refusal can. Same shape as
+# E100: `Tags.security` (never `Tags.database`, which a bare `manage.py check`
+# drops), pure `settings` inspection, no database connection, and every test
+# below drives `run_checks()` rather than the function, because a direct call is
+# exactly the tautology that shipped E100 inert for two review rounds.
+#
+# The gate is the condition itself: dev and test settings never set
+# `SECURE_SSL_REDIRECT`, so the check is silent in the suite without a second
+# flag to keep in step.
+# --------------------------------------------------------------------------
+
+E101 = "common.E101"
+
+
+def e101_errors(**kwargs) -> list[Error]:
+    """The E101 errors `manage.py check` (no arguments) would report."""
+    return [error for error in run_checks(**kwargs) if error.id == E101]
+
+
+def prod_settings(monkeypatch, **environment):
+    """`config.settings.prod`, re-imported under a controlled environment.
+
+    Reading the real module rather than restating its values is the point: a
+    test that asserted "True and None fail the check" would pass while prod
+    settings said something else entirely.
+    """
+    monkeypatch.setenv("DJANGO_MEDIA_ROOT", "/srv/raporo/media")
+    for name in ("DJANGO_SECURE_PROXY_SSL_HEADER",):
+        if name not in environment:
+            monkeypatch.delenv(name, raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    return importlib.reload(importlib.import_module("config.settings.prod"))
+
+
+def test_e101_fires_when_ssl_redirect_has_no_proxy_header(settings):
+    settings.SECURE_SSL_REDIRECT = True
+    settings.SECURE_PROXY_SSL_HEADER = None
+
+    errors = e101_errors()
+
+    assert [error.id for error in errors] == [E101]
+    assert "SECURE_PROXY_SSL_HEADER" in errors[0].msg
+    assert errors[0].hint
+
+
+def test_manage_py_check_refuses_to_boot_into_a_redirect_loop(settings):
+    """End to end through the management command a pre-boot step runs: a
+    non-zero exit, not a warning in a log. Django's own `security.W008` is a
+    `--deploy`-only *warning*, and a warning does not fail `check`."""
+    settings.SECURE_SSL_REDIRECT = True
+    settings.SECURE_PROXY_SSL_HEADER = None
+
+    with pytest.raises(SystemCheckError) as exc:
+        call_command("check")
+
+    assert E101 in str(exc.value)
+
+
+def test_e101_is_not_tagged_database_because_that_tag_is_skipped_by_default(settings):
+    """The E100 regression, pinned for its sibling: a database-tagged check is
+    invisible to a bare `manage.py check`."""
+    settings.SECURE_SSL_REDIRECT = True
+    settings.SECURE_PROXY_SSL_HEADER = None
+
+    assert Tags.database not in checks.check_ssl_redirect_trusts_a_proxy_header.tags
+    assert Tags.security in checks.check_ssl_redirect_trusts_a_proxy_header.tags
+    assert e101_errors(databases=None) == e101_errors(databases=["default"])
+
+
+def test_e101_is_silent_in_the_suites_own_settings():
+    """The gate: dev and test settings never redirect, so the check cannot fire
+    inside the suite and needs no second flag to keep in step."""
+    assert not getattr(django_settings, "SECURE_SSL_REDIRECT", False)  # premise
+
+    assert e101_errors() == []
+
+
+def test_e101_is_silent_once_a_proxy_header_is_declared(settings):
+    settings.SECURE_SSL_REDIRECT = True
+    settings.SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+    assert e101_errors() == []
+
+
+def test_e101_refuses_a_proxy_header_that_is_not_a_two_tuple(settings):
+    """`SECURE_PROXY_SSL_HEADER = "HTTP_X_FORWARDED_PROTO"` is the plausible
+    typo, and Django unpacks the setting without checking it: it would raise
+    `ValueError` on the first request instead of at boot."""
+    settings.SECURE_SSL_REDIRECT = True
+    settings.SECURE_PROXY_SSL_HEADER = "HTTP_X_FORWARDED_PROTO"
+
+    assert [error.id for error in e101_errors()] == [E101]
+
+
+def test_prod_settings_as_shipped_refuse_to_boot(monkeypatch, settings):
+    """The live outage, closed as a refusal rather than a guessed value."""
+    prod = prod_settings(monkeypatch)
+
+    assert prod.SECURE_SSL_REDIRECT is True  # premise
+    assert prod.SECURE_PROXY_SSL_HEADER is None
+    settings.SECURE_SSL_REDIRECT = prod.SECURE_SSL_REDIRECT
+    settings.SECURE_PROXY_SSL_HEADER = prod.SECURE_PROXY_SSL_HEADER
+
+    assert [error.id for error in e101_errors()] == [E101]
+
+
+def test_prod_settings_accept_the_header_the_operator_supplies(monkeypatch, settings):
+    prod = prod_settings(
+        monkeypatch, DJANGO_SECURE_PROXY_SSL_HEADER="HTTP_X_FORWARDED_PROTO,https"
+    )
+
+    assert prod.SECURE_PROXY_SSL_HEADER == ("HTTP_X_FORWARDED_PROTO", "https")
+    settings.SECURE_SSL_REDIRECT = prod.SECURE_SSL_REDIRECT
+    settings.SECURE_PROXY_SSL_HEADER = prod.SECURE_PROXY_SSL_HEADER
+
+    assert e101_errors() == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "HTTP_X_FORWARDED_PROTO",  # no value half
+        "X_FORWARDED_PROTO,https",  # not a WSGI META key
+        "HTTP_X_FORWARDED_PROTO,https,extra",  # three parts
+        ",https",  # no header name
+        "HTTP_X_FORWARDED_PROTO,",  # no expected value
+        "HTTP_X FORWARDED_PROTO,https",  # whitespace in the key
+        "HTTP_X_FORWARDED_PROTO,ht tps",  # whitespace in the value
+    ],
+)
+def test_prod_settings_refuse_a_malformed_proxy_header(monkeypatch, value):
+    """Input validated at the boundary: a half-written header is a silent
+    `ValueError` on the first request, or a `None` that reads as "unset"."""
+    with pytest.raises(ImproperlyConfigured):
+        prod_settings(monkeypatch, DJANGO_SECURE_PROXY_SSL_HEADER=value)
+
+
+def test_prod_settings_treat_an_empty_proxy_header_as_unset(monkeypatch, settings):
+    """Fail closed: a blank value is "not configured", so E101 still fires
+    rather than a `("", "")` tuple that would trust every request."""
+    prod = prod_settings(monkeypatch, DJANGO_SECURE_PROXY_SSL_HEADER="   ")
+
+    assert prod.SECURE_PROXY_SSL_HEADER is None
+    settings.SECURE_SSL_REDIRECT = prod.SECURE_SSL_REDIRECT
+    settings.SECURE_PROXY_SSL_HEADER = prod.SECURE_PROXY_SSL_HEADER
+
+    assert [error.id for error in e101_errors()] == [E101]
+
+
+def test_the_health_probe_is_exempt_from_the_ssl_redirect(monkeypatch, settings, client):
+    """The same outage one layer out, and the reason the exemption exists.
+
+    A container health probe reaches the app over plain HTTP on loopback and
+    sends no `X-Forwarded-Proto`, so `SECURE_SSL_REDIRECT` answers it with a
+    301 to a `https://127.0.0.1` nothing is listening on. The probe never
+    succeeds, the container is never healthy, and the deploy fails with a
+    perfectly working application inside it.
+    """
+    prod = prod_settings(monkeypatch)
+    settings.SECURE_SSL_REDIRECT = True
+    settings.SECURE_REDIRECT_EXEMPT = prod.SECURE_REDIRECT_EXEMPT
+
+    assert client.get("/healthz").status_code == 200
+    # Premise: the redirect really is on, so the line above is not vacuous.
+    assert client.get("/i18n/setlang/").status_code == 301

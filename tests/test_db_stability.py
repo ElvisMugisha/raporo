@@ -36,6 +36,20 @@ from common import db
 AUDIT_TRIGGER_MIGRATION = "apps.audit.migrations.0002_append_only_trigger"
 GUARDED_TABLE = "audit_auditlog"
 
+ORG_KEY_MIGRATION = "tests.testapp.migrations.0003_org"
+
+#: Every table `same_org_fk_v1` is called with by a shipped migration. Pinning
+#: the helper does not pin the text it returns for a table it has never seen, so
+#: each table name is a separate pin - and a new store-scoped table in slice 2
+#: adds two entries here alongside its migration.
+SAME_ORG_TABLES = [
+    "testapp_product",
+    "testapp_sale",
+    "testapp_saleline",
+    "testapp_scopedthing",
+    "testapp_scopedthingownmeta",
+]
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 #: sha256 of each frozen string. Keyed by how a reader finds the string again.
@@ -51,6 +65,36 @@ PINNED_SQL = {
     ),
     f"append_only_triggers_v1({GUARDED_TABLE!r})[reverse]": (
         "f29d95adfba85c6bc230c80b70ddb4d147a145a0dfda1dc683798a0ccba5e019"
+    ),
+    "same_org_fk_v1('testapp_product')[forward]": (
+        "e2c0cc0b74a025a833d4a89124ebccf319fb582448919ba6dca80b3f05ca137e"
+    ),
+    "same_org_fk_v1('testapp_product')[reverse]": (
+        "98eb736af3fb6384453b487619ea6b1d028b8e7e290cc290c1ad757cf28dcb8b"
+    ),
+    "same_org_fk_v1('testapp_sale')[forward]": (
+        "23c8fe0def208dfe573628730538560968b618405a0a6618051305d74aaba231"
+    ),
+    "same_org_fk_v1('testapp_sale')[reverse]": (
+        "25b2384a3fe3563b47299dbd0d82713424719ced7a1936c31347800e481e933c"
+    ),
+    "same_org_fk_v1('testapp_saleline')[forward]": (
+        "7201ad105846eca9474e235ac27cf91162ff89d7f849e12116af0c45b48eec4f"
+    ),
+    "same_org_fk_v1('testapp_saleline')[reverse]": (
+        "13a7b3a15035907251a9b83b8786a421c6ac41b0819455581e7b50cf165bd16d"
+    ),
+    "same_org_fk_v1('testapp_scopedthing')[forward]": (
+        "455700876fc1ccece12733c9de839cfa5cba5c6933cd230d3a9a2a7420a81bcd"
+    ),
+    "same_org_fk_v1('testapp_scopedthing')[reverse]": (
+        "a4f8158761699710218ec7d15d24844651b0d18261f0b9992df0c1cb38fcc0a7"
+    ),
+    "same_org_fk_v1('testapp_scopedthingownmeta')[forward]": (
+        "122c07711b2b4ddefd82794257bf07098ae2aef58f5b437707e490fc540befbd"
+    ),
+    "same_org_fk_v1('testapp_scopedthingownmeta')[reverse]": (
+        "3d2dbb42eda0cd4339178f57c974d778f33dbfe61e49faf4bf96ecac0b86268e"
     ),
 }
 
@@ -92,17 +136,17 @@ PINNED_MIGRATION_SQL = {
 UNVERSIONED_IDENTIFIERS = {"APPEND_ONLY_FUNCTION"}
 
 REMEDY = """
-`{name}` is frozen: apps/audit/migrations/0002_append_only_trigger.py replays it
-verbatim. Django replays migrations by name, so this edit changes what a FRESH
-database installs while every already-migrated database keeps the old
-definition. The two then diverge silently.
+`{name}` is frozen: a shipped migration replays it verbatim. Django replays
+migrations by name, so this edit changes what a FRESH database installs while
+every already-migrated database keeps the old definition. The two then diverge
+silently.
 
 To change the guard's behaviour, revert this edit and instead:
-  1. add CREATE_APPEND_ONLY_FUNCTION_V2 (and append_only_triggers_v2, if the
-     trigger wiring changes) NEXT TO the V1 names in common/db.py - never edit a
+  1. add the _V2 name (CREATE_APPEND_ONLY_FUNCTION_V2, append_only_triggers_v2,
+     same_org_fk_v2, ...) NEXT TO the V1 name in common/db.py - never edit a
      _V1 name;
-  2. add a NEW migration that runs the V2 SQL (V2 re-issues CREATE OR REPLACE
-     for the same function, so a fresh install and a migrated database converge);
+  2. add a NEW migration that runs the V2 SQL, depending on every migration that
+     installed an earlier version, with reverse_sql restoring the V1 body;
   3. add the V2 hashes to PINNED_SQL in this file.
 
 Only if no database anywhere has ever run the migration carrying this string may
@@ -133,6 +177,11 @@ def migration():
     return importlib.import_module(AUDIT_TRIGGER_MIGRATION)
 
 
+@pytest.fixture(scope="module")
+def org_key_migration():
+    return importlib.import_module(ORG_KEY_MIGRATION)
+
+
 # --------------------------------------------------------------------------
 # The tripwire: the frozen strings themselves
 # --------------------------------------------------------------------------
@@ -148,6 +197,58 @@ def test_the_frozen_trigger_sql_has_not_changed():
 
     assert_pinned(f"append_only_triggers_v1({GUARDED_TABLE!r})[forward]", forward)
     assert_pinned(f"append_only_triggers_v1({GUARDED_TABLE!r})[reverse]", reverse)
+
+
+def test_the_frozen_same_org_fk_sql_has_not_changed():
+    """The composite key that makes invariant #1 a property of the schema.
+
+    Every table name a shipped migration passes in is pinned separately: the
+    helper's *name* being pinned says nothing about the text it returns for a
+    table it has never been called with.
+    """
+    for table in SAME_ORG_TABLES:
+        forward, reverse = db.same_org_fk_v1(table)
+
+        assert_pinned(f"same_org_fk_v1({table!r})[forward]", forward)
+        assert_pinned(f"same_org_fk_v1({table!r})[reverse]", reverse)
+
+
+def test_the_same_org_fk_sql_says_immediate_and_not_deferred():
+    """`DEFERRABLE INITIALLY DEFERRED` would make every negative test vacuous.
+
+    A deferred violation surfaces at COMMIT, and a `TestCase` never commits, so
+    `pytest.raises(IntegrityError)` around a cross-organization write would
+    never fire and the suite would go green having checked nothing. The hash
+    above would catch the edit; this says out loud which words it is protecting.
+    """
+    forward, _ = db.same_org_fk_v1("testapp_product")
+
+    assert "DEFERRABLE INITIALLY IMMEDIATE" in forward
+    assert "INITIALLY DEFERRED" not in forward
+    # MATCH SIMPLE is the default and deliberately unwritten; spelling MATCH
+    # FULL would change the NULL semantics the non-nullable columns rely on.
+    assert "MATCH" not in forward
+
+
+def test_the_org_key_migration_carries_one_statement_per_table(org_key_migration):
+    """No loop over the model registry, and no table missed.
+
+    A migration that enumerated `StoreScopedModel.__subclasses__()` at apply
+    time would emit different SQL depending on which models happened to be
+    imported, which is the fork this module exists to prevent - arriving through
+    the one door a SHA-256 pin cannot close, because the pinned text would
+    itself become a function of the registry.
+    """
+    applied = [
+        (op.sql, op.reverse_sql)
+        for op in org_key_migration.Migration.operations
+        if isinstance(op, migrations.RunSQL)
+    ]
+
+    assert applied == [db.same_org_fk_v1(table) for table in SAME_ORG_TABLES]
+    for sql, reverse_sql in applied:
+        assert sha256(sql) in PINNED_SQL.values()
+        assert sha256(reverse_sql) in PINNED_SQL.values()
 
 
 def test_the_shipped_migration_still_carries_exactly_the_pinned_sql(migration):
@@ -270,6 +371,10 @@ def test_every_run_sql_statement_in_every_migration_is_pinned():
     assert "apps/audit/migrations/0002_append_only_trigger.py" in seen
     assert "apps/audit/migrations/0001_initial.py" in seen
     assert "apps/orgs/migrations/0001_initial.py" in seen
+    # And the migration that installs the five store-scoped composite keys: it
+    # lives outside `apps/`, so it is also the case that proves discovery is
+    # `MigrationLoader` and not a glob over `apps/*/migrations/`.
+    assert "tests/testapp/migrations/0003_org.py" in seen
 
     assert unpinned == {}, (
         f"These migration statements are not pinned: {sorted(unpinned)}. A "
@@ -345,6 +450,7 @@ def test_no_migration_imports_an_unpinned_name_from_common_db():
     unenforced contract for its own tables.
     """
     pinned_names = {key.split("(")[0] for key in PINNED_SQL}
+    assert "same_org_fk_v1" in pinned_names  # premise: the split really keys on the name
     imported: dict[str, set[str]] = {}
 
     for relative_path in _shipped_migrations():
@@ -355,8 +461,9 @@ def test_no_migration_imports_an_unpinned_name_from_common_db():
                 names = {alias.name for alias in node.names}
                 imported.setdefault(relative_path, set()).update(names)
 
-    # Premise: this scan actually sees the one migration we know imports the SQL.
+    # Premise: this scan actually sees the migrations we know import the SQL.
     assert "apps/audit/migrations/0002_append_only_trigger.py" in imported
+    assert "tests/testapp/migrations/0003_org.py" in imported
 
     unpinned = {
         path: sorted(names - pinned_names - UNVERSIONED_IDENTIFIERS)

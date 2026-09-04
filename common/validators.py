@@ -4,8 +4,7 @@ User-facing messages are wrapped in `gettext_lazy`: they surface in forms.
 """
 
 import re
-from functools import lru_cache
-from zoneinfo import available_timezones
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from django.core.exceptions import ValidationError
 from django.core.validators import FileExtensionValidator, RegexValidator
@@ -250,23 +249,131 @@ currency_code_validator = RegexValidator(
 )
 
 
-@lru_cache(maxsize=1)
-def _known_timezones() -> frozenset[str]:
-    """Cached: `available_timezones()` walks the tz database on every call."""
-    return frozenset(available_timezones())
+# --------------------------------------------------------------------------
+# Time zones
+# --------------------------------------------------------------------------
+#
+# A period boundary is computed in the organization's zone, so this column
+# decides every month-end total the business ever reads. It used to be
+# validated against `zoneinfo.available_timezones()`, which is a *scan of the
+# filesystem*, and that was wrong in four measured ways at once:
+#
+#   * `localtime` is in the set. It is a symlink to the host's
+#     `/etc/localtime`, so one database served from two machines gives one
+#     organization two different month-ends, and neither is reproducible.
+#   * `Factory` is in the set. It is the tz database's "you forgot to
+#     configure this" placeholder.
+#   * `Etc/GMT+5` is in the set, and its `utcoffset` was MEASURED as
+#     **−05:00** - POSIX inverts the sign of that whole namespace. A ten-hour
+#     error, in a spelling a form accepted without complaint.
+#   * The set is not the same in two places. MEASURED: **486** keys inside the
+#     container against **498** read elsewhere, because the backward-
+#     compatibility links are a packaging choice. So `Africa/Asmera` and
+#     `US/Pacific` - real, widely used aliases - are *rejected* in the
+#     container while nonsense is accepted. Validation that differs by host is
+#     not validation.
+#
+# What replaces it is a literal, curated set. Adding a zone is a deliberate
+# edit with a test that pins its offset, which is the correct amount of
+# friction for a value that moves every total in every report.
+
+#: The zones an organization may bound its reporting periods with: Rwanda, its
+#: East African neighbours, and UTC. Deliberately small. Widen it by editing
+#: this set and adding the zone to the pinned-offset table in
+#: `tests/test_timezone_allowlist.py` - never by widening it back to a
+#: filesystem scan.
+#:
+#: Every key here is a canonical IANA `Region/City` identifier (plus `UTC`,
+#: which is the one zone with no city), so it exists in any tzdata build,
+#: with or without the backward links.
+REPORTING_TIMEZONES = frozenset(
+    {
+        "Africa/Kigali",  # Rwanda. The default.
+        "Africa/Bujumbura",  # Burundi
+        "Africa/Nairobi",  # Kenya
+        "Africa/Kampala",  # Uganda
+        "Africa/Dar_es_Salaam",  # Tanzania
+        "Africa/Lubumbashi",  # DR Congo, east (+02)
+        "Africa/Kinshasa",  # DR Congo, west (+01)
+        "Africa/Juba",  # South Sudan
+        "Africa/Khartoum",  # Sudan
+        "Africa/Addis_Ababa",  # Ethiopia
+        "Africa/Mogadishu",  # Somalia
+        "UTC",
+    }
+)
+
+#: Keys that must stay refused however wide the allowlist gets, including for
+#: the per-user *display* timezone `docs/PRODUCT.md` leaves room for. Each one
+#: resolves, so nothing upstream refuses it for us.
+#:
+#: `localtime` and `local` follow the host clock. `Factory` is the placeholder.
+#: `posixrules` is a legacy DST template - MEASURED resolving to −04:00 while
+#: absent from `available_timezones()`, so `ZoneInfo` accepts strictly more
+#: than that scan lists.
+UNSAFE_TIMEZONE_KEYS = frozenset({"localtime", "local", "Factory", "posixrules"})
+
+#: Namespaces that must stay refused for the same reason.
+#:
+#: `Etc/` because of the inverted sign measured above. `SystemV/` is a legacy
+#: compatibility namespace with hard-coded pre-1987 US DST rules.
+#: `right/` and `posix/` are alternate *encodings* of every other zone -
+#: `right/` counts leap seconds, so its arithmetic differs from every other
+#: spelling of the same place.
+UNSAFE_TIMEZONE_PREFIXES = ("Etc/", "SystemV/", "right/", "posix/")
+
+
+def unsafe_timezone_reason(value) -> str | None:
+    """Why `value` may never bound a period, or `None` if there is no reason.
+
+    Separate from `validate_timezone` and phrased as a reason string so the
+    same rule can guard the future display-timezone setting - which will want
+    a wider allowlist but not a wider *safety* rule - and so
+    `common.periods.resolve_timezone` can refuse a value that predates this
+    allowlist without importing Django's form machinery.
+    """
+    if not isinstance(value, str) or not value:
+        return "it is not a time zone name"
+    if value in UNSAFE_TIMEZONE_KEYS:
+        return "it follows the machine's own clock instead of naming a place"
+    for prefix in UNSAFE_TIMEZONE_PREFIXES:
+        if value.startswith(prefix):
+            return f"the {prefix} names are not places and do not mean what they read as"
+    return None
+
+
+def timezone_exists(value: str) -> bool:
+    """Whether tzdata can resolve `value` at all. Used by the allowlist test,
+    not by the validator: membership in `REPORTING_TIMEZONES` is the rule."""
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError, TypeError):
+        return False
+    return True
 
 
 def validate_timezone(value: str) -> None:
-    """Reject anything that is not an IANA key.
+    """Accept only a zone this product reports in.
 
-    Period boundaries are computed in the organization's zone, so a typo here
-    would silently shift every report.
+    Period boundaries are computed in the organization's zone, so a value that
+    is merely *resolvable* is not good enough: it has to be a real place we
+    have checked, or every total silently shifts.
     """
-    if value not in _known_timezones():
+    reason = unsafe_timezone_reason(value)
+    if reason is not None:
         raise ValidationError(
-            _("%(value)s is not a known time zone name."),
+            _("%(value)s cannot be a reporting time zone: %(reason)s."),
+            code="unsafe_timezone",
+            params={"value": value, "reason": reason},
+        )
+    if value not in REPORTING_TIMEZONES:
+        raise ValidationError(
+            _(
+                "%(value)s is not a time zone Raporo reports in. Choose one of: "
+                "%(allowed)s."
+            ),
             code="invalid_timezone",
-            params={"value": value},
+            params={"value": value, "allowed": ", ".join(sorted(REPORTING_TIMEZONES))},
         )
 
 

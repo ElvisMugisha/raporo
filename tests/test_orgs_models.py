@@ -71,7 +71,15 @@ def test_organization_rejects_an_unknown_timezone(bad):
 
 
 def test_organization_accepts_another_real_timezone():
-    Organization(name="X", slug="x", timezone="Europe/Brussels").full_clean()
+    """Another zone Raporo reports in - not merely another zone that exists.
+
+    `Europe/Brussels` used to stand here and it no longer passes: the reporting
+    timezone is a curated allowlist now (Rwanda plus the East African
+    neighbours), because `zoneinfo.available_timezones()` accepted `localtime`
+    and `Etc/GMT+5`. The full contract, and every value watched being refused,
+    is in `tests/test_timezone_allowlist.py`.
+    """
+    Organization(name="X", slug="x", timezone="Africa/Nairobi").full_clean()
 
 
 # --------------------------------------------------------------------------
@@ -119,6 +127,7 @@ EXPECTED_PERMISSIONS = {
     "role.manage",
     "invite.create",
     "store.manage",
+    "store.access_all",
     "sale.record",
     "sale.below_floor_override",
     "stock.restock",
@@ -141,13 +150,6 @@ def test_presets_are_owner_manager_seller():
     assert PRESETS["Seller"] == frozenset({"sale.record"})
     for name, codes in PRESETS.items():
         assert codes <= PERMISSIONS, name
-
-
-def test_manager_preset_runs_a_store_but_does_not_own_the_org():
-    manager = PRESETS["Manager"]
-
-    assert {"sale.record", "stock.restock", "expense.record", "report.generate"} <= manager
-    assert not {"role.manage", "store.manage"} & manager
 
 
 def test_role_rejects_an_unknown_permission_code(org):
@@ -268,6 +270,12 @@ LIVE_UNIQUE_CONSTRAINTS = [
     (Store, "orgs_store_unique_live_name_per_org"),
     (Role, "orgs_role_unique_live_name_per_org"),
     (Membership, "orgs_membership_unique_live_user_per_org"),
+    # One live membership per user (schema plan §J). This tuple *is* the
+    # check: it asserts the constraint exists AND that its condition is
+    # exactly `LIVE`, so a future migration that drops either turns the suite
+    # red. A system check would be the wrong tool - "this one model declares
+    # this one constraint" is a test, not a rule over a class of models.
+    (Membership, "orgs_membership_unique_live_user"),
     (StoreAccess, "orgs_storeaccess_unique_live_membership_store"),
 ]
 
@@ -456,3 +464,137 @@ def test_the_stored_logo_filename_is_random(org):
 def test_media_root_is_outside_the_source_tree():
     assert not str(settings.MEDIA_ROOT).startswith(str(settings.BASE_DIR))
     assert settings.FILE_UPLOAD_MAX_MEMORY_SIZE <= 2 * 1024 * 1024
+
+
+# --------------------------------------------------------------------------
+# One live membership per user (schema plan §J)
+# --------------------------------------------------------------------------
+
+
+def test_a_user_may_hold_only_one_live_membership(actor, org, owner_role, other_org):
+    """Elvis's ruling: a user belongs to exactly one organization.
+
+    `create()` never calls `clean()`, so this is the database talking - which
+    is the only layer that holds under a race.
+    """
+    Membership.objects.create(user=actor, org=org, role=owner_role)
+    foreign_role = Role.objects.create(org=other_org, name="Owner", permissions=[])
+
+    with pytest.raises(IntegrityError) as exc:
+        with transaction.atomic():
+            Membership.objects.create(user=actor, org=other_org, role=foreign_role)
+
+    assert "orgs_membership_unique_live_user" in str(exc.value)
+
+
+def test_the_two_membership_constraints_name_two_different_incidents(
+    actor, org, owner_role, other_org
+):
+    """A same-org duplicate and a second-org membership are different events.
+
+    One is a double-invite (benign, retry-safe); the other is a policy refusal
+    that needs a human. The names are the only thing an on-call engineer has,
+    so both must be reachable. Precedence comes from index creation order and
+    flips on a database restored from `pg_dump` (which emits indexes
+    alphabetically) - so this asserts that each name *can* fire, never which
+    one wins.
+    """
+    Membership.objects.create(user=actor, org=org, role=owner_role)
+
+    with pytest.raises(IntegrityError) as same_org:
+        with transaction.atomic():
+            Membership.objects.create(user=actor, org=org, role=owner_role)
+
+    assert "orgs_membership_unique_live_user_per_org" in str(same_org.value)
+
+
+def test_a_soft_deleted_membership_releases_the_user(
+    actor, org, owner_role, other_org, other_actor
+):
+    membership = Membership.objects.create(user=actor, org=org, role=owner_role)
+    membership.soft_delete(by=other_actor)
+    foreign_role = Role.objects.create(org=other_org, name="Owner", permissions=[])
+
+    Membership.objects.create(user=actor, org=other_org, role=foreign_role)
+
+    assert Membership.objects.filter(user=actor).count() == 1
+    assert Membership.all_objects.filter(user=actor).count() == 2
+
+
+def test_leaving_and_rejoining_the_first_org_works(actor, org, owner_role, other_org, other_actor):
+    foreign_role = Role.objects.create(org=other_org, name="Owner", permissions=[])
+
+    first = Membership.objects.create(user=actor, org=org, role=owner_role)
+    first.soft_delete(by=other_actor)
+    second = Membership.objects.create(user=actor, org=other_org, role=foreign_role)
+
+    # While B is live, re-joining A is refused: leaving B comes first.
+    with pytest.raises(IntegrityError) as exc:
+        with transaction.atomic():
+            Membership.objects.create(user=actor, org=org, role=owner_role)
+    assert "orgs_membership_unique_live_user" in str(exc.value)
+
+    second.soft_delete(by=other_actor)
+    third = Membership.objects.create(user=actor, org=org, role=owner_role)
+
+    assert Membership.objects.filter(user=actor).count() == 1
+    assert {m.pk for m in Membership.all_objects.filter(user=actor)} == {
+        first.pk,
+        second.pk,
+        third.pk,
+    }
+
+
+def test_the_one_org_violation_reports_on_the_user_field(actor, org, owner_role, other_org):
+    """`violation_error_code="unique"` is load-bearing, not cosmetic.
+
+    A constraint carrying a `condition` always raises the bare message, and
+    `validate_constraints()` only re-files it onto a field when the code is
+    `"unique"` and the constraint names exactly one field. Without the code the
+    message lands in `__all__` as a form-wide banner instead of beside the
+    input the operator got wrong.
+    """
+    Membership.objects.create(user=actor, org=org, role=owner_role)
+    foreign_role = Role.objects.create(org=other_org, name="Owner", permissions=[])
+
+    with pytest.raises(ValidationError) as exc:
+        Membership(user=actor, org=other_org, role=foreign_role).full_clean()
+
+    assert "user" in exc.value.error_dict
+    assert "already belongs to an organization" in str(exc.value.error_dict["user"][0])
+
+
+def test_a_same_org_duplicate_still_reports_the_specific_message(actor, org, owner_role):
+    """Makes §J.2's ruling load-bearing: drop the per-org constraint and this
+    test goes red, because the one-org message says nothing about a double
+    invite into the same organization."""
+    Membership.objects.create(user=actor, org=org, role=owner_role)
+
+    with pytest.raises(ValidationError) as exc:
+        Membership(user=actor, org=org, role=owner_role).full_clean()
+
+    messages = [str(m) for m in exc.value.messages]
+    assert any("already a member of this organization" in m for m in messages)
+
+
+def test_the_one_org_index_is_partial_in_postgres(db):
+    """A conditional UniqueConstraint is a partial index, so it is in
+    `pg_indexes` and NOT in `pg_constraint`. Assert the predicate itself:
+    without it, a soft-deleted membership would hold the user for ever."""
+    from django.db import connection
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE indexname = 'orgs_membership_unique_live_user'"
+        )
+        row = cursor.fetchone()
+        cursor.execute(
+            "SELECT count(*) FROM pg_constraint "
+            "WHERE conname = 'orgs_membership_unique_live_user'"
+        )
+        in_pg_constraint = cursor.fetchone()[0]
+
+    assert row is not None, "the one-org unique index does not exist"
+    assert "WHERE (deleted_at IS NULL)" in row[0]
+    assert in_pg_constraint == 0

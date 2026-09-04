@@ -22,7 +22,7 @@ method names. `|`, `&` and `^` all reach `sql.Query.combine`; `union()`,
 are overridden, so an operator Django adds later is covered by construction:
 enumerating dunders is exactly how `^` shipped unguarded, and how
 `for_store(A) | for_store(RIVAL)` stayed a synonym for the `for_stores([A,
-RIVAL])` that `_store_pks()` already refused.
+RIVAL])` that `resolve_scope()` already refused.
 
 One shape reaches neither seam, so `union()` itself is overridden as well:
 `QuerySet.union()` drops `self` when it is an `EmptyQuerySet` and, with exactly
@@ -46,6 +46,7 @@ our code, never bad input from a request. They stay untranslated on purpose.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Iterable
 
 from django.apps import apps as global_apps
@@ -56,6 +57,15 @@ from django.utils import timezone
 
 STORE_LABEL = "orgs.store"
 STORE_FIELD = "store"
+
+#: The organization pointer, named here rather than in `common/models.py`
+#: because the write guards below reason about it and the import direction is
+#: `managers <- models` (models imports this module, never the reverse).
+#: `common.models` re-exports both names, which is where the checks read them.
+ORG_LABEL = "orgs.organization"
+ORG_FIELD = "org"
+ORG_ATTNAME = f"{ORG_FIELD}_id"
+STORE_ATTNAME = f"{STORE_FIELD}_id"
 
 
 class UnscopedQueryError(Exception):
@@ -76,6 +86,40 @@ class HardDeleteForbidden(NotImplementedError):
     Subclasses `NotImplementedError` so `except NotImplementedError` (what the
     plan's sketch promised) keeps working.
     """
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ScopePin:
+    """The whole pin: one organization, and one or more of *its* stores.
+
+    Two fields rather than a bare set of store ids, because the organization is
+    the fact every merge needs and the fact the old code computed and threw
+    away. `resolve_scope()` already had to read `orgs_store` to refuse a
+    mixed-organization set; keeping the answer turns every widening merge from a
+    database round trip into an integer comparison.
+
+    Frozen, because `sql.Query.combine` mutates `self`: a merge that could
+    mutate a leg in place would leave a half-merged pin behind on a refusal, and
+    the existing code already takes care to refuse *before* `super()` for that
+    reason.
+
+    What the `org_pk` is for, and what it is emphatically not for:
+
+    * **the merge algebra.** Two pins may be combined only when their `org_pk`
+      is the same integer. That is a real refusal and it replaces a query.
+    * **a write.** `org_id` is stamped from here, and the composite foreign key
+      `(store_id, org_id) -> orgs_store (id, org_id)` then proves it at the
+      database.
+    * **NOT a read predicate.** The org here is *derived from the stores the
+      caller named*, so `WHERE org_id = <that org>` is tautological: a store id
+      belonging to another organization would re-scope the query to the
+      attacker's target rather than return nothing. The read predicate that
+      does authorize comes from the tenant context, which does not exist yet.
+      See `_pin` for why no `org_id` term is compiled into a read today.
+    """
+
+    org_pk: int
+    store_pks: tuple[int, ...]
 
 
 def _store_pk(store) -> int:
@@ -104,34 +148,89 @@ def _store_pk(store) -> int:
     return store
 
 
-def _store_pks(stores) -> list[int]:
-    """Normalise a collection of stores and refuse a mixed-organization set.
+def _believable_org_pk(store) -> int | None:
+    """`store.org_id`, but only from an instance entitled to be believed.
+
+    A `Store` that came *out of* the database already had its ownership
+    resolved by the query that produced it, so re-reading `orgs_store` to learn
+    what the instance is holding is a round trip for an answer we have. Three
+    conditions decide "came out of the database", and each excludes a way the
+    attribute could be a fiction:
+
+    * **`_state.adding is False` and `_state.db` is set** - so `Store(id=7,
+      org_id=<a rival's org>)`, hand-built in Python, does not qualify and falls
+      through to the resolving query, which refuses an unknown id. Note that the
+      old code trusted such an instance's `pk` unconditionally, so this is
+      strictly stronger than what it replaces.
+    * **`org_id` is not deferred** - `.only("pk")` leaves the attribute absent,
+      and touching it would fire a hidden refresh query per store.
+    * **`org_id` is not None** - a store with no organization cannot exist
+      (the column is NOT NULL), so a None here means "unknown", not "none".
+
+    A caller who loads a real `Store` and then assigns a different `org_id` to
+    it in Python is lying to the guard on purpose; that is code we wrote, not
+    request data, and the composite foreign key still refuses the write.
+    """
+    if not isinstance(store, models.Model):
+        return None
+    state = getattr(store, "_state", None)
+    if state is None or state.adding or state.db is None:
+        return None
+    if ORG_ATTNAME in store.get_deferred_fields():
+        return None
+    return getattr(store, ORG_ATTNAME, None)
+
+
+def resolve_scope(stores, *, caller: str = "for_stores()") -> ScopePin:
+    """Normalise a collection of stores into a pin, refusing a mixed set.
 
     Reporting across "my stores" is legitimate; reporting across two orgs'
     stores never is, and the caller usually cannot tell the difference by
-    looking at a list of ids - so this resolves them.
+    looking at a list of ids - so this resolves them, and now *keeps* the
+    answer (see `ScopePin`).
+
+    `caller` names the function the author actually called. The messages are
+    otherwise the ones this code has always raised: one of them ("a query may
+    never span organizations") is the sentence the whole guard exists to say,
+    and a message naming a function nobody called is a defect this ledger has
+    already recorded once.
     """
     if isinstance(stores, (str, bytes)) or not isinstance(stores, Iterable):
-        raise TypeError(f"for_stores() needs an iterable of stores, got {stores!r}.")
-    seen: dict[int, None] = {}
+        raise TypeError(f"{caller} needs an iterable of stores, got {stores!r}.")
+    # Insertion-ordered, de-duplicated: `dict` for the order, `None` for "this
+    # id's owner is not known yet".
+    owners: dict[int, int | None] = {}
     for store in stores:
-        seen[_store_pk(store)] = None
-    if not seen:
-        raise ValueError("for_stores() needs at least one store.")
-    pks = list(seen)
+        pk = _store_pk(store)
+        if owners.get(pk) is None:
+            owners[pk] = _believable_org_pk(store)
+    if not owners:
+        raise ValueError(f"{caller} needs at least one store.")
 
-    store_model = global_apps.get_model(*STORE_LABEL.split("."))
-    owners = dict(store_model.all_objects.filter(pk__in=pks).values_list("pk", "org_id"))
-    unknown = [pk for pk in pks if pk not in owners]
-    if unknown:
-        raise ValueError(f"for_stores() was given unknown store ids: {unknown}.")
+    if any(org is None for org in owners.values()):
+        store_model = global_apps.get_model(*STORE_LABEL.split("."))
+        resolved = dict(
+            store_model.all_objects.filter(pk__in=list(owners))
+            # `.order_by()` because `Store.Meta.ordering` otherwise leaks into a
+            # `values_list` that never consumes order: measured as a pointless
+            # `ORDER BY orgs_store.name ASC` on every pin resolution.
+            .order_by()
+            .values_list("pk", ORG_ATTNAME)
+        )
+        unknown = [pk for pk in owners if pk not in resolved]
+        if unknown:
+            raise ValueError(f"{caller} was given unknown store ids: {unknown}.")
+        # The database wins over anything an instance was holding, and the whole
+        # set is re-read rather than only the gaps: one query either way.
+        owners = {pk: resolved[pk] for pk in owners}
+
     orgs = set(owners.values())
     if len(orgs) > 1:
         raise CrossStoreReferenceError(
-            f"for_stores() was given stores from {len(orgs)} organizations "
+            f"{caller} was given stores from {len(orgs)} organizations "
             f"({sorted(orgs)}); a query may never span organizations."
         )
-    return pks
+    return ScopePin(org_pk=orgs.pop(), store_pks=tuple(owners))
 
 
 def soft_delete_values(model, by) -> dict:
@@ -158,51 +257,67 @@ def require_actor(by, system: bool):
     return by
 
 
-def merge_scope_pks(
-    model, left_pks, right_pks, operator: str, *, narrow: bool
-) -> tuple[int, ...]:
-    """The store set a combined query is pinned to, resolved - never assumed.
+def merge_pins(
+    model, left: ScopePin | None, right: ScopePin | None, operator: str, *, narrow: bool
+) -> ScopePin:
+    """The pin a combined query carries - computed, no longer re-queried.
 
     A plain set union is what leaked: `for_stores([A, RIVAL])` is refused by
-    `_store_pks()`, so `for_store(A) | for_store(RIVAL)` is its synonym and has
-    to go through the same resolver. A merge that widens the set therefore
-    re-resolves ownership against the database.
+    `resolve_scope()`, so `for_store(A) | for_store(RIVAL)` is its synonym and
+    has to be refused by the same rule. It still is, one step earlier: each leg
+    was pinned by a database read that proved *its* stores lie in one
+    organization, so the merge only has to ask whether the two organizations are
+    the same integer. That is not weaker than re-resolving - the union of two
+    sets each inside one organization is inside one organization, and the
+    "unknown store id" half was already done per leg - and it costs no query.
 
-    A pin is an upper bound on where the result's rows can come from, so
-    *widening* it is always sound and *narrowing* it only is when the result is
-    provably inside both legs - `&` and `intersection()`. `difference()` is not
-    one of those: its rows come from the left leg, about which the right leg's
-    pin says nothing. Hence a `narrow` flag rather than the connector: the two
-    call sites speak different vocabularies (`sql.AND`/`OR`/`XOR` against
-    `"union"`/`"intersection"`/`"difference"`), and a string compared against one
-    of them is dead code on the other path - `intersection()` used to pin to
-    both stores where `&` narrowed. An empty intersection falls back to the
-    union, because a pin of no stores would read as "unpinned" downstream.
+    The rule order is load-bearing:
 
-    Two unpinned legs are refused here rather than left to the compile-time
-    guard: `_store_pks(())` would raise `ValueError` naming a function the caller
-    never called, which no `except UnscopedQueryError` catches.
+    1. **an unpinned leg is refused first.** Round 4 measured that a shortcut
+       which hands back an empty pin lets `ScopedQuery.combine` mark the query
+       scoped and compile it with no store predicate at all.
+    2. **then the organizations must match**, or `CrossStoreReferenceError`.
+    3. **then the store sets merge**: union by default; the intersection when
+       `narrow=True`, which is `&` and `intersection()` only. `difference()`
+       does not narrow - its rows come from the left leg, about which the right
+       leg's pin says nothing - hence a flag rather than the connector, since
+       the two call sites speak different vocabularies (`sql.AND`/`OR`/`XOR`
+       against `"union"`/`"intersection"`/`"difference"`) and a string compared
+       against one of them is dead code on the other path. An empty
+       intersection falls back to the union, because a pin of no stores would
+       read as "unpinned" downstream.
     """
-    left, right = set(left_pks), set(right_pks)
-    if not left and not right:
+    if left is None and right is None:
         raise UnscopedQueryError(
             f"{model.__name__} is store-scoped: `{operator}` combines two unpinned "
             f"querysets, so the combined query would carry no store predicate. "
             f"Pin every side with for_store()/for_stores()."
         )
-    if left == right:
-        # Nothing new to resolve: this exact set was validated against the
-        # database when `for_store()` / `for_stores()` pinned it, and stores are
-        # never hard-deleted, so a second lookup can only confirm it. Skipping it
-        # is what keeps `a | a` lazy - a widening merge is worth the query, but
-        # building a queryset should not hit the database on its own.
-        return tuple(sorted(left))
-    resolved = _store_pks(sorted(left | right))
+    if left is None or right is None:
+        # Not reachable through either call site - `refuse_scope_mismatch` runs
+        # first on both the scoped and the unscoped side - and it still refuses
+        # rather than adopting the pinned leg's scope, because the alternative
+        # to a reachable refusal is a silently unpinned query.
+        pinned, unpinned = ("left", "right") if left is not None else ("right", "left")
+        raise UnscopedQueryError(
+            f"{model.__name__} is store-scoped: `{operator}` combines a store-pinned "
+            f"queryset ({pinned}) with an unpinned one ({unpinned}), so the combined "
+            f"query would carry no store predicate. Pin every side with "
+            f"for_store()/for_stores()."
+        )
+    if left.org_pk != right.org_pk:
+        raise CrossStoreReferenceError(
+            f"{model.__name__}: `{operator}` combines a query pinned to organization "
+            f"{left.org_pk} with one pinned to organization {right.org_pk}; a query "
+            f"may never span organizations."
+        )
+    merged = tuple(dict.fromkeys(left.store_pks + right.store_pks))
     if narrow:
-        narrowed = left & right
+        shared = set(left.store_pks) & set(right.store_pks)
+        narrowed = tuple(pk for pk in merged if pk in shared)
         if narrowed:
-            return tuple(pk for pk in resolved if pk in narrowed)
-    return tuple(resolved)
+            merged = narrowed
+    return ScopePin(org_pk=left.org_pk, store_pks=merged)
 
 
 class GuardedQuery(Query):
@@ -222,9 +337,29 @@ class GuardedQuery(Query):
     seam below can compare a scoped query with an unscoped one from either side.
     """
 
-    #: Overwritten per instance by `ScopedQuerySet._pin`.
-    store_scoped = False
-    store_scope_pks: tuple[int, ...] = ()
+    #: Written per instance by `ScopedQuerySet._pin`. ONE attribute, and the
+    #: three names below are read-only views of it: round 4 measured a leak in
+    #: which `store_scoped` was True while the store set was empty, and the
+    #: query then compiled with no store predicate. A pin that cannot disagree
+    #: with itself cannot reproduce that. `Query.clone()` copies `__dict__`, so
+    #: the pin survives every chained `filter()` exactly as the flags did.
+    scope_pin: ScopePin | None = None
+
+    @property
+    def store_scoped(self) -> bool:
+        """Whether a store has been pinned. Kept as a name: `queryset_scope`,
+        `refuse_scope_mix` and the 45-case operator matrix all read it."""
+        return self.scope_pin is not None
+
+    @property
+    def store_scope_pks(self) -> tuple[int, ...]:
+        return () if self.scope_pin is None else self.scope_pin.store_pks
+
+    @property
+    def org_scope_pk(self) -> int | None:
+        """The pinned organization - for the merge algebra and for writes. NOT
+        a read predicate; see `ScopePin`."""
+        return None if self.scope_pin is None else self.scope_pin.org_pk
 
     def refuse_scope_mismatch(self, rhs, connector: str) -> None:
         """A merge of a pinned query with an unpinned one produces a single
@@ -272,6 +407,11 @@ def queryset_scope(queryset) -> tuple[bool, tuple[int, ...]]:
         bool(getattr(query, "store_scoped", False)),
         tuple(getattr(query, "store_scope_pks", ()) or ()),
     )
+
+
+def queryset_pin(queryset) -> ScopePin | None:
+    """The `ScopePin` a queryset carries, for callers that need the org."""
+    return getattr(getattr(queryset, "query", None), "scope_pin", None)
 
 
 def refuse_scope_mix(left, others, operator: str) -> None:
@@ -343,24 +483,23 @@ class ScopedQuery(GuardedQuery):
     """A `Query` that refuses to compile until a store has been pinned."""
 
     def combine(self, rhs, connector):
-        """The scoped side of the same seam: re-resolve the merged pin set.
+        """The scoped side of the same seam: merge the two pins.
 
         Once a mixed merge is refused, both sides are pinned and the remaining
-        question is *whose stores*. Both checks run before `super()`, because
-        `Query.combine` mutates `self` and a refusal should leave nothing
-        half-merged behind.
+        question is *whose organization and whose stores*. Both checks run
+        before `super()`, because `Query.combine` mutates `self` and a refusal
+        should leave nothing half-merged behind.
         """
         self.refuse_scope_mismatch(rhs, connector)
-        merged = merge_scope_pks(
+        merged = merge_pins(
             self.model,
-            self.store_scope_pks,
-            getattr(rhs, "store_scope_pks", ()),
+            self.scope_pin,
+            getattr(rhs, "scope_pin", None),
             connector,
             narrow=connector == AND,
         )
         result = super().combine(rhs, connector)
-        self.store_scoped = True
-        self.store_scope_pks = merged
+        self.scope_pin = merged
         return result
 
     def get_compiler(self, *args, **kwargs):
@@ -499,18 +638,45 @@ class ScopedQuerySet(SoftDeleteQuerySet):
     # -- pinning ---------------------------------------------------------
 
     def for_store(self, store):
-        pk = _store_pk(store)
-        return self._pin(self.filter(store_id=pk), (pk,))
+        """One store. Now resolved rather than taken on trust, which buys a
+        consistent diagnostic: an unknown store id used to raise from
+        `for_stores()` and return *silently empty* here, and a query that looks
+        scoped and returns nothing is how scoping bugs hide. A saved `Store`
+        instance still costs no query (`_believable_org_pk`).
+
+        A pin is not an authorization. `for_store(<a rival's store>)` returns
+        the rival's rows, here as before, because nothing in a scoping
+        primitive knows who is asking. That is `require_store()`'s job, and a
+        store id from request data must never reach this function.
+        """
+        pin = resolve_scope([store], caller="for_store()")
+        return self._pin(self.filter(store_id=pin.store_pks[0]), pin)
 
     def for_stores(self, stores):
-        pks = _store_pks(stores)
-        return self._pin(self.filter(store_id__in=pks), tuple(pks))
+        pin = resolve_scope(stores)
+        return self._pin(self.filter(store_id__in=pin.store_pks), pin)
 
     @staticmethod
-    def _pin(queryset, pks: tuple[int, ...]):
-        queryset.query.store_scoped = True
-        queryset.query.store_scope_pks = pks
+    def _pin(queryset, pin: ScopePin):
+        """Attach the pin. Deliberately attaches *only* the pin.
+
+        No `org_id = %s` term is compiled into the read. It would be
+        tautological - the org came from the stores the caller named, so a store
+        id from another organization re-scopes the query to that organization
+        instead of returning nothing - and a term that looks like a tenant guard
+        without being one is worse than no term. The predicate that does
+        authorize comes from the tenant context, which does not exist yet.
+
+        When the org-leading composite indexes land, an `org_id` term becomes a
+        *query-plan* requirement (a `(org_id, store_id, ...)` index cannot serve
+        a `store_id`-only predicate). Add it then, with the plan measured before
+        and after, and label it as what it is.
+        """
+        queryset.query.scope_pin = pin
         return queryset
+
+    def _scope_pin(self) -> ScopePin | None:
+        return getattr(self.query, "scope_pin", None)
 
     def _scope_pks(self) -> tuple[int, ...]:
         return tuple(getattr(self.query, "store_scope_pks", ()) or ())
@@ -544,12 +710,12 @@ class ScopedQuerySet(SoftDeleteQuerySet):
         call passes through first.
         """
         clone = super()._combinator_query(combinator, *other_qs, **kwargs)
-        merged = self._scope_pks()
+        merged = self._scope_pin()
         for other in other_qs:
-            merged = merge_scope_pks(
+            merged = merge_pins(
                 self.model,
                 merged,
-                queryset_scope(other)[1],
+                queryset_pin(other),
                 f"{combinator}()",
                 narrow=combinator in NARROWING_COMBINATORS,
             )
@@ -560,23 +726,65 @@ class ScopedQuerySet(SoftDeleteQuerySet):
     def _given_store_pk(self, mapping) -> int | None:
         if not mapping:
             return None
-        for key in ("store_id", STORE_FIELD):
+        for key in (STORE_ATTNAME, STORE_FIELD):
             value = mapping.get(key)
             if value is not None:
                 return _store_pk(value)
         return None
 
+    def _given_org_pk(self, mapping) -> int | None:
+        """The same shape for `org`. Callers do not pass it - the column is
+        `editable=False` and derived - but a write that names it must be
+        checked rather than ignored."""
+        if not mapping:
+            return None
+        for key in (ORG_ATTNAME, ORG_FIELD):
+            value = mapping.get(key)
+            if value is None:
+                continue
+            if isinstance(value, models.Model):
+                if value._meta.label_lower != ORG_LABEL:
+                    raise TypeError(
+                        f"{self.model.__name__}.{ORG_FIELD} needs a {ORG_LABEL} "
+                        f"instance, got {value._meta.label_lower}."
+                    )
+                if value.pk is None:
+                    raise ValueError(
+                        f"{self.model.__name__}.{ORG_FIELD} needs a saved "
+                        f"organization; this one has no primary key."
+                    )
+                return value.pk
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(
+                    f"{self.model.__name__}.{ORG_FIELD} needs an {ORG_LABEL} instance "
+                    f"or integer primary key, got {value!r}."
+                )
+            if value <= 0:
+                raise ValueError(
+                    f"{self.model.__name__}.{ORG_FIELD} needs a positive primary key, "
+                    f"got {value!r}."
+                )
+            return value
+        return None
+
     def _check_write_store(self, *mappings):
-        """Refuse a write that names a store outside the pinned scope."""
-        pinned = self._scope_pks()
-        if not pinned:
+        """Refuse a write that names a store, or an org, outside the pin."""
+        pin = self._scope_pin()
+        if pin is None:
             return
+        pinned = pin.store_pks
         for mapping in mappings:
             given = self._given_store_pk(mapping)
             if given is not None and given not in pinned:
                 raise CrossStoreReferenceError(
                     f"{self.model.__name__}: this queryset is pinned to store(s) "
                     f"{list(pinned)}; store {given} is out of scope."
+                )
+            given_org = self._given_org_pk(mapping)
+            if given_org is not None and given_org != pin.org_pk:
+                raise CrossStoreReferenceError(
+                    f"{self.model.__name__}: this queryset is pinned to organization "
+                    f"{pin.org_pk}; organization {given_org} is out of scope."
                 )
 
     def _store_for_write(self, kwargs: dict) -> dict:
@@ -609,8 +817,30 @@ class ScopedQuerySet(SoftDeleteQuerySet):
             )
         return kwargs
 
+    def _org_for_write(self, kwargs: dict) -> dict:
+        """Stamp `org` from the pin, and refuse one that disagrees with it.
+
+        Free and exact: the pin's organization and its stores came out of one
+        read, so this cannot be inconsistent with `store`. Without a pin there
+        is nothing to stamp from and `StoreScopedModel._derive_org()` does the
+        work at `save()` instead, from the store.
+        """
+        pin = self._scope_pin()
+        if pin is None:
+            return kwargs
+        kwargs = dict(kwargs)
+        given = self._given_org_pk(kwargs)
+        if given is not None and given != pin.org_pk:
+            raise CrossStoreReferenceError(
+                f"{self.model.__name__}: cannot create a row in organization {given} "
+                f"from a queryset pinned to organization {pin.org_pk}."
+            )
+        kwargs.pop(ORG_FIELD, None)
+        kwargs[ORG_ATTNAME] = pin.org_pk
+        return kwargs
+
     def create(self, **kwargs):
-        return super().create(**self._store_for_write(kwargs))
+        return super().create(**self._org_for_write(self._store_for_write(kwargs)))
 
     def get_or_create(self, defaults=None, **kwargs):
         self._check_write_store(kwargs, defaults)
@@ -624,7 +854,8 @@ class ScopedQuerySet(SoftDeleteQuerySet):
 
     def bulk_create(self, objs, *args, **kwargs):
         objs = list(objs)
-        pinned = self._scope_pks()
+        pin = self._scope_pin()
+        pinned = () if pin is None else pin.store_pks
         for obj in objs:
             if obj.store_id is None:
                 if len(pinned) != 1:
@@ -638,8 +869,15 @@ class ScopedQuerySet(SoftDeleteQuerySet):
                     f"{self.model.__name__}: bulk_create row belongs to store "
                     f"{obj.store_id}, outside the pinned scope {list(pinned)}."
                 )
-            # bulk_create never calls save(), so the same-store check has to be
-            # made here too.
+            # bulk_create never calls save(), so the same-store check and the
+            # org derivation both have to be made here too. Order matters: the
+            # pin's org is stamped first (free, and exact), then `_derive_org`
+            # either fills it from the store or refuses a disagreement.
+            if pin is not None and getattr(obj, ORG_ATTNAME, None) is None:
+                setattr(obj, ORG_ATTNAME, pin.org_pk)
+            derive = getattr(obj, "_derive_org", None)
+            if derive is not None:
+                derive()
             check = getattr(obj, "_assert_related_stores_match", None)
             if check is not None:
                 check()
@@ -668,12 +906,36 @@ class ScopedQuerySet(SoftDeleteQuerySet):
         would strand a parent in one store with children in another. Refused
         outright - even when the target store is inside the pinned scope.
         """
-        for key in (STORE_FIELD, f"{STORE_FIELD}_id"):
+        for key in (STORE_FIELD, STORE_ATTNAME):
             if key in kwargs:
                 raise CrossStoreReferenceError(
                     f"{self.model.__name__}: update() cannot change `store`. "
                     f"Re-parenting a row is a service operation that must move its "
                     f"children too, not a bulk column write."
+                )
+
+    def _refuse_org_rehoming(self, kwargs) -> None:
+        """`update()` may never rewrite `org`/`org_id`, for a stronger reason.
+
+        `org` is *derived* from `store`, and the composite foreign key
+        `(store_id, org_id) -> orgs_store (id, org_id)` is what proves the pair
+        agrees. A bulk write to `org_id` alone therefore either breaks that key
+        outright or - if it were ever paired with a matching `store_id` write -
+        would move a business row into another organization, which is not an
+        operation this product has. Re-homing a store is a service operation on
+        `orgs_store`, not a column write on its rows.
+
+        Refused in Python as well as at the database because the message is the
+        point: an `IntegrityError` naming `<table>_store_same_org_fk` tells the
+        author what broke, not what they should have done.
+        """
+        for key in (ORG_FIELD, ORG_ATTNAME):
+            if key in kwargs:
+                raise CrossStoreReferenceError(
+                    f"{self.model.__name__}: update() cannot change `{ORG_FIELD}`. It "
+                    f"is derived from `store` and proven by the "
+                    f"{self.model._meta.db_table}_store_same_org_fk composite key; "
+                    f"re-homing a store is a service operation, not a column write."
                 )
 
     def _check_update_fk_stores(self, kwargs) -> None:
@@ -744,6 +1006,7 @@ class ScopedQuerySet(SoftDeleteQuerySet):
         """
         self._require_scope()
         self._refuse_store_reparenting(kwargs)
+        self._refuse_org_rehoming(kwargs)
         self._check_update_fk_stores(kwargs)
         return super().update(**kwargs)
 
@@ -789,13 +1052,24 @@ class StoreScopedManager(models.Manager.from_queryset(ScopedQuerySet)):
 
 
 __all__ = [
+    "ORG_ATTNAME",
+    "ORG_FIELD",
+    "ORG_LABEL",
+    "STORE_ATTNAME",
+    "STORE_FIELD",
+    "STORE_LABEL",
     "AllObjectsManager",
     "CrossStoreReferenceError",
     "HardDeleteForbidden",
     "NoHardDeleteQuerySet",
+    "ScopePin",
     "ScopedQuerySet",
     "SoftDeleteManager",
     "SoftDeleteQuerySet",
     "StoreScopedManager",
     "UnscopedQueryError",
+    "merge_pins",
+    "queryset_pin",
+    "queryset_scope",
+    "resolve_scope",
 ]

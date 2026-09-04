@@ -11,6 +11,9 @@ leaks the guard cannot see come from:
   a hand-built lookup key either;
 - a foreign key into a store-scoped model from something that is not
   store-scoped has no store to be checked against (E006);
+- a store-scoped model that loses, weakens or re-spells its denormalised `org`
+  pointer takes the composite foreign key with it, and the database stops being
+  what keeps a row's organization and its store in step (E007);
 - a unique constraint that names no tenant column turns `full_clean()` into a
   cross-tenant existence oracle - "this code already exists" for a row the
   caller cannot see (E005);
@@ -25,13 +28,14 @@ from django.apps import apps as global_apps
 from django.conf import settings
 from django.core.checks import Error, Tags, register
 from django.core.exceptions import FieldDoesNotExist
-from django.db.models import Q, UniqueConstraint, UUIDField
+from django.db.models import Model, Q, UniqueConstraint, UUIDField
 
 from common.managers import STORE_FIELD, STORE_LABEL, StoreScopedManager
 from common.models import (
     IDENTITY_COLUMNS,
     ORG_COLUMNS,
     ORG_FIELD,
+    ORG_LABEL,
     PUBLIC_ID_FIELD,
     STORE_COLUMNS,
     TENANT_COLUMNS,
@@ -39,6 +43,13 @@ from common.models import (
 )
 
 DEFAULT_MANAGER_NAME = "all_objects"
+
+#: The spelling `org` replaced, and which must not come back. Four SHA-256-pinned
+#: `RunSQL` statements already contain the literal `REFERENCES orgs_store (id,
+#: org_id)`, and the stability contract forbids editing shipped pinned text - so
+#: a table spelling it `organization_id` would produce composite keys whose two
+#: sides name the same concept differently, on every future review.
+REJECTED_ORG_SPELLING = "organization"
 
 #: Names for the primary key. A unique constraint that includes the primary key
 #: is logically implied by the primary key, so it enforces nothing - see
@@ -155,6 +166,141 @@ def _check_store_field(model, label) -> list[Error]:
             )
         ]
     return []
+
+
+def _check_org_field(model, label) -> list[Error]:
+    """E007: the denormalised organization pointer, in exactly one shape.
+
+    Worth a check rather than a test because it constrains a *class* of models
+    that new code joins by inheriting one base: every slice-2 table gets the
+    column from `StoreScopedModel`, and the ways to lose it are all quiet ones -
+    a subclass re-declaring `org` to add a `related_name`, to add an index "for
+    the planner", or to make it nullable so a fixture loads. Each of those
+    silently disarms the composite foreign key that is the *only* reason the
+    column exists, and none of them fails a query.
+
+    Every clause below is load-bearing:
+
+    * **present, and a foreign key to `orgs.organization`** - the composite key
+      `(store_id, org_id) -> orgs_store (id, org_id)` has nothing to reference
+      otherwise.
+    * **NOT NULL** - PostgreSQL's MATCH SIMPLE skips a composite foreign key
+      entirely when either column is NULL, so a nullable `org` is not a weaker
+      guarantee, it is *no* guarantee.
+    * **`editable=False`** - the value is derived from `store`; a form that
+      could set it could re-home a row.
+    * **hidden (`related_name="+"`)** - a reverse accessor
+      `organization.product_set` hands out rows with neither the store filter
+      nor the soft-delete filter. `common.E004` fires on it too; this repeats
+      the requirement where the field is described, because E004's message
+      talks about accessors and this one talks about the column.
+    * **`db_constraint=False`** - measured: a real `org_id -> orgs_organization`
+      key takes `FOR KEY SHARE` on the organization row for every insert into
+      every store-scoped table, so `create_store`'s row lock would block every
+      sale in the organization. The composite key already proves the
+      organization exists, transitively through `orgs_store.org_id`.
+    * **`db_index=False`** - the indexes that serve a tenant predicate lead with
+      `org`, and Django's automatic single-column FK index is a redundant prefix
+      of every one of them: pure write cost on the hottest tables in the
+      product.
+    """
+    try:
+        field = model._meta.get_field(ORG_FIELD)
+    except FieldDoesNotExist:
+        field = None
+    related = getattr(field, "related_model", None)
+    if field is None or related is None:
+        return [
+            Error(
+                f"{label} has no `{ORG_FIELD}` foreign key, so the "
+                f"{model._meta.db_table}_store_same_org_fk composite key cannot "
+                f"exist and nothing but application code keeps a row's "
+                f"organization and its store in step.",
+                hint=(
+                    f"Do not re-declare `{ORG_FIELD}`: inherit it from "
+                    f"StoreScopedModel, which declares it in the one shape the "
+                    f"composite key needs."
+                ),
+                obj=model,
+                id="common.E007",
+            )
+        ]
+
+    # `related` is still a string when the target app is not loaded (the
+    # isolated registries the check's own tests build).
+    related_label = (related if isinstance(related, str) else related._meta.label).lower()
+    wrong = []
+    if related_label != ORG_LABEL:
+        wrong.append(f"points at {related_label}, not {ORG_LABEL}")
+    if field.null:
+        wrong.append(
+            "is nullable, and PostgreSQL MATCH SIMPLE skips the composite key "
+            "entirely when either column is NULL"
+        )
+    if field.editable:
+        wrong.append("is editable, so a form could re-home the row")
+    if not getattr(field.remote_field, "hidden", False):
+        wrong.append(
+            'is not hidden, so `related_name="+"` is missing and the reverse '
+            "accessor hands out rows with no store filter"
+        )
+    if field.db_constraint:
+        wrong.append(
+            "carries db_constraint=True, which locks the organization row on "
+            "every insert and guarantees nothing the composite key does not"
+        )
+    if field.db_index:
+        wrong.append(
+            "carries db_index=True, a redundant prefix of every org-leading "
+            "index and pure write cost"
+        )
+    if not wrong:
+        return []
+    return [
+        Error(
+            f"{label}.{ORG_FIELD} " + "; ".join(wrong) + ".",
+            hint=(
+                f"Delete the local declaration and inherit `{ORG_FIELD}` from "
+                f"StoreScopedModel."
+            ),
+            obj=model,
+            id="common.E007",
+        )
+    ]
+
+
+def _check_org_spelling(models) -> list[Error]:
+    """E007, the other half: `organization` is not a column name here.
+
+    Applies to *every* model, not only store-scoped ones, because the damage is
+    a schema in which one concept is `org_id` on five tables and
+    `organization_id` on fifteen - and because a composite key would then read
+    `FOREIGN KEY (organization_id, store_id) REFERENCES orgs_store (id,
+    org_id)`, which looks like a bug on every future review. The name is
+    settled by four SHA-256-pinned `RunSQL` statements that already contain the
+    literal `REFERENCES orgs_store (id, org_id)`.
+    """
+    errors = []
+    for model in models:
+        if not isinstance(model, type) or not issubclass(model, Model):
+            continue
+        if model._meta.abstract:
+            continue
+        for field in model._meta.local_fields:
+            if field.name != REJECTED_ORG_SPELLING:
+                continue
+            errors.append(
+                Error(
+                    f"{model._meta.label}.{REJECTED_ORG_SPELLING} spells the tenancy "
+                    f"column the long way. It is `{ORG_FIELD}` / `{ORG_FIELD}_id` "
+                    f"everywhere in this schema, including inside four already "
+                    f"shipped, SHA-256-pinned SQL statements that cannot be edited.",
+                    hint=f"Rename the field to `{ORG_FIELD}`.",
+                    obj=model,
+                    id="common.E007",
+                )
+            )
+    return errors
 
 
 def _check_relations(model, label) -> list[Error]:
@@ -510,8 +656,10 @@ def audit_store_scoped_models(models) -> list[Error]:
         label = model._meta.label
         errors += _check_managers(model, label)
         errors += _check_store_field(model, label)
+        errors += _check_org_field(model, label)
         errors += _check_relations(model, label)
         errors += _check_uniqueness(model, label)
+    errors += _check_org_spelling(models)
     return errors
 
 
@@ -561,3 +709,71 @@ def check_database_is_not_test_named(app_configs, **kwargs):
                 )
             )
     return errors
+
+
+@register(Tags.security)
+def check_ssl_redirect_trusts_a_proxy_header(app_configs, **kwargs):
+    """E101: refuse to boot into an HTTPS redirect loop.
+
+    `SECURE_SSL_REDIRECT = True` behind a TLS-terminating proxy, with no
+    `SECURE_PROXY_SSL_HEADER`, is a total outage and not a subtle one: the proxy
+    speaks TLS to the client and plain HTTP to us, so Django sees `http`,
+    answers `301 -> https`, and the proxy forwards the retry as `http` again.
+    Every request loops until the client gives up. Measured under
+    `config.settings.prod`, which shipped exactly that pair.
+
+    The fix cannot be a value here - which header carries the client's scheme
+    is a fact about the proxy in front of a deployment that does not exist yet -
+    so this is a refusal instead: `config/settings/prod.py` reads the header
+    from `DJANGO_SECURE_PROXY_SSL_HEADER`, validates it, and leaves it unset
+    when the operator has not chosen one. Then this check stops the boot.
+
+    Four properties, each learned from `common.E100`:
+
+    * **`Tags.security`, never `Tags.database`.** `CheckRegistry.run_checks`
+      drops database-tagged checks unless an alias is passed, and a bare
+      `manage.py check` passes none, so E100 sat inert for two review rounds.
+    * **No database connection.** Pure `settings` inspection, so a pre-boot
+      `manage.py check` in a container does not need a reachable database to
+      report this.
+    * **An `Error`, not a `Warning`.** Django's own `security.W008` covers the
+      missing-redirect half, but it is `--deploy`-only and a warning does not
+      fail `manage.py check`.
+    * **The gate is the condition, not a second flag.** Dev and test settings
+      never set `SECURE_SSL_REDIRECT`, so this cannot fire inside the suite and
+      there is no `ENFORCE_...` switch to forget.
+
+    Deliberately not covered: a process that terminates TLS itself needs no
+    proxy header and would be refused here. This product has one deployment
+    shape - a container behind a reverse proxy - and inventing an opt-out for a
+    shape nobody runs would be a setting nobody sets and a hole anybody could
+    use. Add it, with a measurement, the day the shape exists.
+    """
+    if not getattr(settings, "SECURE_SSL_REDIRECT", False):
+        return []
+    header = getattr(settings, "SECURE_PROXY_SSL_HEADER", None)
+    well_formed = (
+        isinstance(header, (tuple, list))
+        and len(header) == 2
+        and all(isinstance(part, str) and part for part in header)
+    )
+    if well_formed:
+        return []
+    return [
+        Error(
+            f"SECURE_SSL_REDIRECT is on and SECURE_PROXY_SSL_HEADER is {header!r}. "
+            f"Behind a TLS-terminating proxy Django sees 'http', redirects to "
+            f"'https', and the proxy forwards the retry as 'http': every request "
+            f"loops for ever.",
+            hint=(
+                "Set DJANGO_SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,https "
+                "(or whichever header your proxy overwrites) so Django can tell a "
+                "proxied HTTPS request from a plain one. Only for a header the "
+                "proxy overwrites unconditionally: Django trusts it absolutely, so "
+                "a client-supplied one would turn the redirect off. If nothing "
+                "terminates TLS in front of this process, turn SECURE_SSL_REDIRECT "
+                "off instead - it cannot work there either."
+            ),
+            id="common.E101",
+        )
+    ]

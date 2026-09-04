@@ -9,3 +9,7 @@ ruff==0.16.5
 # Verifies uploaded logos are really PNG/JPEG/WebP by decoding the bytes
 # (an attacker picks the extension), and backs Django's ImageField.
 Pillow==12.3.0
+# Shuffles test order every run: the suite was green only because pytest's
+# fixture-scope reordering happened to schedule an app-registry leak after its
+# victims. Order-independence is now enforced, not assumed.
+pytest-randomly==5.0.0

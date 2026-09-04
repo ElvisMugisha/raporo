@@ -871,3 +871,148 @@ Cost if wrong: adding `Store.timezone` later is one nullable column plus a docum
 **Ruling 3 — production hosts in Rwanda.** Removes Law 058/2021 Arts 48 and 50 from the critical path for the database and the media directory, which together hold 100% of the personal data. **Does not remove:** the NCSA registration, the named DPO and the DPA annex (still a launch blocker, still a 6–10 week clock, and the 2021 law's transition expired 15 October 2023 so no grace period remains); a written processor contract with the host; and an email provider abroad, which remains its own Art 48 transfer to declare. `privacy-compliance` had corrected its own earlier position here — its original "document the route and apply" understated the law, because **Art 50 requires a registration certificate that expressly authorises offshore storage**, not a generic one.
 
 **Ruling 4 — the report carries `Sales` and `Received` as two numbers, never added.** `Sales` = sum of sale line values, dated by the sale. `Received` = sum of payments in, dated by the payment. This resolves a live contradiction between two committed documents: `PRODUCT.md` says *"revenue = money actually received"* while `PROJECT-DESCRIPTION.md` says a deposit *"counts in the day's sales"*. Both are now true of different, differently-named lines. The sample reports already keep a `SALES` section and a `PAYMENT` section apart, so the app stops merging what the paper separates, and the credit book stays reconcilable against period revenue. Cost if wrong: two report lines where one was expected; the alternative was two screens showing two different totals both labelled "sales", which is the defect class that makes an owner stop trusting the tool.
+
+### Phase 1 APPROVED by Elvis (2026-09-03), plus three answers
+
+**`igishoro` / `inyungu` — resolved, and his answer resolved it by a route the question did not anticipate.** Elvis supplied the meanings: *igishoro* = "the money or assets you start a business with — the initial investment used to generate more wealth" (EN capital / investment / seed money; FR capital / fonds de commerce); *inyungu* = "the financial gain after selling a product or running a business — revenue minus expenses" (EN profit / benefit; FR profit / bénéfice). Both are the **whole-of-business** sense.
+
+The disambiguation therefore falls out of the existing sample reports rather than needing new vocabulary: **bare form = cycle/whole sense; qualified `igishoro cy'ibyacurujwe` / `inyungu y'ibyacurujwe` ("…of what was sold") = period sense.** The businesses already write it this way. Rule recorded in `docs/PRD.md` §6: a report never prints a bare form for a period figure, nor a qualified form for a cycle figure. Cost if wrong: one line from Elvis; `localization-engineer` owns the RW/FR strings when Task 8 lands.
+
+**Production hostname — deliberately not decided.** So `CSRF_TRUSTED_ORIGINS` and `SECURE_PROXY_SSL_HEADER` cannot be written, and guessing a hostname would be worse than leaving them empty.
+
+Ruling: do **not** park D1 (the `SECURE_SSL_REDIRECT = True` + `SECURE_PROXY_SSL_HEADER = None` redirect loop) waiting for a hostname. Close it as a **boot-time refusal instead of a value**: prod settings must fail `manage.py check` when `SECURE_SSL_REDIRECT` is truthy and `SECURE_PROXY_SSL_HEADER` is unset. That needs no hostname, converts a first-deploy total outage into a named startup error, and is the `common.E100` shape — a settings-string check with no connection. Cost if wrong: a deploy behind a proxy that genuinely terminates TLS end-to-end must set the header explicitly; that is the correct burden. Assigned into the `E101` family alongside the runtime-identity check.
+
+**Email: Gmail (Elvis's decision).** Recorded and it stands. Two consequences that are not objections but must be written down rather than discovered:
+
+1. **Sending limits are a launch-capacity question, not a detail.** Consumer Gmail SMTP caps around 500 recipients/day and Workspace around 2,000. Password reset, invites and (slice 6) scheduled report delivery all share that budget. Also: `From` must match the authenticated account, so `DEFAULT_FROM_EMAIL = noreply@raporo.rw` requires Workspace on a domain Elvis controls plus a "send mail as" alias — it cannot be done from a consumer account.
+2. **A consumer Gmail account has no data-processing agreement, and Raporo is a processor for its customers.** Google Workspace carries the Cloud Data Processing Addendum; a personal Gmail account carries none. Sending customer personal data (email addresses, invitee names) through an account with no DPA is a genuine gap in the Art 48/49 chain — and it is the one place Elvis's Rwanda-hosting ruling does *not* remove the cross-border question, because Google is US-based. **Recommendation: Google Workspace, not consumer Gmail**, so a DPA exists and the from-address can be on the Raporo domain. Routed to `privacy-compliance` for the Art 48 declaration either way. Not a launch blocker for slice 1 (no mail is sent until Task 9b) but it is on the launch list.
+
+Sequencing changes proceeding absent objection, both conservative: the **one-org-per-user constraint lands before Task 4** (a second live membership was measured accepted today, and Tasks 4 and 7 are about to be written against the opposite assumption), and the **`orgs_membership` RLS bootstrap closes before RLS ships** (a plain policy on that table returns zero rows at login, so nobody can ever authenticate — total lockout, not a leak).
+
+## Session 7b — Phase 3 begins: the tenancy round
+
+**Ruling that narrows a standing rule. Corrected 2026-09-04 — my first statement of the cause was wrong.** The standing rule is "no two parallel agents share a checkout — give each a `git worktree`." Measured: **a worktree created by the harness is based on an old commit, not the branch tip.** The `architect`'s worktree came from `6e785fd`, carrying no source tree and only ADRs 0001–0006; it attempted `git reset --hard feat/slice-1-foundation` and was denied.
+
+**I attributed that denial to the harness. It is this repo's own `.claude/settings.json`, which denies `Bash(git reset:*)`** — deliberately, so no agent can rewrite history. That matters because it changes the conclusion: `git checkout` is **not** denied, so a worktree *can* be populated with `git checkout <branch> -- .`, and worktree isolation is therefore available with a one-line workaround rather than unavailable. The decision to run implementers sequentially stands, but on cost/benefit rather than on impossibility: a populated-by-checkout worktree has a detached base whose `git diff` no longer reads as one author's work, which is the attribution property the isolation existed to protect. That is survivable for an agent authoring new files — it read the real tree read-only and wrote into the worktree, and the controller copied the two files out — but it makes a worktree **unusable for an implementer editing existing source**, which is every remaining task.
+
+So implementers run **one at a time in the main checkout**. The standing rule's *purpose* — never two agents mutating one tree — is satisfied by there being one agent. Its stated *mechanism* is not available here. Cost if wrong: throughput. The alternative was parallel agents sharing the main tree, which is precisely the configuration that cost this project a deleted security guard and a phantom regression, so throughput loses. Revisit if worktrees can be based on `HEAD`.
+
+Corollary recorded so nobody re-derives it: read-only *analysis* agents may still run in parallel in the main tree, as five did this session — they cannot mutate it, and three of them independently reported `git status --porcelain` at start and finish with every diff accounted for.
+
+### Tooling audit (2026-09-04) — three silent failures in the committed AI-team setup
+
+ADR 0001's premise is "clone on any machine, run `scripts/setup.sh`, and the whole team works identically." Three things measured false.
+
+**1. Two of the five declared plugins have never loaded.** `claude plugin list` reports them installed from a *different* marketplace than `settings.json` enables:
+
+    declared: superpowers@superpowers-marketplace     installed: superpowers@claude-plugins-official     -> DISABLED
+    declared: security-guidance@claude-code-plugins   installed: security-guidance@claude-plugins-official -> DISABLED
+
+There is **no `superpowers-marketplace` directory in the plugin cache at all**, so the enable key matched nothing. `setup.sh:80` ran `claude plugin install "$p" && ok "plugin $p"` — which **prints success on an install that leaves the plugin disabled**. That is this project's signature defect, in its own bootstrap: a control that reports working and does nothing. The superpowers skills that never loaded are precisely the methodology this repo is named after — `writing-plans`, `executing-plans`, `subagent-driven-development`, `verification-before-completion`, `test-driven-development`, `using-git-worktrees`, `requesting-code-review`, `dispatching-parallel-agents` and six more. Every session has been reproducing them by hand from this ledger.
+
+Fixed: `settings.json` keys corrected, `claude-plugins-official` declared in `extraKnownMarketplaces`, and `setup.sh` now **asserts enablement** by grepping `claude plugin list` for `enabled` per plugin rather than trusting the installer's exit code. Requires `claude plugin enable <p>` plus a session restart by Elvis — agents cannot run it.
+
+**2. Headroom has never run.** `headroom: command not found`; `~/.local/bin/headroom` absent; `uv tool list` reported `Ignoring malformed tool headroom-ai` — a half-written install that `setup.sh` skipped over because its check was `command -v headroom` inside an `else` branch that had already failed once. `.claude/settings.local.json` carries no `ANTHROPIC_BASE_URL` and no hooks, so the project was never routed either. **Every token spent across all seven sessions was uncompressed.** Repaired: uninstall-then-install (v0.37.0 now on PATH), proxy started and verified `✓ pass — running at http://127.0.0.1:8787`. `setup.sh` now clears a malformed install first and **fails** rather than warns if `headroom` is still missing afterwards. Routing (`ANTHROPIC_BASE_URL`) is deliberately left to `setup.sh` step 4 and a session restart — rewriting it mid-session would re-route a live session and three running agents.
+
+Also stale: `settings.json` allowed `Bash(headroom status:*)`, and `status` is not a command in 0.37 (`stats` is). Corrected.
+
+**3. `git worktree` is NOT denied — only `git reset` is.** So the controller can create correctly-based worktrees itself: `git worktree add --detach <path> feat/slice-1-foundation` yields a full checkout at the branch tip (verified: `managers.py` 801 lines, 11 ADRs, HEAD `387ae62`). This **reverses** the Session 7b ruling that worktrees were unusable — that conclusion came from the harness's own `isolation: "worktree"`, which bases them on an unrelated commit. Parallel implementers with real isolation are available after all, and three tracks were dispatched that way (`wt-tenancy`, `wt-orgs`, `wt-periods`), each with its own compose project. The standing rule is satisfiable as written; it just needs the controller to create the worktree rather than the harness.
+
+Ruling: `review-animations` carrying `disable-model-invocation: true` is **deliberate, not a defect** — it is slash-command only. `security-guidance` shipping no skills is also correct; it is a hooks-only plugin (`SessionStart`, `UserPromptSubmit`, `PostToolUse`). Neither needs fixing; both were recorded so the next audit does not re-flag them.
+
+## Session 8 — the tenancy round built and gated (2026-09-04)
+
+**Three parallel tracks, real worktree isolation, one merge. 574 → 1538 tests.** Worktrees created by the controller (`git worktree add --detach <path> feat/slice-1-foundation`), each with its own compose project. Disjoint file ownership; exactly one file overlapped (`tests/test_orgs_models.py`, Track C changing one function inside Track B's 141 insertions) and merged cleanly.
+
+Controller verification after merge, by execution: **1538 passed**, ruff `check` clean, `manage.py check` silent, no drift under either settings module, wiped-volume `up -d --wait` **healthy in 18s** with 27 migrations and `/healthz` 200, four `%same_org_fk%` keys all `condeferrable=t condeferred=f`, both audit triggers reinstalled.
+
+**The one cross-track interaction, found by the merge and not by any track.** Track C's forbidden-query-form scanner fired on Track A's `common/models.py:337`: `\bBETWEEN\b` with `re.IGNORECASE` matched the English word "between" in the error message *"moving a row between organizations is not an operation."* Narrowed to case-sensitive (every raw statement in this codebase spells keywords upper-case) plus `test_the_scanner_still_catches_a_real_uppercase_between` asserting both halves, then proven by planting a real `WHERE business_date BETWEEN %s AND %s` (caught) beside the prose (spared). **`code-reviewer` then judged the fix insufficient** — see I5 below.
+
+### Gate verdicts
+
+| Gate | Verdict |
+| --- | --- |
+| `security-engineer` | **APPROVE WITH NITS** — "security says merge" |
+| `database-engineer` | **APPROVE WITH NITS** |
+| `code-reviewer` | **REQUEST CHANGES** — 2 blocking, both small |
+| `qa-engineer` | pending |
+
+### The retention floor was wrong three times, in three layers, found by three reviewers
+
+1. `privacy-compliance` prescribed range partitioning. **Overruled** on seven measurements; it accepted, stating its prescription was "reasoned, not measured".
+2. Its replacement floor, `at < now() - interval '10 years'`, was **wrong in the dangerous direction** — Rwanda's ten years runs from 1 January following the fiscal year, so a March 2026 row is protected to 31 December 2036 and that floor licensed deleting it nine months early. Corrected by `privacy-compliance` itself to `extract(year from at) <= extract(year from now()) - 11`.
+3. `database-engineer` then measured that **`extract(year from at)` is session-TimeZone dependent**, and the application session is UTC: a row recorded at 00:30 on 1 January 2027 in Kigali reads as year **2026** in UTC and **2027** in Kigali. The corrected formula still classified a Rwandan New Year row a full year early. Final: `extract(year from at AT TIME ZONE 'Africa/Kigali')`.
+
+Recorded in **ADR 0012** (`docs/adr/0012-audit-log-destruction-at-end-of-retention.md`, 187 lines), drafted by `database-engineer` and written by the controller, with partitioning as the rejected option and all four partitioning measurements quoted. Standing rule attached: **the direction of error is over-retention.**
+
+### `database-engineer` refuted a premise the controller had relayed as fact
+
+The brief asserted that an org-leading index and a read-side `org_id` predicate must land together or neither, because "a `(org_id, store_id, …)` index cannot serve a `store_id`-only predicate". **False on PostgreSQL 18**, measured on 500k rows:
+
+    store_id-only predicate vs the ORG-LEADING index
+        50 orgs  -> Index Searches:   52   hit=104 read=60   1.312 ms
+      2000 orgs  -> Index Searches: 2001   hit=5994          4.868 ms
+      2000 orgs, org_id in the predicate
+                 -> Index Searches:    1   hit=3             0.039 ms
+
+PG 18's **skip scan** serves it, which makes the index *worse* than dead weight: the plan reads like a healthy index scan while degrading linearly in tenant count — 125x on time, 2003x on buffers. And the read predicate on the *current* store-leading shape costs nothing (a heap filter on 270 already-narrowed rows, measured marginally faster). **Ruling reversed: the predicate lands alone and first; the org-leading index must not land without it.** `E008`'s acceptance test is `Index Searches: 1`, not "an index is used".
+
+Also from that gate: the redundant-index count is **26, not 22** (four more found by a mechanical strict-left-prefix query over `pg_index`), 25 signed off and `orgs_membership_user_id` **held** because `Membership.all_objects.filter(user=…)` is the leave-and-rejoin history and that table grows with users. And **the application schema has zero CHECK constraints** — every domain rule is a NOT NULL, an FK or a UNIQUE; nothing validates a value. Its own recommended phone CHECK had a hole it found and closed itself (`788123456` accepted — the one-SIM-two-strings defect).
+
+Two of its findings correct **its own** prior wording, faithfully copied into the code: the `INITIALLY DEFERRED` docstrings say the violation is "attributed to whichever test ran last". Measured false — attributed to the *same* test, which reports `PASSED` with a red teardown. The genuinely silent path is narrower: `_should_check_constraints()` skips the re-arm when the connection already needs rollback.
+
+### `code-reviewer`: two blocking, and one correction to the controller's own fix
+
+- **B1 — the clause the whole merge algebra rests on has no witness.** `merge_pins` traded a database read for an integer comparison *on the strength of* `_believable_org_pk` refusing a hand-built `Store`. Removing the `state.adding or state.db is None` clause leaves 219 tests green while `for_store(real) | for_store(Store(id=<real foreign id>, org_id=<mine>))` returns **both organizations' rows**. Controller reproduced the shipped behaviour: `_state.adding` is `True`, `_believable_org_pk` returns `None`, the org is re-queried and the merge is refused. The guard works; nothing tests it. **`security-engineer` found the same code path from the other direction** (its Low 4, "a tampered `Store` instance can pin a query across two organizations") — one asked *is it exploitable*, the other *is it witnessed*. Independent convergence, again the best predictor in this ledger.
+- **B2 — `set_membership_role(..., stores=[...])` is silently discarded on any non-demotion.** `elif was_access_all:` means the argument applies only when moving *off* an `access_all` role; every other transition accepts it and drops it, returning success. An access-control API answering "done" to something it did not do.
+- **I1 — `ScopePin` does not make "pinned but empty" unrepresentable, and the comment says it does.** `ScopePin(org_pk=1, store_pks=())` constructs, `store_scoped` is `True`, and the query compiles with **no store predicate** — the round-4 leak verbatim. Unreachable today; the claim is stronger than the code and the code is three lines from matching it.
+- **I5 — the controller's BETWEEN fix treated the instance, not the class.** Three sibling patterns are still `IGNORECASE` over arbitrary string literals, and two *new* collisions are latent: `deleted_at__lte` (the shape the Law 058/2021 retention runner will be written in) and `created_at__gt` (cursor pagination). Both are legitimate non-period queries, and `test_every_waiver_in_the_tree_is_in_a_test` forbids `# periods: allow` in `common/`, `apps/` and `config/` — **so the first author to write either hits a guard with no sanctioned escape.** A designed dead end, and it will get the scanner switched off, which is the exact reasoning the module used to drop `now()`. Its structural fix: require a SQL keyword in the same literal before flagging, which spares prose in all four patterns and would have spared `models.py:337` without narrowing anything.
+- **I6 — `docs/ROADMAP.md` was stale in the change that lands the work**, against CLAUDE.md's own rule. Controller's file, controller's miss; corrected.
+
+On the test count, its judgement is worth keeping: *"+964 tests overstates the number of independent facts by roughly 400; do not quote it as a coverage figure."* 19 targeted mutations, 19 discriminated; **six lines had no witness** (B1 plus four in `common/managers.py`).
+
+**Controller process error, flagged by `code-reviewer` and correctly:** the controller wrote ADR 0012 into the live checkout **while that review was in flight**, perturbing its baseline. The gate attributed the file to `database-engineer`; it was the controller, from that gate's draft. The LEDGER's own Session 7b ruling forbids exactly that configuration. The remaining gate round waits for `qa-engineer` before any edit to the tree.
+
+### `qa-engineer`: REQUEST CHANGES — and the headline number was inflated by two of the three claims defending it
+
+~65 mutations applied one at a time, suite run each, file restored and `cmp`-verified. **60 killed.** Its summary, which the controller adopts: *"the +964 is real evidence, padded with about 420 tests of measured-zero discriminating power."* Both `qa-engineer` and `code-reviewer` reached that independently. **Stop quoting +964 as a coverage figure.**
+
+**BLOCKING — the suite is green by scheduling accident, and this invalidates every green run reported this session.** `tests/test_common_checks.py:952` is the only one of 44 model-defining tests in that file without `@isolate_apps("tests.testapp")`. It calls `scoped_with_org(...)`, which does `type(name, (StoreScopedModel,), ...)` with `app_label = "testapp"`, so a **table-less** model registers into `django.apps.apps` permanently for the session.
+
+    reverse order   -> 8 failed, 1530 passed
+    shuffle seed 1  -> 7 failed, 1531 passed
+    shuffle seed 2  -> 5 failed, 1533 passed
+    every failure: psycopg.errors.UndefinedTable: relation "testapp_inheritsorg" does not exist
+
+Default order is green **only** because pytest's fixture-scope reordering places the leak at execution index **#703**, after all four victims — measured at #247 (`dumpdata` round trip), #396 (`soft_delete_store`), #567 and #569 (the two registry-walking enumeration tests). Blast radius is everything that walks `apps.get_models()` and then queries, including `provisioning.live_store_scoped_rows()`.
+
+**And the reason it reached a gate: there is no ordering plugin installed at all** — `pytest_randomly`, `pytest_xdist`, `pytest_random_order` all absent. One line fixes the leak (verified 1538 across default, reverse and seeds 1/2/7, then reverted); `pytest-randomly` is what stops the next one hiding.
+
+**BLOCKING — `common/managers.py:539` `_raw_delete` destroys data and has zero tests.** Replacing the refusal with a real delete leaves **1538 passed**: `_raw_delete HARD-DELETED 1 organization row(s)`. `QuerySet._raw_delete` issues a real `DELETE` and is directly callable. Its two siblings have tests (queryset `delete()` 9 kills, instance `delete()` 1 kill); this one never did, in a codebase whose first principle is that nothing is ever hard-deleted.
+
+**BLOCKING — the query-form scanner misses the ordinary Django idiom.** `ZONELESS_CLOCK_CALLS` and `SERVER_ZONE_CALLS` match on the dotted name, so any rebinding defeats them. Measured escapes planted in real production code:
+
+    ESCAPED!  from django.utils.timezone import localdate; _t = localdate()
+    ESCAPED!  from datetime import datetime as DT; _now = DT.now()
+    ESCAPED!  from datetime import date as D; _t = D.today()
+    ESCAPED!  from django.db.models.functions import TruncMonth as _T; _x = _T("created_at")
+
+The first needs no alias — it is the ordinary Django import — and a bare `localdate()` is exactly the `settings.TIME_ZONE` read that produced the measured 300-versus-500 defect. The module's own "what it cannot see, stated plainly" section lists four limitations and import spelling is not among them.
+
+**BLOCKING — an impossible period constructs cleanly then throws a bare `OverflowError`** from a property (`common/periods.py:394`, and three more sites). A custom range's end date is user-typed, so `periods.custom(date(9999,12,30), …)` is a **500 on a fat-fingered year** rather than a validation error, against the engine's stated contract that an impossible period raises `PeriodError` at construction.
+
+**The three-timezone harness is theatre, and the controller relayed its defence as fact.** `qa-engineer` reproduced the author's exact number (12 failed, 15 passed) and then split it per zone: **4 failed / 5 passed in each of UTC, Kiritimati and Anchorage** — killed identically. It then ran 12 mutations spanning the whole engine: **zero discriminated by server zone.** The structural reason is decisive: `common/periods.py` touches neither `settings` nor the ORM, so only **2 of 198** tests can depend on the fixture at all (both name it explicitly). The autouse fixture multiplies the other 196 for nothing — **392 of 594 collected tests are duplicates with no measured discriminating power.**
+
+It then did the better thing and found the axis that *does* matter is untested: `REPORTING_TIMEZONES` ships **12** zones and the suite sweeps a handful of hand-picked exotic ones instead, never the allowlist the product actually runs on. It wrote that sweep — full-year day partition plus "a month equals its two halves" for all 12 — **24 tests, 0.30s, all passing.** Ruling: drop the autouse, keep the 3x on the two tests that name the fixture, adopt the 12-zone sweep.
+
+**33% of the denial matrix is inert.** 5 of 13 rows killed by **zero** of 11 `access.py` mutations — `a1_manager -> A1 = 200`, `a_decoy -> A1 = 200`, and the three `anonymous -> 401` rows. The anonymous rows are the worst: they exercise `if not request.user.is_authenticated: return HttpResponse(status=401)` written **in the test file**, so fifteen parametrised cases assert that a two-line harness returns the constant it was written to return. The model axis added zero discrimination too (all 11 mutations killed all five models identically) — justified only as the forward guarantee, which `test_every_store_scoped_model_is_in_the_matrix` provides and which is real.
+
+**The ledger's own signature failure recurred, and `qa-engineer` caught the second instance.** `tests/test_tenancy_org_column.py:326 test_get_or_create_refuses_another_organization` looks like the test for `_check_write_store`'s org branch and is not — it is **doubly guarded** and survives removal of either guard alone. Proven by removing both: 2 failed. Not a security hole (the composite key still refuses) but the readable message the code's own docstring calls "the point" is lost, and the transaction is poisoned instead of clean.
+
+**Verified adequate by mutation, with positive controls** — one-live-membership (raced with two threads: 1 commit, 1 `IntegrityError`, exactly 1 live row); the store cap under **five** concurrent creates (`['created','StoreLimitReached'x4]`, total 5); the org row lock; escalation refusal; all three `_derive_org` precedence branches (whole method off → 27 failed + 171 errors); `_V1` SQL pinning from a one-character whitespace edit; the timezone allowlist (10/13/17 kills); `load_fixture`'s re-arm (2 kills **plus 2 collateral errors in later tests**, the landmine biting exactly as documented). And `register_owner` rolls back from **all five** failure points, not just the one the suite tests.
+
+**Cleared:** `common.E007`, every clause discriminating, and the `== []` assertions are honest negative controls with real positive counterparts. It confirmed the controller's premise by measurement: `config.settings.dev` → **0** `StoreScopedModel` subjects, `config.settings.test` → 5. So E001–E007 are silent by construction in production and `manage.py check` being quiet under dev proves nothing.
+
+**Process note, its own:** its first pass ran the shuffle battery and the E007 battery concurrently against one container and one test database, producing 224 spurious errors. It discarded those results and re-ran everything serialized. Disclosing that rather than shipping the numbers is the behaviour this project has been trying to instil.
+
+**Controller error, flagged by two gates independently:** the controller edited the live checkout during the gate round — ADR 0012, `ruff.toml` `py313`→`py314`, and three unquoted forward refs in `common/periods.py` from `ruff check --fix`. `code-reviewer` attributed the ADR to `database-engineer`; it was the controller, from that gate's draft. `qa-engineer` gated its start-of-session snapshot and states plainly that those three changes are **ungated by it**. Both are right, and the Session 7b ruling forbids exactly that configuration. The `py314` bump and the three annotations therefore carry no gate verdict and are called out in the commit message.

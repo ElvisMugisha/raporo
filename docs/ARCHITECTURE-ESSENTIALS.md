@@ -19,7 +19,7 @@ where they are rules you must obey.
   `common/tenancy.py`, `common/middleware.py`, `common/selectors.py`, any `services/` package,
   `tests/test_tenancy_matrix.py`, `templates/base.html`, `locale/rw`, `locale/fr`,
   `compose.prod.yaml`, any CI, `store.access_all`, the one-org-per-user constraint,
-  `common.E007`–`E011`, `E101`, `E102`, `E200`.
+  `E008`–`E011`, `E102`, `E200`. **Built since:** `E007` (the `org` column) and `E101`.
 - **`common.E012` does not exist.** Registered today: `common.E001`–`E006` and `E100`. The
   `E012` in circulation is **Django's** `models.E012`.
 - `StoreScopedModel` has **zero concrete subclasses**, so the `org` column still needs no data
@@ -33,7 +33,7 @@ where they are rules you must obey.
 | The identifier is **`public_id`** on **`PublicIdModel`**: `UUIDField(default=uuid.uuid7, editable=False, unique=True)` | measured — only `clean_fields` skips a `DatabaseDefault`, so a database default puts an expression object into a `WHERE` clause and into a DOM id | ADR 0010 **Amendment**: not `uuid`, not `IdentifiedModel`, not a db default, not a named `UniqueConstraint` |
 | RLS is **`ENABLE`**, never `FORCE`; **no `BYPASSRLS` anywhere** | `FORCE` plus `BYPASSRLS` is self-cancelling, and dropping `BYPASSRLS` makes backfills silently affect 0 rows | ADR 0009 **Amendment**; the pre-amendment text is retained deliberately and is **not** current |
 | The composite-FK generator is `same_org_fk_v1`; keys are named `<table>_store_same_org_fk` | identical in shape to the four already shipped | schema plan §A.5 |
-| Check ids: E007 = org-leading index · E008 = `public_id` present · E009 = the `org` FK · E010 = exhaustive `PRESETS` | ADR 0008 assigns E010 to the index rule and is stale; §D.2 renumbered it | tenancy design §D.2, §J.2 |
+| **Check ids, settled 2026-09-04 — this table wins over every spec:** E007 = the `org` FK on `StoreScopedModel` **(SHIPPED)** · E008 = org-leading index · E009 = `public_id` present · E010 = exhaustive `PRESETS` · E100 = no `test_`-named prod database **(SHIPPED)** · E101 = `SECURE_SSL_REDIRECT` requires a proxy header **(SHIPPED)** · E103 = runtime identity: the `default` role owns no application table and holds no `BYPASSRLS`, `SUPERUSER` or `TRUNCATE` — **DESIGNED, NOT BUILT** · E102 = RLS conformance · E200 = erasure plan | Three documents disagreed: ADR 0008 gave E009 to the FK and E010 to the index; tenancy design §D.2 gave E007 to the index; the schema plan reserved E101 for the `/app`-write rule. The code has now picked a side, so the table follows the code. **There is no `common.E012`** — `models.E012` is Django's own. The E101 row was briefly written here as covering runtime identity *and* the redirect header, with only the redirect half built; `security-engineer` caught it in the same session. A documented, correctly-named, never-executed control is the failure this project has already paid for twice, so the two are separate ids and the unbuilt one says so. | ADR 0008, ADR 0011, tenancy design §D.2, schema plan §D.3 |
 
 ## Tenancy — invariant #1 is the release gate
 
@@ -64,7 +64,7 @@ where they are rules you must obey.
   composite FK when either column is NULL); `related_name="+"` (or E004 fires);
   `db_constraint=False` (measured — a real FK there makes `create_store` block every sale in
   the org), and `create_store` must use `select_for_update(no_key=True)`. (schema plan §A)
-- **Every `Index` on a store-scoped model leads with `org` or `store`** (E007). `models.Index`
+- **Every `Index` on a store-scoped model leads with `org`** (E008, not yet built). `models.Index`
   names cap at 30 chars; `UniqueConstraint` names do not — do not "fix" a long constraint name.
 - **`accounts_user` gets no RLS policy, deliberately** — auth resolves an identifier before any
   organization is known. Its defence is the non-enumerating backend plus throttling.

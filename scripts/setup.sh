@@ -46,8 +46,16 @@ if command -v headroom >/dev/null 2>&1; then
 else
   if $CHECK_ONLY; then fail "Headroom missing"; else
     warn "Headroom missing — installing"
-    uv tool install --python 3.13 "headroom-ai[all]"
-    ok "Headroom installed"
+    # A half-written install leaves uv reporting "Ignoring malformed tool
+    # headroom-ai" and no `headroom` on PATH, which is silent: the proxy simply
+    # never compresses anything. Measured on this machine 2026-09-04. Clear it
+    # first so a re-run repairs rather than skips.
+    uv tool uninstall headroom-ai >/dev/null 2>&1 || true
+    uv tool install --python 3.14 "headroom-ai[all]" || \
+      uv tool install "headroom-ai[all]" || warn "headroom install failed — run manually"
+    command -v headroom >/dev/null 2>&1 \
+      && ok "Headroom installed" \
+      || fail "Headroom still not on PATH — ensure ~/.local/bin is in PATH"
   fi
 fi
 
@@ -75,9 +83,21 @@ if command -v claude >/dev/null 2>&1; then
     for m in obra/superpowers-marketplace pbakaus/impeccable thedotmack/claude-mem anthropics/claude-code; do
       claude plugin marketplace add "$m" >/dev/null 2>&1 || true
     done
-    for p in superpowers@superpowers-marketplace impeccable@impeccable claude-mem@thedotmack \
-             security-guidance@claude-code-plugins claude-code-setup@claude-plugins-official; do
+    # The marketplace suffix must be the one `claude plugin list` reports, not the
+    # plugin's nickname. Measured 2026-09-04: `superpowers@superpowers-marketplace`
+    # and `security-guidance@claude-code-plugins` matched no installed plugin, so
+    # both stayed DISABLED for the life of the project while `install` reported
+    # success. Verify any change here with `claude plugin list`, not by re-reading
+    # this file.
+    for p in superpowers@claude-plugins-official impeccable@impeccable claude-mem@thedotmack \
+             security-guidance@claude-plugins-official claude-code-setup@claude-plugins-official; do
       claude plugin install "$p" >/dev/null 2>&1 && ok "plugin $p" || warn "plugin $p — install manually: claude plugin install $p"
+      claude plugin enable "$p" >/dev/null 2>&1 || true
+    done
+    # Enabled != loaded. This is the assertion the old code was missing.
+    for p in superpowers security-guidance impeccable claude-mem claude-code-setup; do
+      claude plugin list 2>/dev/null | grep -A3 "$p@" | grep -q 'enabled' \
+        && ok "plugin $p enabled" || warn "plugin $p present but NOT enabled — check the marketplace suffix in .claude/settings.json"
     done
     # claude-mem needs its worker + hooks registered (one-time; interactive on first run)
     if command -v bun >/dev/null 2>&1 || npx --yes claude-mem status >/dev/null 2>&1; then

@@ -12,9 +12,9 @@
       "Bash(npm test:*)",
       "Bash(python3 --version)",
       "Bash(python3 .claude/skills/ui-ux-pro-max/scripts/*)",
-      "Bash(headroom status:*)",
       "Bash(headroom stats:*)",
       "Bash(headroom doctor)",
+      "Bash(headroom proxy)",
       "Bash(playwright-cli:*)"
     ],
     "deny": [
@@ -39,15 +39,15 @@
     "thedotmack": {
       "source": { "source": "github", "repo": "thedotmack/claude-mem" }
     },
-    "claude-code-plugins": {
+    "claude-plugins-official": {
       "source": { "source": "github", "repo": "anthropics/claude-code" }
     }
   },
   "enabledPlugins": {
-    "superpowers@superpowers-marketplace": true,
+    "superpowers@claude-plugins-official": true,
     "impeccable@impeccable": true,
     "claude-mem@thedotmack": true,
-    "security-guidance@claude-code-plugins": true,
+    "security-guidance@claude-plugins-official": true,
     "claude-code-setup@claude-plugins-official": true
   },
   "enableAllProjectMcpServers": false

@@ -1,12 +1,51 @@
 """Shared fixtures for the foundation test-suite."""
 
 import pytest
+from django.apps import apps as django_apps
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
 from django.db import DEFAULT_DB_ALIAS, connections
 
 from apps.orgs.models import Organization, Store
 from tests.testapp.models import Category, Product, Sale
+
+
+@pytest.fixture(autouse=True)
+def refuse_a_leaked_model():
+    """No test may leave a model behind in the app registry.
+
+    A test that builds a throwaway model - `type(name, (StoreScopedModel,),
+    {...})` or a `class` in a function body - registers it in
+    `django.apps.apps` for the rest of the *session* unless it is wrapped in
+    `@isolate_apps`. The model has no table, so every later test that walks
+    `apps.get_models()` and then queries (the tenancy matrix, the org-key
+    enumeration, `dumpdata`, and `soft_delete_store` via
+    `live_store_scoped_rows`) dies on `UndefinedTable`.
+
+    MEASURED: one such test - 1 of the 44 model-defining tests in
+    `test_common_checks.py` - had no decorator, and the suite was green *only*
+    because pytest scheduled it after all four of its victims. Reversing the
+    collected order gave `8 failed, 1530 passed`.
+
+    So the order-independence of the suite is asserted here rather than left to
+    the shuffle finding it: this fires in the *same* test that leaked, in any
+    order, on the first run. `pytest-randomly` is the second line of defence,
+    not the first - a guard that only fires on an unlucky seed is a guard that
+    reports the wrong test.
+    """
+    before = {label: frozenset(models) for label, models in django_apps.all_models.items()}
+    yield
+    leaked = sorted(
+        f"{label}.{name}"
+        for label, models in django_apps.all_models.items()
+        for name in models
+        if name not in before.get(label, ())
+    )
+    assert not leaked, (
+        f"this test left {leaked} in the app registry, where it has no database "
+        f"table and will break every later test that walks apps.get_models(). "
+        f"Wrap it in @isolate_apps(\"tests.testapp\")."
+    )
 
 
 @pytest.fixture

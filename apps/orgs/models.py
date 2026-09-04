@@ -1,10 +1,19 @@
 """The tenancy spine: organizations, their stores, and who may do what.
 
-Business data never carries an organization pointer of its own: a store-scoped
-row reaches its organization through `Store.org`, which is the single join to
-get right (`common.checks` E004/E006 keep it that way, and a test asserts no
-store-scoped model declares an `org` field). The models in *this* module are
-the organization's own structure, so they do carry `org` - and the pairs that
+Business data carries its organization on the row. `StoreScopedModel` declares
+`org` alongside `store`, and a composite foreign key `(org_id, store_id) ->
+orgs_store (id, org_id)` makes it the database's job that the two agree
+(ADR 0008; `common.checks` E007 refuses a subclass that disarms the column, and
+E004/E006 still govern how relations to store-scoped models may be declared).
+
+This paragraph used to say the opposite - that business data never carries an
+organization pointer and reaches its org through `Store.org` alone - and cited
+a test asserting no store-scoped model declares `org`. That was true until the
+column landed, and it is exactly the sentence a future reviewer would use to
+"fix" the column back out, so it is corrected here rather than left to rot.
+
+The models in *this* module are the organization's own structure, so they do
+carry `org` - and the pairs that
 must agree (`Membership.role`, `StoreAccess.store`, `AuditLog.store`) are tied
 together by composite foreign keys in the migration, not by `clean()` alone:
 `Model.objects.create()` never calls `clean()`.
@@ -225,11 +234,54 @@ class Role(SoftDeleteModel, AuditedModel):
             )
 
     def has(self, code: str) -> bool:
-        """True when this role grants `code`. Unknown codes are always False."""
+        """True when this role grants `code`. Unknown codes are always False.
+
+        **A retired role grants nothing**, and that belongs here rather than in
+        each caller. `Role` is `PROTECT`ed and hard delete is forbidden, so
+        soft-deleting a role leaves live memberships pointing at it - a
+        reachable state, not a theoretical one - and every caller then has to
+        remember to ask. MEASURED: one that did not was
+        `set_membership_role`'s lock-out check, which counted a membership on a
+        retired `role.manage` role as a role manager and so let the last live
+        one be demoted, leaving the organization permanently unmanageable.
+        `permitted_stores()` and `check_permission()` asked correctly; this
+        line is why a third caller cannot get it wrong.
+
+        The direction is the whole point: a guard whose failure mode is
+        "grants nothing" is safe, and one whose failure mode is "grants
+        everything an old row said" is not.
+        """
+        if self.deleted_at is not None:
+            return False
         return bool(code) and code in PERMISSIONS and code in set(self.permissions or [])
 
 
 class Membership(SoftDeleteModel, AuditedModel):
+    """One person's place in one organization: user + org + role.
+
+    **A user holds at most one live membership** (Elvis's ruling; schema plan
+    §J), so an authenticated user has exactly one organization and there is no
+    org selector, no org id in a URL and nothing to tamper with.
+
+    **The join table stays, and that is the reversal path.** Allowing multi-org
+    later must remain
+    `RemoveConstraint("orgs_membership_unique_live_user")` - a metadata-only
+    `DROP INDEX`, instant and reversible. Do **not** "simplify" this into
+    `User.org = ForeignKey(Organization)`: that puts a tenant pointer on the
+    authentication table (the one table read *before* any org context exists),
+    destroys the leave-and-rejoin history the soft-deleted rows carry, breaks
+    the `(id, org)` composite-FK chain `StoreAccess` and `AuditLog` hang off,
+    and turns the reversal into a data migration under a maintenance window.
+
+    **Never `bulk_create(..., ignore_conflicts=True)` on this table.** It turns
+    every constraint below into a silent no-op: no row, no exception, and a
+    caller that reports "invited".
+
+    Services **look first** (`membership_for()` / `org_for()`) and treat an
+    `IntegrityError` as the race it is. Nothing branches on which constraint
+    fired - see the precedence caveat in `Meta`.
+    """
+
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         verbose_name=_("user"),
@@ -253,6 +305,29 @@ class Membership(SoftDeleteModel, AuditedModel):
         verbose_name = _("membership")
         verbose_name_plural = _("memberships")
         constraints = [
+            # The two uniqueness rules below overlap deliberately: the per-org
+            # constraint is *implied* by the one-org constraint and is kept
+            # anyway, because it is the one that fires first in the common
+            # failure mode and because it names the benign case.
+            #
+            #   ..._unique_live_user_per_org - this person was invited to THIS
+            #       org twice. A double-submit or a race: benign, retry-safe,
+            #       no human decision needed.
+            #   ..._unique_live_user - this person works for ANOTHER org. A
+            #       policy refusal that needs an answer from a human.
+            #
+            # Those are two different incidents with two different responses,
+            # and the constraint name in the log line is all an on-call
+            # engineer gets. One name cannot carry both.
+            #
+            # Precedence is a convenience, never a contract. PostgreSQL checks
+            # unique indexes in `pg_class` OID order, which on a fresh database
+            # is creation order (per-org ships in `0001_initial`, one-org in
+            # `0003`) - but `pg_dump` emits indexes ALPHABETICALLY, so on any
+            # database rebuilt from a dump `..._unique_live_user` sorts first
+            # and wins instead. Nothing may branch on which constraint fired;
+            # the service layer looks first and the constraints are the
+            # backstop that catches the race.
             models.UniqueConstraint(
                 fields=["user", "org"],
                 condition=LIVE,
@@ -260,6 +335,33 @@ class Membership(SoftDeleteModel, AuditedModel):
                 violation_error_message=_(
                     "This person is already a member of this organization."
                 ),
+            ),
+            # Declared second on purpose: if these migrations are ever squashed
+            # `CreateModel` emits constraints in this list's order, so the
+            # fresh-database precedence above holds either way.
+            #
+            # `violation_error_code="unique"` is load-bearing. A constraint
+            # carrying a `condition` always raises the bare message, and
+            # `Model.validate_constraints()` only re-files that error onto a
+            # field when the code is exactly `"unique"` AND the constraint
+            # names one field. Without it the message lands in
+            # `NON_FIELD_ERRORS` as a form-wide banner instead of beside the
+            # input the operator got wrong.
+            #
+            # The message is written for the person filling in an invite form,
+            # not for an operator: an `IntegrityError` never carries it (a
+            # conditional constraint is a partial unique index, so PostgreSQL
+            # reports the index *name*). It must also be true when both
+            # constraints fail at once, which is why it names no organization.
+            models.UniqueConstraint(
+                fields=["user"],
+                condition=LIVE,
+                name="orgs_membership_unique_live_user",
+                violation_error_message=_(
+                    "That account already belongs to an organization. Remove it "
+                    "there first, or invite a different email address."
+                ),
+                violation_error_code="unique",
             ),
             models.UniqueConstraint(
                 fields=["id", "org"],
@@ -279,8 +381,16 @@ class Membership(SoftDeleteModel, AuditedModel):
 
 
 class StoreAccess(SoftDeleteModel, AuditedModel):
-    """Which stores a membership may work in. Materialised even for owners:
-    explicit rows beat an implicit "owners see everything" rule.
+    """Which stores a membership may work in - for every membership whose role
+    does *not* hold `store.access_all`.
+
+    A role holding that code reaches every live store in its organization and
+    gets no rows here (ADR 0011): a row that does not control access would be a
+    decoy for anyone auditing who can reach a store. The grant for such a role
+    is the role itself, and role edits are audited, so the reviewable artefact
+    is the decision rather than its fan-out.
+    `apps/orgs/services/access.py::permitted_stores()` is the only reader of
+    this table and the only place the two branches meet.
 
     `org` is denormalized so the database can hold `(membership, org)` and
     `(store, org)` together and refuse a row that mixes two organizations.

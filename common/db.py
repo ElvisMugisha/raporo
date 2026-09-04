@@ -150,3 +150,68 @@ DROP TRIGGER IF EXISTS {row_trigger} ON {table};
 DROP TRIGGER IF EXISTS {truncate_trigger} ON {table};
 """
     return forward, reverse
+
+
+def same_org_fk_v1(table: str) -> tuple[str, str]:
+    """Return (forward_sql, reverse_sql) tying `table` to one organization.
+
+    FROZEN for every table name a shipped migration passes in. Do not edit; add
+    `same_org_fk_v2` instead (see the module docstring). Note that pinning this
+    *helper* does not pin the text it returns for a table it has never been
+    called with: add both hashes to `PINNED_SQL` in
+    `tests/test_db_stability.py` for each new table.
+
+    The key is `(store_id, org_id) -> orgs_store (id, org_id)`, which is what
+    makes invariant #1 a property of the schema rather than of the code that
+    writes to it: a row whose denormalised `org_id` does not match the
+    organization of its own store is refused by PostgreSQL, including from
+    `psql`, from a data migration, and from any future service that forgets.
+    Byte-identical in shape to the four already shipped
+    (`orgs_membership_role_same_org_fk`, `orgs_storeaccess_membership_same_org_fk`,
+    `orgs_storeaccess_store_same_org_fk`, `audit_auditlog_store_same_org_fk`).
+
+    Four properties are load-bearing, and each has been re-litigated once:
+
+    * **`DEFERRABLE INITIALLY IMMEDIATE`, never `INITIALLY DEFERRED`.**
+      `IMMEDIATE` checks at statement end; `DEFERRED` checks at COMMIT, and a
+      `TestCase` never commits - so `pytest.raises(IntegrityError)` around a
+      cross-organization write would never fire and the test asserting the most
+      important invariant in the product would pass having checked nothing.
+      `DEFERRABLE` is still declared, so a caller who genuinely needs a window
+      can `SET CONSTRAINTS ALL DEFERRED` for one transaction; `INITIALLY
+      DEFERRED` removes the strict default and offers no way back.
+    * **MATCH SIMPLE** (the default, so unwritten): the columns must therefore
+      both be `NOT NULL`, because MATCH SIMPLE skips the check entirely when
+      either is NULL. `StoreScopedModel` declares both non-nullable for exactly
+      this reason.
+    * **The target `orgs_store_id_org_uniq` is unconditional**, and must stay
+      so: PostgreSQL refuses a partial unique index as a foreign-key target
+      ("there is no unique constraint matching given keys for referenced
+      table"). `common.E005` encodes that as a rule.
+    * **Fixtures must be loaded through `tests/conftest.py::load_fixture`.**
+      Postgres' `check_constraints()` - which `loaddata` runs at the end of
+      every load - finishes with a transaction-scoped `SET CONSTRAINTS ALL
+      DEFERRED`, so a plain `loaddata` inside a `TestCase` leaves *every*
+      `*_same_org_fk` key deferred for the rest of that test: a cross-org write
+      is then accepted, and the violation surfaces at teardown attributed to
+      whichever test ran last. `load_fixture` re-arms with `SET CONSTRAINTS ALL
+      IMMEDIATE`. Every key this helper installs inherits that hazard.
+
+    One `RunSQL` per table with a literal table name, never a loop over the
+    model registry: a migration that enumerates the registry at *apply* time
+    emits different SQL depending on which models happen to exist when it runs,
+    which is the fork this module exists to prevent, arriving through the one
+    door the SHA-256 pin cannot close (the pinned text would itself become a
+    function of the registry). The loop belongs in the test.
+
+        FORWARD, REVERSE = same_org_fk_v1("catalog_product")
+        operations = [migrations.RunSQL(sql=FORWARD, reverse_sql=REVERSE)]
+    """
+    constraint = f"{table}_store_same_org_fk"
+    forward = (
+        f"ALTER TABLE {table} ADD CONSTRAINT {constraint} "
+        f"FOREIGN KEY (store_id, org_id) REFERENCES orgs_store (id, org_id) "
+        f"DEFERRABLE INITIALLY IMMEDIATE;"
+    )
+    reverse = f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {constraint};"
+    return forward, reverse
